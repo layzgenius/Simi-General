@@ -150,22 +150,24 @@ actor PreviewAudioAnalyzer {
         var frame = Array(samples[offset ..< offset + fftSize])
         vDSP_vmul(frame, 1, window, 1, &frame, 1, vDSP_Length(fftSize))
 
-        // Pack real input into split-complex form
+        // Pack real input into split-complex form, run FFT, compute magnitudes.
+        // All Accelerate calls that touch splitComplex must live inside the
+        // withUnsafeMutableBufferPointer scopes so the raw pointers stay valid.
         var real = [Float](repeating: 0, count: fftSize / 2)
         var imag = [Float](repeating: 0, count: fftSize / 2)
-        var splitComplex = DSPSplitComplex(realp: &real, imagp: &imag)
-
-        frame.withUnsafeBytes { ptr in
-            let complexPtr = ptr.baseAddress!.assumingMemoryBound(to: DSPComplex.self)
-            vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(fftSize / 2))
-        }
-
-        // Forward FFT
-        vDSP_fft_zrip(fftSetup, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
-
-        // Magnitudes
         var magnitudes = [Float](repeating: 0, count: fftSize / 2)
-        vDSP_zvabs(&splitComplex, 1, &magnitudes, 1, vDSP_Length(fftSize / 2))
+
+        real.withUnsafeMutableBufferPointer { realPtr in
+            imag.withUnsafeMutableBufferPointer { imagPtr in
+                var splitComplex = DSPSplitComplex(realp: realPtr.baseAddress!, imagp: imagPtr.baseAddress!)
+                frame.withUnsafeBytes { ptr in
+                    let complexPtr = ptr.baseAddress!.assumingMemoryBound(to: DSPComplex.self)
+                    vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(fftSize / 2))
+                }
+                vDSP_fft_zrip(fftSetup, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
+                vDSP_zvabs(&splitComplex, 1, &magnitudes, 1, vDSP_Length(fftSize / 2))
+            }
+        }
 
         // Spectral centroid
         let binHz = sampleRate / Double(fftSize)
