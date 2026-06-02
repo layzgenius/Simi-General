@@ -80,10 +80,8 @@ actor PreviewAudioAnalyzer {
             return nil
         }
 
-        buffer.frameLength = frameCount
-
         guard let channelData = buffer.floatChannelData else { return nil }
-        let samples = Array(UnsafeBufferPointer(start: channelData[0], count: Int(frameCount)))
+        let samples = Array(UnsafeBufferPointer(start: channelData[0], count: Int(buffer.frameLength)))
         let sampleCount = samples.count
 
         // ── RMS energy ──────────────────────────────
@@ -97,7 +95,9 @@ actor PreviewAudioAnalyzer {
                                                    sampleCount: sampleCount,
                                                    sampleRate: sampleRate)
 
+        #if DEBUG
         print("🎵 Audio analysis: energy=\(energy), brightness=\(brightness)")
+        #endif
         return AudioMeasurements(energy: energy, spectralBrightness: brightness)
     }
 
