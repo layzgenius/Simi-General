@@ -336,7 +336,7 @@ class LastFMService {
             "punk", "metal", "grunge", "indie rock", "alt-rock", "classic rock",
             // Soul / vintage
             "funk", "soul", "disco", "motown", "gospel", "bossa nova",
-            "reggae", "afrobeats",
+            "reggae", "afrobeats", "house",
             // Hip-hop specific
             "boom bap", "cloud rap", "trap", "drill", "uk drill",
             "phonk", "grime", "punk rap", "alternative hip hop",
