@@ -633,8 +633,11 @@ class RecommendationEngine: ObservableObject {
 
         // 1.5. Preview audio analysis — real energy/valence from the 30s preview clip.
         //      Runs after Spotify fails. Never runs in the background enrichment loop.
+        //      iTunes is the fallback source for preview URLs: Spotify stopped returning
+        //      preview_url on most tracks in late 2024.
         var audioMeasurements: AudioMeasurements? = nil
-        if let previewURL = song.previewURL {
+        let previewURL = song.previewURL ?? (await itunesService.fetchPreviewURL(title: song.title, artist: song.artist))
+        if let previewURL {
             audioMeasurements = await previewAnalyzer.analyze(previewURL: previewURL)
         }
 
