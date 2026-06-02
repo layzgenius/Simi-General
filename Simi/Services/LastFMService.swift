@@ -323,7 +323,7 @@ class LastFMService {
             // Slow/romantic R&B
             "slow jam", "slow jams", "quiet storm", "neo-soul", "neo soul",
             // Indie / dream
-            "dream pop", "bedroom pop", "indie folk", "shoegaze", "chillwave",
+            "dream pop", "bedroom pop", "indie folk", "shoegaze", "chillwave", "melancholic",
             // Electronic chill
             "lo-fi", "lofi", "ambient", "chillhop", "vaporwave",
             // Electronic energetic
