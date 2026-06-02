@@ -50,27 +50,22 @@ actor PreviewAudioAnalyzer {
         }
         defer { try? FileManager.default.removeItem(at: tempURL) }
 
-        // Open audio file
+        // Open with explicit float32 processing format so the buffer format matches
+        // processingFormat exactly. Using the plain init sets processingFormat to the
+        // file's native (often stereo compressed) format; passing a mono buffer to
+        // read(into:) then fails with ExtAudioFileRead error -50.
         let audioFile: AVAudioFile
         do {
-            audioFile = try AVAudioFile(forReading: tempURL)
+            audioFile = try AVAudioFile(forReading: tempURL, commonFormat: .pcmFormatFloat32, interleaved: false)
         } catch {
             return nil
         }
 
-        let fileFormat = audioFile.fileFormat
-        let sampleRate = fileFormat.sampleRate
+        let sampleRate = audioFile.fileFormat.sampleRate
         let frameCount = AVAudioFrameCount(audioFile.length)
+        let processingFormat = audioFile.processingFormat  // float32, native channels and rate
 
-        // Read into a mono float buffer
-        guard let monoFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: false
-        ) else { return nil }
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: frameCount) else {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: frameCount) else {
             return nil
         }
 
@@ -81,8 +76,21 @@ actor PreviewAudioAnalyzer {
         }
 
         guard let channelData = buffer.floatChannelData else { return nil }
-        let samples = Array(UnsafeBufferPointer(start: channelData[0], count: Int(buffer.frameLength)))
-        let sampleCount = samples.count
+        let actualFrames = Int(buffer.frameLength)
+        let channelCount = Int(processingFormat.channelCount)
+
+        // Average all channels into a single mono array using vDSP
+        var monoSamples = [Float](repeating: 0, count: actualFrames)
+        for ch in 0 ..< channelCount {
+            vDSP_vadd(monoSamples, 1, channelData[ch], 1, &monoSamples, 1, vDSP_Length(actualFrames))
+        }
+        if channelCount > 1 {
+            var scale = Float(1.0 / Float(channelCount))
+            vDSP_vsmul(monoSamples, 1, &scale, &monoSamples, 1, vDSP_Length(actualFrames))
+        }
+
+        let samples = monoSamples
+        let sampleCount = actualFrames
 
         // ── RMS energy ──────────────────────────────
         var rms: Float = 0
