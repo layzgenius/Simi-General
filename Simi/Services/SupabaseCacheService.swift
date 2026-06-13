@@ -17,11 +17,11 @@ import Foundation
 
 class SupabaseCacheService {
 
-    // In debug builds the cache is bypassed so Xcode test runs always hit live APIs
-    // and never lock in stale values. Remove this flag or flip it to true to test
-    // cache behaviour locally.
+    // In debug builds the cache is bypassed so test runs always hit live APIs and never
+    // lock in stale values. Set SIMI_CACHE_ENABLED=1 in a scheme's environment variables
+    // to enable caching in a specific debug run without touching this file.
     #if DEBUG
-    private let cacheEnabled = false
+    private let cacheEnabled = ProcessInfo.processInfo.environment["SIMI_CACHE_ENABLED"] == "1"
     #else
     private let cacheEnabled = true
     #endif
@@ -60,7 +60,7 @@ class SupabaseCacheService {
               let first = rows.first,
               let tags = first["tags"]?.value else { return nil }
 
-        print("✅ Supabase tag cache hit: \"\(title)\"")
+        simiLog("✅ Supabase tag cache hit: \"\(title)\"")
         return tags
     }
 
@@ -92,7 +92,7 @@ class SupabaseCacheService {
               let first = rows.first,
               let features = first["features"]?.value else { return nil }
 
-        print("✅ Supabase feature cache hit: \"\(title)\"")
+        simiLog("✅ Supabase feature cache hit: \"\(title)\"")
         return features
     }
 
@@ -102,14 +102,16 @@ class SupabaseCacheService {
               let featuresData = try? JSONEncoder().encode(features),
               let featuresJSON = try? JSONSerialization.jsonObject(with: featuresData) else { return }
         let key = cacheKey(title: title, artist: artist)
-        // Shorter TTL for estimated data so bad values self-correct sooner.
-        // Spotify features are ground truth; tag/BPM estimates are rougher.
+        // TTL is proportional to data quality — better sources stay cached longer.
+        // librosa (Railway full-analysis) is our highest-quality on-device source,
+        // on par with Spotify features. Estimated data self-corrects sooner.
         let ttlDays: Int
         switch source {
-        case "spotify":       ttlDays = 30
-        case "tag_estimated": ttlDays = 7
-        case "preview_audio": ttlDays = 14
-        default:              ttlDays = 3   // bpm_only or unknown
+        case "spotify", "librosa": ttlDays = 30  // ground-truth sources
+        case "refreshed":          ttlDays = 21  // manually re-analyzed
+        case "preview_audio":      ttlDays = 7   // on-device chroma + energy only
+        case "tag_estimated":      ttlDays = 2   // genre averages — least reliable
+        default:                   ttlDays = 1   // bpm_only or unknown
         }
         let expiresAt = ISO8601DateFormatter().string(
             from: Calendar.current.date(byAdding: .day, value: ttlDays, to: Date())!
@@ -120,7 +122,8 @@ class SupabaseCacheService {
             "artist": artist,
             "features": featuresJSON,
             "source": source,
-            "expires_at": expiresAt
+            "expires_at": expiresAt,
+            "schema_version": 1
         ]
         await upsert(url: url, body: body, conflictColumn: "cache_key")
     }
@@ -139,7 +142,7 @@ class SupabaseCacheService {
               let first = rows.first,
               let tracks = first["tracks"]?.value else { return nil }
 
-        print("✅ Supabase similar-tracks cache hit: \"\(title)\"")
+        simiLog("✅ Supabase similar-tracks cache hit: \"\(title)\"")
         return tracks
     }
 
@@ -199,6 +202,72 @@ class SupabaseCacheService {
     }
 
     // ──────────────────────────────────────────────
+    // MARK: - Vector Catalog
+    // ──────────────────────────────────────────────
+
+    /// Builds the normalized 8-dim embedding from an AudioFeatures struct.
+    /// Dimension order must match the SQL embedding column in analyzed_songs.
+    static func buildEmbedding(from features: AudioFeatures) -> [Double] {
+        [
+            features.valence,
+            features.energy,
+            features.danceability,
+            features.acousticness,
+            Double(features.mode),          // 0.0 = minor, 1.0 = major
+            min(features.bpm / 200.0, 1.0), // normalize BPM into 0–1
+            features.tonalClarity,
+            features.spectralWarmth
+        ]
+    }
+
+    /// Writes a librosa-analyzed song's embedding into the vector catalog.
+    /// Upserts on spotify_id — re-analyzing a song updates its stored vector.
+    func storeVector(spotifyID: String, title: String, artist: String, features: AudioFeatures) async {
+        guard cacheEnabled else { return }
+        guard let url = URL(string: "\(baseURL)/rest/v1/analyzed_songs"),
+              let featuresData = try? JSONEncoder().encode(features),
+              let featuresJSON = try? JSONSerialization.jsonObject(with: featuresData) else { return }
+        let emb = Self.buildEmbedding(from: features)
+        let embStr = "[\(emb.map { String(format: "%.6f", $0) }.joined(separator: ","))]"
+        let body: [String: Any] = [
+            "spotify_id": spotifyID,
+            "title":      title,
+            "artist":     artist,
+            "embedding":  embStr,
+            "features":   featuresJSON
+        ]
+        await upsert(url: url, body: body, conflictColumn: "spotify_id")
+    }
+
+    /// Queries the vector catalog for nearest neighbors to the given embedding.
+    /// Returns [] until the catalog crosses the cold-start threshold (300 songs) —
+    /// the SQL function handles the check server-side so no extra round-trip is needed.
+    func fetchSimilarByVector(embedding: [Double]) async -> [(title: String, artist: String)] {
+        guard cacheEnabled else { return [] }
+        guard let url = URL(string: "\(baseURL)/rest/v1/rpc/find_similar_songs") else { return [] }
+        let body: [String: Any] = ["query_embedding": embedding, "limit_count": 20]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body),
+              let data = await postRPC(url: url, body: bodyData),
+              let rows = try? JSONDecoder().decode([VectorCandidateRow].self, from: data) else {
+            return []
+        }
+        if !rows.isEmpty { simiLog("🔷 Vector catalog: \(rows.count) similar songs") }
+        return rows.map { (title: $0.title, artist: $0.artist) }
+    }
+
+    private func postRPC(url: URL, body: Data) async -> Data? {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("Bearer \(anonKey)", forHTTPHeaderField: "Authorization")
+        request.setValue(anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return data
+    }
+
+    // ──────────────────────────────────────────────
     // MARK: - HTTP Helpers
     // ──────────────────────────────────────────────
 
@@ -211,15 +280,17 @@ class SupabaseCacheService {
     }
 
     private func upsert(url: URL, body: [String: Any], conflictColumn: String) async {
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var request = URLRequest(url: url)
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "on_conflict", value: conflictColumn)]
+        guard let resolvedURL = components?.url,
+              let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        var request = URLRequest(url: resolvedURL)
         request.httpMethod = "POST"
         request.httpBody = data
         request.setValue("Bearer \(anonKey)", forHTTPHeaderField: "Authorization")
         request.setValue(anonKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // Both directives must be in ONE Prefer header — setValue overwrites, not appends.
-        request.setValue("resolution=merge-duplicates,on_conflict=\(conflictColumn)", forHTTPHeaderField: "Prefer")
+        request.setValue("resolution=merge-duplicates", forHTTPHeaderField: "Prefer")
         _ = try? await session.data(for: request)
     }
 
@@ -293,6 +364,17 @@ private struct TracksValue: Codable {
         }
     }
     func encode(to encoder: Encoder) throws {}
+}
+
+private struct VectorCandidateRow: Codable {
+    let spotifyId: String
+    let title: String
+    let artist: String
+    let distance: Double
+    enum CodingKeys: String, CodingKey {
+        case spotifyId = "spotify_id"
+        case title, artist, distance
+    }
 }
 
 // ──────────────────────────────────────────────

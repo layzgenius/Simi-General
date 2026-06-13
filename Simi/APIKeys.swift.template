@@ -1,0 +1,15 @@
+// APIKeys.swift.template
+// Simi — Music Discovery App
+//
+// This is the SAFE template committed to git.
+// Real credentials go in APIKeys.swift (gitignored).
+//
+// Setup:
+//   1. Copy this file: cp APIKeys.swift.template APIKeys.swift
+//   2. Replace the placeholder values below with your real keys
+//   3. Get Spotify credentials at: https://developer.spotify.com/dashboard
+
+enum APIKeys {
+    static let spotifyClientID     = "YOUR_SPOTIFY_CLIENT_ID"
+    static let spotifyClientSecret = "YOUR_SPOTIFY_CLIENT_SECRET"
+}

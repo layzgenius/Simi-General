@@ -5,20 +5,20 @@
 //   1. Genre tags — it has crowd-sourced tags like "indie pop", "dream pop", "shoegaze"
 //   2. Similar artists — a huge database of "fans also like" relationships
 //
-// SETUP REQUIRED:
-//   1. Go to https://www.last.fm/api/account/create
-//   2. Create an app → copy your API Key
-//   3. Paste it below (no secret needed for read-only calls)
+// Requests are routed through the Cloudflare Worker proxy — the real API key
+// lives server-side as a Worker environment secret (LASTFM_KEY).
+//
+// Upstream: https://ws.audioscrobbler.com/2.0/
 
 import Foundation
 
 class LastFMService {
 
     // ──────────────────────────────────────────────
-    // MARK: 🔑 API KEY — loaded from APIKeys.swift (gitignored)
+    // MARK: - Proxy config (key held server-side)
     // ──────────────────────────────────────────────
-    private let apiKey = APIKeys.lastFMKey
-    private let baseURL = "https://ws.audioscrobbler.com/2.0"
+    private let proxyURL = APIKeys.lastFMProxyURL
+    private let proxyKey = APIKeys.proxyKey
 
     // ──────────────────────────────────────────────
     // MARK: - Fetch Genre Tags for a Track
@@ -35,11 +35,11 @@ class LastFMService {
             "autocorrect": "1"
         ])
 
-        guard let url = URL(string: "\(baseURL)?\(params)") else {
+        guard let request = makeRequest(queryString: params) else {
             throw SimiError.invalidURL
         }
 
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await URLSession.shared.data(for: request)
 
         // Try track-level tags first
         if let result = try? JSONDecoder().decode(LastFMTagsResult.self, from: data),
@@ -52,7 +52,7 @@ class LastFMService {
 
         // Fallback: artist-level tags (much broader coverage, especially for older/classic artists)
         // The Gap Band, Stevie Wonder, etc. all have rich artist tags even if track tags are sparse.
-        print("⚠️ No track tags for \"\(title)\" — falling back to artist tags for \(artist)")
+        simiLog("⚠️ No track tags for \"\(title)\" — falling back to artist tags for \(artist)")
         return await fetchArtistTags(artist: artist)
     }
 
@@ -63,8 +63,8 @@ class LastFMService {
             "artist": artist,
             "autocorrect": "1"
         ])
-        guard let url = URL(string: "\(baseURL)?\(params)"),
-              let (data, _) = try? await URLSession.shared.data(from: url),
+        guard let request = makeRequest(queryString: params),
+              let (data, _) = try? await URLSession.shared.data(for: request),
               let result = try? JSONDecoder().decode(LastFMTagsResult.self, from: data),
               !result.toptags.tag.isEmpty else {
             return [Genre(main: "Unknown")]
@@ -79,19 +79,7 @@ class LastFMService {
     /// Converts a flat tag list to Genre objects, preferring recognised genre keywords over
     /// mood/decade labels ("80s", "favorites", "seen live" etc.)
     private func genresToReturn(from tags: [String]) -> [Genre] {
-        // Genre-priority keywords — these beat mood/decade tags for the main slot
-        let genreKeywords = [
-            "soul", "r&b", "rnb", "funk", "hip-hop", "hip hop", "rap", "trap", "pop",
-            "rock", "jazz", "blues", "electronic", "dance", "house", "techno", "edm",
-            "indie", "folk", "country", "classical", "metal", "punk", "alternative",
-            "reggae", "gospel", "disco", "neo-soul", "neo soul", "synth", "ambient",
-            "lo-fi", "lofi", "drill", "phonk", "k-pop", "j-pop",
-            "grime", "uk hip hop", "uk rap", "uk drill", "punk rap", "rap rock",
-            "alternative hip hop", "alternative rap", "experimental hip hop"
-        ]
-
         // Junk tags — crowd-sourced Last.fm noise that should never be shown to the user.
-        // Anything matching a blocked term is silently dropped before display or estimation.
         let blockedTags: Set<String> = [
             "ass", "sexy", "sex", "hot", "naked", "nsfw", "explicit",
             "seen live", "favorites", "favourite", "favorite", "love",
@@ -111,13 +99,57 @@ class LastFMService {
             tag.count > 2
         }
 
-        // Pick the first tag that matches a genre keyword, otherwise fall back to cleanTags[0]
-        let mainTag = cleanTags.first(where: { tag in
-            genreKeywords.contains(where: { tag.contains($0) || $0.contains(tag) })
-        }) ?? cleanTags.first ?? tags.first ?? "Unknown"
+        // Tier 1: specific subgenres — more informative than broad genre labels.
+        // e.g. "cloud rap" is preferred over "rap"; "psychedelic trap" over "trap".
+        // Last.fm tags are ordered by play count — check for specifics first regardless of order.
+        let specificSubgenres: Set<String> = [
+            // Hip-hop / Trap subgenres
+            "cloud rap", "cloud trap", "psychedelic trap", "melodic trap", "dark trap",
+            "emo rap", "emo trap", "rage rap", "boom bap", "uk drill", "phonk", "grime",
+            "alternative hip hop", "alternative rap", "experimental hip hop", "punk rap",
+            "rap rock", "uk hip hop", "uk rap",
+            // R&B / Soul subgenres
+            "neo-soul", "neo soul", "slow jam", "slow jams", "quiet storm",
+            "smooth r&b", "contemporary r&b", "new jack swing",
+            // Rock / Alt subgenres
+            "indie rock", "alt-rock", "hard rock", "classic rock", "grunge",
+            "post-rock", "post-punk", "shoegaze", "darkwave", "new wave",
+            // Pop subgenres
+            "indie pop", "dream pop", "bedroom pop", "electropop", "synth-pop", "synth pop",
+            "k-pop", "j-pop",
+            // Electronic subgenres
+            "lo-fi", "lofi", "chillwave", "synthwave", "vaporwave",
+            "drum and bass", "dnb", "future bass", "hyperpop", "breakcore",
+            "dubstep", "brostep", "filthstep", "hybrid trap",
+            // Other
+            "disco", "funk", "bossa nova", "afrobeats", "reggae",
+        ]
 
-        // Sub-genre: first clean tag that differs from main
-        let subTag = cleanTags.dropFirst().first(where: { $0 != mainTag })
+        // Tier 2: broad genre keywords — fallback when no specific subgenre found
+        let genreKeywords = [
+            "soul", "r&b", "rnb", "funk", "hip-hop", "hip hop", "rap", "trap", "pop",
+            "rock", "jazz", "blues", "electronic", "dance", "house", "techno", "edm",
+            "indie", "folk", "country", "classical", "metal", "punk", "alternative",
+            "reggae", "gospel", "disco", "neo-soul", "neo soul", "synth", "ambient",
+            "lo-fi", "lofi", "drill", "phonk", "k-pop", "j-pop",
+            "grime", "uk hip hop", "uk rap", "uk drill", "punk rap", "rap rock",
+            "alternative hip hop", "alternative rap", "experimental hip hop"
+        ]
+
+        // Two-pass selection: specific first, then generic
+        let mainTag: String
+        if let specific = cleanTags.first(where: { specificSubgenres.contains($0) }) {
+            mainTag = specific
+        } else {
+            mainTag = cleanTags.first(where: { tag in
+                genreKeywords.contains(where: { tag.contains($0) || $0.contains(tag) })
+            }) ?? cleanTags.first ?? tags.first ?? "Unknown"
+        }
+
+        // Sub-genre: first clean tag that differs from main and is an informative genre/mood label
+        let subTag = cleanTags.first(where: { tag in
+            tag != mainTag && (specificSubgenres.contains(tag) || genreKeywords.contains(where: { tag.contains($0) || $0.contains(tag) }))
+        })
 
         return [Genre(main: mainTag.capitalized, sub: subTag?.capitalized)]
     }
@@ -137,11 +169,11 @@ class LastFMService {
             "autocorrect": "1"
         ])
 
-        guard let url = URL(string: "\(baseURL)?\(params)") else {
+        guard let request = makeRequest(queryString: params) else {
             throw SimiError.invalidURL
         }
 
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await URLSession.shared.data(for: request)
 
         // Last.fm returns an error object when the track isn't in its database.
         // Return empty gracefully rather than crashing.
@@ -168,8 +200,8 @@ class LastFMService {
             "artist": artist,
             "autocorrect": "1"
         ])
-        if let url = URL(string: "\(baseURL)?\(params)"),
-           let (data, _) = try? await URLSession.shared.data(from: url),
+        if let request = makeRequest(queryString: params),
+           let (data, _) = try? await URLSession.shared.data(for: request),
            let result = try? JSONDecoder().decode(LastFMTagsResult.self, from: data),
            !result.toptags.tag.isEmpty {
             return result.toptags.tag.prefix(8).map { $0.name.lowercased() }
@@ -181,8 +213,8 @@ class LastFMService {
             "artist": artist,
             "autocorrect": "1"
         ])
-        guard let artistURL = URL(string: "\(baseURL)?\(artistParams)"),
-              let (artistData, _) = try? await URLSession.shared.data(from: artistURL),
+        guard let artistRequest = makeRequest(queryString: artistParams),
+              let (artistData, _) = try? await URLSession.shared.data(for: artistRequest),
               let artistResult = try? JSONDecoder().decode(LastFMTagsResult.self, from: artistData) else {
             return []
         }
@@ -206,11 +238,14 @@ class LastFMService {
         //       any other single artist max 3 (prevents a different artist flooding the pool).
         if let tracks = try? await fetchSimilarTracks(title: title, artist: artist, limit: 50),
            !tracks.isEmpty {
+            // Loose pool cap — only prevents complete flooding by one artist.
+            // Final artist diversity enforcement (2 source / 3 others) happens in
+            // RecommendationEngine.applyArtistDiversity after scoring all sources.
             let sourceKey = artist.lowercased().trimmingCharacters(in: .whitespaces)
             var artistCounts: [String: Int] = [:]
             let diversified = tracks.filter { track in
                 let key = track.artist.lowercased().trimmingCharacters(in: .whitespaces)
-                let cap = key == sourceKey ? 2 : 3
+                let cap = key == sourceKey ? 5 : 7
                 let count = artistCounts[key, default: 0]
                 if count < cap {
                     artistCounts[key] = count + 1
@@ -222,7 +257,7 @@ class LastFMService {
         }
 
         // Stage 2 — get similar artists, then pull top tracks from each
-        print("⚠️ No track.getSimilar results for \"\(title)\" — falling back to artist.getSimilar")
+        simiLog("⚠️ No track.getSimilar results for \"\(title)\" — falling back to artist.getSimilar")
         let similarArtists = (try? await fetchSimilarArtists(artist: artist)) ?? []
         guard !similarArtists.isEmpty else { return [] }
 
@@ -239,7 +274,7 @@ class LastFMService {
             }
         }
 
-        print("✅ Artist fallback: \(fallback.count) tracks from \(similarArtists.prefix(6).count) similar artists")
+        simiLog("✅ Artist fallback: \(fallback.count) tracks from \(similarArtists.prefix(6).count) similar artists")
         return fallback
     }
 
@@ -256,8 +291,8 @@ class LastFMService {
             "limit": "5",
             "autocorrect": "1"
         ])
-        guard let url = URL(string: "\(baseURL)?\(params)"),
-              let (data, _) = try? await URLSession.shared.data(from: url),
+        guard let request = makeRequest(queryString: params),
+              let (data, _) = try? await URLSession.shared.data(for: request),
               let result = try? JSONDecoder().decode(LastFMArtistTopTracksResult.self, from: data) else {
             return []
         }
@@ -278,8 +313,8 @@ class LastFMService {
             "tag": tag,
             "limit": "\(limit)"
         ])
-        guard let url = URL(string: "\(baseURL)?\(params)"),
-              let (data, _) = try? await URLSession.shared.data(from: url),
+        guard let request = makeRequest(queryString: params),
+              let (data, _) = try? await URLSession.shared.data(for: request),
               let result = try? JSONDecoder().decode(LastFMTagTopTracksResult.self, from: data) else {
             return []
         }
@@ -292,7 +327,7 @@ class LastFMService {
         let queries = selectEmotionalQueries(from: rawTags)
         guard !queries.isEmpty else { return [] }
 
-        print("🎭 Emotional tag queries: \(queries)")
+        simiLog("🎭 Emotional tag queries: \(queries)")
 
         var results: [(title: String, artist: String)] = []
         var seen = Set<String>()
@@ -309,7 +344,7 @@ class LastFMService {
             }
         }
 
-        print("🎭 Tag pool: \(results.count) candidates from \(queries.count) tags")
+        simiLog("🎭 Tag pool: \(results.count) candidates from \(queries.count) tags")
         return results
     }
 
@@ -324,6 +359,8 @@ class LastFMService {
             "slow jam", "slow jams", "quiet storm", "neo-soul", "neo soul",
             // Indie / dream
             "dream pop", "bedroom pop", "indie folk", "shoegaze", "chillwave", "melancholic",
+            // Mood / atmosphere — injected by audio-feature derivation in RecommendationEngine
+            "late night", "dark", "sad", "feel good", "upbeat", "energetic", "aggressive",
             // Electronic chill
             "lo-fi", "lofi", "ambient", "chillhop", "vaporwave",
             // Electronic energetic
@@ -337,9 +374,11 @@ class LastFMService {
             // Soul / vintage
             "funk", "soul", "disco", "motown", "gospel", "bossa nova",
             "reggae", "afrobeats", "house",
-            // Hip-hop specific
-            "boom bap", "cloud rap", "trap", "drill", "uk drill",
-            "phonk", "grime", "punk rap", "alternative hip hop",
+            // Hip-hop specific — general to specific
+            "boom bap", "cloud rap", "cloud trap", "psychedelic trap", "dark trap",
+            "melodic trap", "melodic rap", "emo trap", "emo rap", "rage rap",
+            "trap", "drill", "uk drill", "phonk", "grime", "punk rap",
+            "alternative hip hop", "alternative rap", "experimental hip hop",
             // Acoustic / singer-songwriter
             "folk", "acoustic", "singer-songwriter",
             // Jazz / blues
@@ -349,22 +388,37 @@ class LastFMService {
         ]
         // Broad / mood tags remapped to more specific Last.fm query equivalents.
         let mappedQueries: [String: String] = [
-            "romantic":   "slow jam",
-            "sensual":    "slow jam",
-            "seductive":  "slow jam",
-            "bedroom":    "bedroom pop",
-            "chill":      "lo-fi",
-            "chill out":  "lo-fi",
-            "chillout":   "lo-fi",
-            "melancholic":"melancholic",
-            "sad":        "melancholic",
-            "dark":       "darkwave",
-            "aggressive": "metal",
-            "heavy":      "metal",
-            "party":      "disco",
-            "workout":    "drum and bass",
-            "summer":     "indie pop",
-            "electronic": "synthwave",
+            "romantic":      "slow jam",
+            "sensual":       "slow jam",
+            "seductive":     "slow jam",
+            "bedroom":       "bedroom pop",
+            "chill":         "late night",     // "chill" alone is too vague — late night is more evocative
+            "chill out":     "lo-fi",
+            "chillout":      "lo-fi",
+            "melancholic":   "melancholic",
+            "melancholy":    "melancholic",
+            "sad":           "melancholic",
+            "dark":          "melancholic",    // was "darkwave" — wrong genre for modern dark trap/r&b
+            "aggressive":    "aggressive",
+            "heavy":         "metal",
+            "party":         "disco",
+            "workout":       "drum and bass",
+            "summer":        "indie pop",
+            "electronic":    "synthwave",
+            "nocturnal":     "late night",
+            "dreamy":        "cloud rap",      // dreamy trap / cloud rap overlap
+            "atmospheric":   "cloud rap",
+            "hazy":          "cloud rap",
+            "woozy":         "psychedelic trap",
+            "moody":         "melancholic",
+            "introspective": "cloud rap",
+            "trippy":        "psychedelic trap",
+            "ethereal":      "dream pop",
+            "psychedelic":   "psychedelic trap",
+            "stoner":        "cloud rap",
+            // Broad genre tags — map to more evocative specific queries
+            "rnb":           "late night",   // R&B with dark valence → late-night/slow-jam feel
+            "r&b":           "late night",
         ]
 
         var queries: [String] = []
@@ -396,11 +450,11 @@ class LastFMService {
             "autocorrect": "1"
         ])
 
-        guard let url = URL(string: "\(baseURL)?\(params)") else {
+        guard let request = makeRequest(queryString: params) else {
             throw SimiError.invalidURL
         }
 
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await URLSession.shared.data(for: request)
         let result = try JSONDecoder().decode(LastFMSimilarArtistsResult.self, from: data)
 
         return result.similarartists.artist.map { $0.name }
@@ -410,16 +464,25 @@ class LastFMService {
     // MARK: - Helper
     // ──────────────────────────────────────────────
 
-    /// Builds the URL query string, always including the API key and JSON format flag
+    /// Builds the URL query string, always including `format=json`.
+    /// The real API key is injected server-side by the Cloudflare Worker.
     private func buildParams(_ params: [String: String]) -> String {
         var all = params
-        all["api_key"] = apiKey
         all["format"] = "json"
 
         return all.map { key, value in
             let encodedValue = value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? value
             return "\(key)=\(encodedValue)"
         }.joined(separator: "&")
+    }
+
+    /// Constructs a URLRequest aimed at the Worker proxy with the shared auth header.
+    private func makeRequest(queryString: String) -> URLRequest? {
+        guard let url = URL(string: "\(proxyURL)?\(queryString)") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue(proxyKey, forHTTPHeaderField: "X-Proxy-Key")
+        return request
     }
 }
 

@@ -27,9 +27,10 @@ class PreviewPlayer: ObservableObject {
         // Stop whatever is playing
         stop()
 
-        // Ensure audio plays through speaker even in silent mode
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        // Activate the audio session (category is set once at app launch in SimiApp.init)
+        #if !os(macOS)
         try? AVAudioSession.sharedInstance().setActive(true)
+        #endif
 
         player = AVPlayer(url: url)
         player?.play()
@@ -128,8 +129,8 @@ struct SongCard: View {
                         Text(song.title)
                             .font(.simiHeadline)
                             .foregroundColor(.simiText)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.85)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
 
                         Text(song.artist)
                             .font(.simiCaption)
@@ -143,7 +144,7 @@ struct SongCard: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(isExpanded
                     ? "Collapse details for \(song.title) by \(song.artist)"
-                    : "\(song.title) by \(song.artist), \(song.similarityLabel)"
+                    : "#\(rank). \(song.title) by \(song.artist), \(song.similarityLabel)"
                       + (song.matchReasons.isEmpty ? "" : ", "
                          + song.matchReasons.prefix(2).map(\.rawValue).joined(separator: ", ")))
                 .accessibilityHint(isExpanded ? "Tap to collapse" : "Tap to see audio features")
@@ -174,6 +175,9 @@ struct SongCard: View {
                                     .contentShape(Rectangle())
                             }
                             .accessibilityLabel("Open on Spotify")
+                            .contextMenu {
+                                Label("Open on Spotify", systemImage: "music.note.list")
+                            }
                         }
 
                         // Apple Music
@@ -185,6 +189,9 @@ struct SongCard: View {
                                 .contentShape(Rectangle())
                         }
                         .accessibilityLabel("Search on Apple Music")
+                        .contextMenu {
+                            Label("Search on Apple Music", systemImage: "heart.fill")
+                        }
 
                         // YouTube
                         Link(destination: youtubeURL(for: song)) {
@@ -195,6 +202,9 @@ struct SongCard: View {
                                 .contentShape(Rectangle())
                         }
                         .accessibilityLabel("Search on YouTube")
+                        .contextMenu {
+                            Label("Search on YouTube", systemImage: "play.rectangle.fill")
+                        }
                     }
                 }
             }
@@ -356,8 +366,8 @@ struct AudioFeaturesGrid: View {
             ("Danceability", percentLabel(features.danceability), "figure.dance"),
             ("Acoustic",     percentLabel(features.acousticness), "guitars"),
         ]
-        // Key requires real audio analysis — hide it when features are estimated from tags
-        if !features.isEstimated {
+        // Key requires Spotify's audio-features — hide it when key is tag-estimated (always C Major default)
+        if !features.isKeyEstimated {
             items.append(("Key", features.keyName, "music.quarternote.3"))
         }
         return items

@@ -1,0 +1,29 @@
+# Xcode
+*.xcuserstate
+*.xcbkptlist
+xcuserdata/
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ─────────────────────────────────────────────────────
+# SECRETS — never commit this file
+# Copy Simi/APIKeys.swift.template → Simi/APIKeys.swift and fill in real keys
+# ─────────────────────────────────────────────────────
+Simi/APIKeys.swift

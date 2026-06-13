@@ -45,7 +45,7 @@ class MusicBrainzService {
             return nil
         }
 
-        print("🎵 MusicBrainz MBID for \"\(title)\" by \(artist): \(best.id) (score: \(best.score ?? 0))")
+        simiLog("🎵 MusicBrainz MBID for \"\(title)\" by \(artist): \(best.id) (score: \(best.score ?? 0))")
         return best.id
     }
 
@@ -79,7 +79,7 @@ class MusicBrainzService {
 
         let sorted = tags.sorted { ($0.count ?? 0) > ($1.count ?? 0) }
         let names = sorted.prefix(8).map { $0.name.lowercased() }
-        print("🎵 MusicBrainz tags for \"\(title)\": \(names.prefix(3).joined(separator: ", "))")
+        simiLog("🎵 MusicBrainz tags for \"\(title)\": \(names.prefix(3).joined(separator: ", "))")
         return names
     }
 }
