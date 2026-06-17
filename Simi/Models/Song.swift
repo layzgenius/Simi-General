@@ -65,6 +65,7 @@ struct AudioFeatures: Codable, Sendable {
     var rolloff: Double?              // spectral rolloff / Nyquist [0,1]
     var onsetMean: Double?
     var onsetStd: Double?
+    var grooveRatio: Double?           // onset_std / onset_mean — syncopation proxy (funky ~0.8–1.8, smooth ~0.3–0.7)
     // Essentia DEAM predictions — nil when essentia unavailable on backend
     var arousal: Double?              // DEAM arousal [0,1]
     var valenceEssentia: Double?      // DEAM valence [0,1]
@@ -99,6 +100,7 @@ struct AudioFeatures: Codable, Sendable {
         rolloff: Double? = nil,
         onsetMean: Double? = nil,
         onsetStd: Double? = nil,
+        grooveRatio: Double? = nil,
         arousal: Double? = nil,
         valenceEssentia: Double? = nil,
         dclapEmbedding: [Double]? = nil
@@ -128,6 +130,7 @@ struct AudioFeatures: Codable, Sendable {
         self.rolloff          = rolloff
         self.onsetMean        = onsetMean
         self.onsetStd         = onsetStd
+        self.grooveRatio      = grooveRatio
         self.arousal          = arousal
         self.valenceEssentia  = valenceEssentia
         self.dclapEmbedding   = dclapEmbedding
@@ -162,6 +165,7 @@ struct AudioFeatures: Codable, Sendable {
         rolloff          = try c.decodeIfPresent(Double.self,   forKey: .rolloff)
         onsetMean        = try c.decodeIfPresent(Double.self,   forKey: .onsetMean)
         onsetStd         = try c.decodeIfPresent(Double.self,   forKey: .onsetStd)
+        grooveRatio      = try c.decodeIfPresent(Double.self,   forKey: .grooveRatio)
         arousal          = try c.decodeIfPresent(Double.self,    forKey: .arousal)
         valenceEssentia  = try c.decodeIfPresent(Double.self,    forKey: .valenceEssentia)
         dclapEmbedding   = try c.decodeIfPresent([Double].self,  forKey: .dclapEmbedding)
@@ -169,14 +173,9 @@ struct AudioFeatures: Codable, Sendable {
 
     // Human-readable helpers
 
-    /// Corrects half-time BPM at display time: high-energy songs (energy ≥ 0.68) with BPM
-    /// in [60, 95] are typically analyzed at half-time (e.g. DnB at 172 BPM reads as 86).
-    /// Applies to both fresh analysis and cached Supabase features so the display is always correct.
-    var normalizedBPM: Double {
-        guard bpm > 0 else { return 0 }
-        if energy >= 0.68 && bpm >= 60 && bpm <= 95 { return bpm * 2 }
-        return bpm
-    }
+    /// Returns the stored BPM directly. RecommendationEngine.normalizeBPM() already applies
+    /// genre-aware half-time correction before storing, so display-time re-doubling is wrong.
+    var normalizedBPM: Double { bpm }
 
     var bpmFormatted: String { normalizedBPM > 0 ? "\(Int(normalizedBPM)) BPM" : "BPM unknown" }
     var keyName: String {
@@ -185,76 +184,71 @@ struct AudioFeatures: Codable, Sendable {
         return keys[safe: key].map { "\($0) \(modeName)" } ?? "Unknown"
     }
 
-    // Vibe summary — a short label based on energy + valence + mode + bpm + danceability.
-    // Energy threshold is 0.7 for "Intense" — songs in the 0.45–0.7 range feel groovy/warm.
-    // Mode + bpm guards prevent slow major-key ballads (End of the Road, Let's Stay Together)
-    // from falling to "Melancholic & Calm": major-key songs with valence >= 0.35 get
-    // "Warm & Groovy" or "Smooth & Mellow" instead. Slow major-key songs with valence > 0.55
-    // are routed to "Smooth & Mellow" before the generic "Chill & Happy" check so that
-    // intimate R&B ballads (Come Over, Body Party) don't read as generically upbeat.
+    // Vibe summary — 8 labels derived from a composite kinetic score.
+    // Pure energy-gating mislabeled high-danceability/BPM tracks: HUMBLE. (150 BPM,
+    // dance=0.90, energy=0.61) scored "mid-energy" and landed "Moody & Driving";
+    // Seven Nation Army (heavy, minor, val=0.26) also got "Moody & Driving". The
+    // composite score weights felt kinetic energy across all three dimensions.
+    //
+    //   kinetic = energy×0.40 + danceability×0.35 + min(bpm/160, 1)×0.25
+    //
+    // Labels: Energetic & Upbeat · Hype & Hard · Intense & Dark · Warm & Groovy
+    //         Moody & Driving · Smooth & Mellow · Chill & Happy · Melancholic & Calm
     var vibeSummary: String {
-        // Use normalizedBPM so half-time tracks (e.g. DnB stored at 86 BPM) hit the
-        // correct branch. Without this, a 172 BPM DnB track stored at 86 skips the
-        // fast-tempo branch entirely and may land on "Melancholic & Calm".
         let nbpm = normalizedBPM
-        // Very fast tempos (DnB, hardstyle, hyperpop: >155 BPM).
-        // Energy gate (≥0.5) prevents jazz in unusual time signatures (Take Five: 5/4 → 173 BPM
-        // detected but energy=0.23) from misfiring here.
-        // Danceability escape matches Branch 2 — DnB at 170 BPM is upbeat, not "Intense & Dark".
-        if nbpm > 155 && energy >= 0.5 {
-            if valence > 0.55 || danceability >= 0.65 { return "Energetic & Upbeat" }
-            return "Intense & Dark"
-        }
-        // High energy (≥0.7): three-way split.
-        //   valence > 0.55       → Energetic & Upbeat (clearly happy)
-        //   danceability >= 0.65 → Energetic & Upbeat (club/EDM/dubstep: Bangarang, Turn Down for What)
-        //   valence > 0.45       → Energetic & Upbeat (stadium anthem: Titanium, Eye of the Tiger)
-        //   else                 → Intense & Dark (non-danceable dark: grunge, metal)
-        // "Moody & Driving" is mid-energy only — never applied at ≥0.7 energy.
-        if energy >= 0.7 {
+        let kinetic = energy * 0.40 + danceability * 0.35 + min(nbpm / 160.0, 1.0) * 0.25
+
+        // ── HIGH KINETIC (> 0.65) ────────────────────────────────────────────
+        // e.g. HUMBLE.=0.79, Uptown Funk=0.83, Master of Puppets=0.68
+        if kinetic > 0.65 {
             if valence > 0.55 { return "Energetic & Upbeat" }
-            if danceability >= 0.65 { return "Energetic & Upbeat" }
-            if valence > 0.45 { return "Energetic & Upbeat" }
+            // Dark/neutral + kinetic + danceable: drill, dark trap, hard rap, industrial dance.
+            // e.g. HUMBLE. (dance=0.90), Sicko Mode (dance=0.67), Y FI DAT (dance=0.68, val=0.51).
+            if danceability > 0.65 { return "Hype & Hard" }
+            // Dark + kinetic + low danceability: metal, hard rock, dark electronic.
+            // e.g. Master of Puppets (dance=0.38), Blinding Lights (dance=0.51).
             return "Intense & Dark"
         }
-        // Mid energy (≥0.45): split by valence + danceability.
-        // >= 0.45 (not >) closes the boundary gap so energy=0.45 songs use this branch.
-        if energy >= 0.45 {
+
+        // ── MID KINETIC (0.40 – 0.65) ────────────────────────────────────────
+        // e.g. Seven Nation Army=0.65, Africa (Toto)=0.61, God's Plan=0.56
+        if kinetic > 0.40 {
             if valence > 0.55 {
-                if danceability > 0.62 { return "Warm & Groovy" }
-                // Electric/compressed production at active tempo isn't "Smooth & Mellow"
-                if acousticness < 0.12 && nbpm > 110 { return "Moody & Driving" }
+                // BPM gate prevents slow R&B ballads (68 BPM, high Spotify danceability)
+                // from landing on Warm & Groovy — they belong in Smooth & Mellow.
+                if danceability > 0.62 && nbpm > 85 { return "Warm & Groovy" }
                 return "Smooth & Mellow"
-            } else {
-                if danceability > 0.62 {
-                    // Near-positive valence + high dance = Warm & Groovy, not Moody & Driving.
-                    // e.g. neutral-mood danceable pop (valence=0.52, dance=0.70) vs dark groove
-                    // (valence=0.35, dance=0.70 → Moody & Driving stays correct).
-                    return valence > 0.48 ? "Warm & Groovy" : "Moody & Driving"
-                }
-                // Very low valence (<0.20) at mid-energy is aggressive-dark, not quietly sad.
-                // e.g. Revenge – XXXTentacion (energy=0.55, valence=0.11) → "Intense & Dark".
-                return valence < 0.20 ? "Intense & Dark" : "Melancholic & Calm"
             }
+            // Very low valence OR minor-key dark without groove → driven and heavy, not sad.
+            // Four gates cover different "dark" shapes:
+            //   1. val < 0.25            — universally very dark (Revenge, Creep chorus)
+            //   2. minor + val<0.35 + low dance  — slow/moderate minor dark (Lose Yourself, In the End)
+            //   3. minor + val<0.42 + active BPM — fast minor moderately dark (Come As You Are,
+            //      Seven Nation Army) but NOT quiet slow grunge (All Apologies, nbpm=80)
+            //   4. minor + val<0.50 + fast BPM — metal/hard-rock where the 30-second preview
+            //      captures a quiet intro (Enter Sandman: energy=0.32, valence=0.45, BPM=123).
+            //      No danceability gate: librosa's tempo sweet-spot formula (peak at 120 BPM) gives
+            //      high dance scores to any 110-130 BPM track, making danceability useless here.
+            //      Mode + tempo alone reliably identify fast minor-key heavy songs in mid-kinetic range.
+            if valence < 0.25
+                || (mode == 0 && valence < 0.35 && danceability < 0.65)
+                || (mode == 0 && valence < 0.42 && danceability < 0.70 && nbpm > 100)
+                || (mode == 0 && valence < 0.50 && nbpm > 110) {
+                return "Intense & Dark"
+            }
+            return "Moody & Driving"
         }
-        // Low energy: slow major-key songs route to warm labels before Melancholic.
-        // bpm > 0 guard prevents unknown-BPM songs (bpm=0) from firing ballad guards.
-        // bpm <= 115 (inclusive) — "< 115" accidentally excluded ballads at exactly 115 BPM.
-        // Slow major-key positive songs are intimate, not generically "Chill & Happy".
+
+        // ── LOW ENERGY (≤ 0.40) ──────────────────────────────────────────────
+        // Major-key slow songs route to warm labels before Melancholic.
         if mode == 1 && nbpm > 0 && nbpm <= 115 && valence > 0.55 { return "Smooth & Mellow" }
         if valence > 0.55 { return "Chill & Happy" }
-        // Raised dance threshold (0.55) prevents intimate duets (The Closer I Get to You,
-        // dance=0.45) from getting "Warm & Groovy".
         if mode == 1 && nbpm > 0 && nbpm <= 115 && valence >= 0.45 && danceability > 0.55 { return "Warm & Groovy" }
-        // Lowered floor (0.35) catches tender ballads like End of the Road (valence=0.37).
         if mode == 1 && nbpm > 0 && nbpm <= 115 && valence >= 0.35 { return "Smooth & Mellow" }
-        // Active-tempo + electric production: energy reading is likely unreliable (quiet intro
-        // or short preview from the quiet section of the track). A 120 BPM electric track with
-        // near-zero acousticness is never "Smooth & Mellow" — route to "Moody & Driving".
-        // e.g. Enter Sandman: 123 BPM, acousticness≈0.00, energy<0.45 due to quiet-intro preview.
-        if nbpm > 110 && acousticness < 0.12 { return "Moody & Driving" }
-        // Catch minor-key low-energy songs with decent valence (≥0.45) before labeling them
-        // melancholic — minor key ≠ sad. e.g. a gentle lo-fi beat or minor-key folk song.
+        // Fast minor-key tracks where the 30s preview captured a quiet intro section.
+        // The actual song is heavy — use mode + tempo as the stable signal.
+        if nbpm > 110 && mode == 0 && valence < 0.45 { return "Intense & Dark" }
+        if nbpm > 110 && mode == 0 { return "Moody & Driving" }
         if valence >= 0.45 { return "Smooth & Mellow" }
         return "Melancholic & Calm"
     }
@@ -286,6 +280,9 @@ struct SimilarSong: Identifiable, Codable {
 
     // Why was this recommended?
     var matchReasons: [MatchReason]
+
+    // Human-readable match explanation with specific dimensions
+    var matchExplanation: MatchExplanation? = nil
 
     // Human-readable match label — emotional at high scores, numeric otherwise.
     // "Matching…" shows while enrichment is in flight (audioFeatures still nil).
@@ -325,6 +322,19 @@ enum MatchReason: String, Codable, CaseIterable {
     case instrumentalFeel   = "Instrumental feel"
     case spaciousProduction = "Spacious production"
     case dryAndTight        = "Dry & tight"
+}
+
+// MARK: - MatchExplanation
+// Pre-computed human-readable explanation of why a song was recommended.
+// Generated in enrichWithABFeatures alongside matchReasons; never persisted to Supabase.
+struct MatchExplanationRow: Codable {
+    let label: String       // e.g. "Emotional weight"
+    let descriptor: String  // e.g. "Same melancholic weight"
+}
+
+struct MatchExplanation: Codable {
+    let rows: [MatchExplanationRow]  // only rows where data is reliable and dimensions are close
+    let genreBridgeLabel: String?    // e.g. "Jazz → Hip-Hop"; nil when same genre family
 }
 
 // MARK: - URLSource
