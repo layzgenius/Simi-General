@@ -233,6 +233,25 @@ struct SongCard: View {
                 .allowsHitTesting(false)
             }
 
+            // ── Genre bridge ──
+            if let bridge = song.matchExplanation?.genreBridgeLabel {
+                HStack {
+                    Text("\(bridge) 🌉")
+                        .font(.simiMicro.weight(.semibold))
+                        .foregroundColor(.simiAccent)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.simiAccent.opacity(0.12))
+                        .clipShape(Capsule())
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 12)
+                .transition(.opacity)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Genre bridge: \(bridge)")
+            }
+
             // ── Expanded Detail ──
             if isExpanded, let features = song.audioFeatures {
                 Divider()
@@ -442,7 +461,7 @@ struct AudioFeaturesGrid: View {
                 MatchExplanationRow(label: "Intensity",        descriptor: "Equally driven"),
                 MatchExplanationRow(label: "Key",              descriptor: "Both major key"),
             ],
-            genreBridgeLabel: nil
+            genreBridgeLabel: "Pop → Jazz"
         )
     )
 
