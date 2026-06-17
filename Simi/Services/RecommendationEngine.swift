@@ -1112,6 +1112,50 @@ class RecommendationEngine: ObservableObject {
         return MatchExplanation(rows: rows, genreBridgeLabel: genreBridgeLabel)
     }
 
+    /// Computes the feature-space centroid of multiple seed songs for blend-mode explanation.
+    /// `isEstimated` / `isKeyEstimated` are conservative: centroid is marked estimated if any
+    /// seed is estimated, so explanation row gates behave correctly for mixed-quality blends.
+    private func centroid(of seeds: [AudioFeatures]) -> AudioFeatures {
+        guard seeds.count > 1 else { return seeds[0] }
+        let n = Double(seeds.count)
+
+        func avg(_ kp: KeyPath<AudioFeatures, Double>) -> Double {
+            seeds.map { $0[keyPath: kp] }.reduce(0, +) / n
+        }
+        func avgOpt(_ kp: KeyPath<AudioFeatures, Double?>) -> Double? {
+            let vals = seeds.compactMap { $0[keyPath: kp] }
+            return vals.isEmpty ? nil : vals.reduce(0, +) / Double(vals.count)
+        }
+        func majority(_ kp: KeyPath<AudioFeatures, Int>) -> Int {
+            let counts = Dictionary(seeds.map { ($0[keyPath: kp], 1) }, uniquingKeysWith: +)
+            return counts.max(by: { $0.value < $1.value })?.key ?? seeds[0][keyPath: kp]
+        }
+
+        var c = seeds[0]
+        c.bpm              = avg(\.bpm)
+        c.energy           = avg(\.energy)
+        c.valence          = avg(\.valence)
+        c.danceability     = avg(\.danceability)
+        c.acousticness     = avg(\.acousticness)
+        c.instrumentalness = avg(\.instrumentalness)
+        c.liveness         = avg(\.liveness)
+        c.loudness         = avg(\.loudness)
+        c.key              = majority(\.key)
+        c.mode             = majority(\.mode)
+        c.isEstimated      = seeds.contains { $0.isEstimated }
+        c.isKeyEstimated   = seeds.contains { $0.isKeyEstimated }
+        c.spectralWarmth   = avg(\.spectralWarmth)
+        c.tonalClarity     = avg(\.tonalClarity)
+        c.vocalPresence    = avg(\.vocalPresence)
+        c.reverbSpace      = avg(\.reverbSpace)
+        c.grooveRatio      = avgOpt(\.grooveRatio)
+        c.arousal          = avgOpt(\.arousal)
+        c.valenceEssentia  = avgOpt(\.valenceEssentia)
+        c.chromaEntropy    = avgOpt(\.chromaEntropy)
+        c.mfccMean = nil; c.mfccStd = nil; c.spectralContrast = nil; c.chroma = nil
+        return c
+    }
+
     // MARK: - Background AcousticBrainz Enrichment
     // ──────────────────────────────────────────────
 
@@ -1221,8 +1265,9 @@ class RecommendationEngine: ObservableObject {
             recommendations[update.index].audioFeatures   = update.features
             recommendations[update.index].similarityScore = score
             recommendations[update.index].matchReasons    = reasons
+            let explanationSource = seedFeatures.count > 1 ? centroid(of: seedFeatures) : sourceFeatures
             recommendations[update.index].matchExplanation = buildMatchExplanation(
-                source: sourceFeatures,
+                source: explanationSource,
                 target: update.features,
                 sourceGenres: genres,
                 targetGenre: recommendations[update.index].genre
@@ -1275,8 +1320,9 @@ class RecommendationEngine: ObservableObject {
             recommendations[i].audioFeatures   = pyFeatures
             recommendations[i].similarityScore = score
             recommendations[i].matchReasons    = reasons
+            let explanationSource = seedFeatures.count > 1 ? centroid(of: seedFeatures) : sourceFeatures
             recommendations[i].matchExplanation = buildMatchExplanation(
-                source: sourceFeatures,
+                source: explanationSource,
                 target: pyFeatures,
                 sourceGenres: genres,
                 targetGenre: recommendations[i].genre
