@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Simi — Songs that feel the same</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       oklch(8.5% 0.008 265);
+  --surface:  oklch(12%  0.009 265);
+  --card:     oklch(15%  0.012 265);
+  --border:   oklch(22%  0.014 265);
+  --purple:   oklch(56%  0.22  285);
+  --purple-lo:oklch(56%  0.22  285 / 0.12);
+  --purple-md:oklch(56%  0.22  285 / 0.3);
+  --cyan:     oklch(76%  0.14  215);
+  --cyan-lo:  oklch(76%  0.14  215 / 0.12);
+  --green:    oklch(80%  0.18  155);
+  --text:     oklch(95%  0.006 265);
+  --sub:      oklch(60%  0.025 265);
+  --dim:      oklch(40%  0.018 265);
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+/* ── Nav ── */
+nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 20px 40px;
+  background: oklch(8.5% 0.008 265 / 0.85);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-logo {
+  font-family: 'Syne', sans-serif;
+  font-size: 1.5rem;
+  font-weight: 800;
+  color: var(--purple);
+  letter-spacing: -0.02em;
+}
+
+.nav-cta {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 20px;
+  background: var(--purple);
+  color: var(--text);
+  border-radius: 100px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: opacity 0.15s;
+}
+.nav-cta:hover { opacity: 0.85; }
+
+/* ── Hero ── */
+.hero {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-items: center;
+  gap: 60px;
+  padding: 140px 40px 80px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.hero-text { max-width: 560px; }
+
+.hero-eyebrow {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--cyan);
+  margin-bottom: 28px;
+}
+
+.hero-eyebrow::before {
+  content: '';
+  display: block;
+  width: 24px; height: 1px;
+  background: var(--cyan);
+}
+
+h1 {
+  font-family: 'Syne', sans-serif;
+  font-size: clamp(2.8rem, 5vw, 4.2rem);
+  font-weight: 800;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  margin-bottom: 24px;
+}
+
+h1 em {
+  font-style: normal;
+  color: var(--purple);
+}
+
+.hero-sub {
+  font-size: 1.125rem;
+  color: var(--sub);
+  line-height: 1.7;
+  margin-bottom: 40px;
+  max-width: 46ch;
+}
+
+.hero-actions {
+  display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+}
+
+.btn-primary {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 14px 28px;
+  background: var(--purple);
+  color: var(--text);
+  border-radius: 100px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: opacity 0.15s, transform 0.15s;
+}
+.btn-primary:hover { opacity: 0.85; transform: translateY(-1px); }
+
+.btn-ghost {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--sub);
+  text-decoration: none;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 2px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.btn-ghost:hover { color: var(--text); border-color: var(--sub); }
+
+/* ── Vibe Map Canvas ── */
+.vibe-map-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1;
+  max-width: 480px;
+}
+
+#vibeCanvas {
+  width: 100%;
+  height: 100%;
+  border-radius: 20px;
+}
+
+.vibe-map-legend {
+  position: absolute;
+  bottom: 16px; left: 16px;
+  display: flex; gap: 12px;
+  font-size: 0.7rem;
+  color: var(--sub);
+}
+
+.legend-dot {
+  display: flex; align-items: center; gap: 5px;
+}
+
+.legend-dot::before {
+  content: '';
+  display: block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+}
+.legend-dot.you::before { background: oklch(95% 0.006 265); border: 2px solid var(--purple); }
+.legend-dot.rec::before { background: var(--cyan); }
+
+/* ── Section layout ── */
+section { padding: 100px 40px; }
+
+.section-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.section-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 20px;
+}
+
+h2 {
+  font-family: 'Syne', sans-serif;
+  font-size: clamp(2rem, 3.5vw, 3rem);
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  margin-bottom: 20px;
+}
+
+.section-sub {
+  font-size: 1.05rem;
+  color: var(--sub);
+  max-width: 52ch;
+  line-height: 1.7;
+}
+
+/* ── Problem section ── */
+.problem { background: var(--surface); }
+
+.problem-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+  margin-top: 60px;
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.competitor-card {
+  background: var(--card);
+  padding: 32px 28px;
+  position: relative;
+}
+
+.competitor-name {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 20px;
+}
+
+.competitor-ui {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.data-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+
+.data-row .label { color: var(--sub); }
+.data-row .value { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+.competitor-verdict {
+  font-size: 0.8rem;
+  color: var(--dim);
+  font-style: italic;
+  line-height: 1.5;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+  margin-top: 4px;
+}
+
+.blackbox-card {
+  background: var(--card);
+  padding: 32px 28px;
+}
+
+.blackbox-recs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 24px;
+}
+
+.blackbox-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border-radius: 6px;
+}
+
+.blackbox-thumb {
+  width: 32px; height: 32px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.blackbox-info { flex: 1; min-width: 0; }
+.blackbox-title { font-size: 0.8rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.blackbox-artist { font-size: 0.7rem; color: var(--sub); }
+
+.blackbox-why {
+  display: inline-block;
+  font-size: 0.65rem;
+  color: var(--dim);
+  background: var(--border);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* ── Differentiators ── */
+.diff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 60px;
+  margin-top: 60px;
+  align-items: start;
+}
+
+.diff-visual {
+  position: sticky;
+  top: 120px;
+}
+
+.diff-features {
+  display: flex;
+  flex-direction: column;
+  gap: 48px;
+}
+
+.diff-feature { cursor: default; }
+
+.feature-number {
+  font-family: 'Syne', sans-serif;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--purple);
+  letter-spacing: 0.08em;
+  margin-bottom: 10px;
+}
+
+.feature-title {
+  font-family: 'Syne', sans-serif;
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  margin-bottom: 10px;
+}
+
+.feature-body {
+  font-size: 0.95rem;
+  color: var(--sub);
+  line-height: 1.7;
+  max-width: 44ch;
+}
+
+/* Vibe chip demo */
+.vibe-chips-demo {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin-top: 20px;
+}
+
+.vibe-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px;
+  border-radius: 100px;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.vibe-chip.energy { background: var(--purple-lo); color: var(--purple); }
+.vibe-chip.mood   { background: var(--cyan-lo);   color: var(--cyan);   }
+.vibe-chip.bpm    { background: oklch(80% 0.18 155 / 0.12); color: var(--green); }
+.vibe-chip.genre  { background: oklch(40% 0.018 265 / 0.3); color: var(--sub); }
+
+/* Blend demo */
+.blend-demo {
+  margin-top: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.blend-seeds {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-bottom: 12px;
+}
+
+.blend-seed {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  background: var(--card);
+  border-radius: 8px;
+}
+
+.blend-seed-thumb {
+  width: 30px; height: 30px;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.blend-seed-info { flex: 1; }
+.blend-seed-title { font-size: 0.8rem; font-weight: 600; }
+.blend-seed-artist { font-size: 0.7rem; color: var(--sub); }
+
+.blend-arrow {
+  text-align: center;
+  font-size: 0.7rem;
+  color: var(--dim);
+  padding: 4px 0;
+  letter-spacing: 0.05em;
+}
+
+.blend-result {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px;
+  background: var(--purple-lo);
+  border: 1px solid var(--purple-md);
+  border-radius: 8px;
+}
+
+.blend-result-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--purple);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.blend-result-desc {
+  font-size: 0.75rem;
+  color: var(--sub);
+}
+
+/* ── Comparison ── */
+.comparison { background: var(--surface); }
+
+.compare-table {
+  margin-top: 60px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.compare-head {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1.2fr;
+  gap: 0;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.compare-head-cell {
+  padding: 16px 20px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sub);
+  border-right: 1px solid var(--border);
+}
+
+.compare-head-cell:last-child { border-right: none; }
+.compare-head-cell.highlight {
+  color: var(--purple);
+  background: var(--purple-lo);
+}
+
+.compare-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1.2fr;
+  border-bottom: 1px solid var(--border);
+}
+
+.compare-row:last-child { border-bottom: none; }
+
+.compare-cell {
+  padding: 16px 20px;
+  font-size: 0.875rem;
+  border-right: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+}
+
+.compare-cell:last-child { border-right: none; }
+.compare-cell.feature-label { color: var(--text); font-weight: 500; }
+.compare-cell.highlight { background: var(--purple-lo); }
+
+.check { color: var(--green); font-size: 1rem; }
+.cross { color: var(--dim); font-size: 1rem; }
+.partial { color: oklch(75% 0.15 60); font-size: 0.75rem; }
+
+/* ── Positioning statement ── */
+.positioning {
+  text-align: center;
+  padding: 120px 40px;
+}
+
+.pos-inner {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.pos-quote {
+  font-family: 'Syne', sans-serif;
+  font-size: clamp(1.8rem, 4vw, 3.2rem);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin-bottom: 32px;
+}
+
+.pos-quote strong {
+  color: var(--purple);
+  font-weight: 800;
+}
+
+.pos-body {
+  font-size: 1.05rem;
+  color: var(--sub);
+  line-height: 1.75;
+  max-width: 56ch;
+  margin: 0 auto 48px;
+}
+
+/* ── CTA ── */
+.cta-section {
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  text-align: center;
+  padding: 100px 40px;
+}
+
+.cta-inner { max-width: 600px; margin: 0 auto; }
+
+.cta-section h2 { margin-bottom: 16px; }
+.cta-section .section-sub { margin: 0 auto 40px; text-align: center; }
+
+/* ── Footer ── */
+footer {
+  padding: 32px 40px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  nav { padding: 16px 24px; }
+  .hero { grid-template-columns: 1fr; padding: 120px 24px 60px; gap: 48px; }
+  .vibe-map-wrap { max-width: 100%; }
+  .problem-grid { grid-template-columns: 1fr; }
+  .diff-grid { grid-template-columns: 1fr; }
+  .diff-visual { position: static; }
+  section { padding: 64px 24px; }
+  .compare-head, .compare-row { grid-template-columns: 2fr 1fr 1fr 1.2fr; }
+  .compare-head-cell:nth-child(3),
+  .compare-cell:nth-child(3) { display: none; }
+  footer { flex-direction: column; gap: 8px; text-align: center; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── Navigation ── -->
+<nav>
+  <span class="nav-logo">simi</span>
+  <a href="#cta" class="nav-cta">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+      <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z"/>
+      <path d="M10 8l6 4-6 4V8z" fill="currentColor" stroke="none"/>
+    </svg>
+    Get on iOS
+  </a>
+</nav>
+
+<!-- ── Hero ── -->
+<section style="padding: 0;">
+  <div class="hero">
+    <div class="hero-text">
+      <div class="hero-eyebrow">Music discovery, redesigned</div>
+      <h1>Songs that <em>feel</em> the same</h1>
+      <p class="hero-sub">Every other app tells you what songs sound like. Chosic gives you BPM charts. Spotify gives you a black box. Simi tells you what a song <em>means</em> — then finds you more that hit the same way.</p>
+      <div class="hero-actions">
+        <a href="#cta" class="btn-primary">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.7 9.05 7.4c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.39-1.32 2.76-2.54 3.99zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z"/></svg>
+          Download for iPhone
+        </a>
+        <a href="#how" class="btn-ghost">See how it works</a>
+      </div>
+    </div>
+
+    <div class="vibe-map-wrap">
+      <canvas id="vibeCanvas" width="480" height="480"></canvas>
+      <div class="vibe-map-legend">
+        <div class="legend-dot you">Your song</div>
+        <div class="legend-dot rec">Matches</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Problem ── -->
+<section class="problem" id="how">
+  <div class="section-inner">
+    <div class="section-label">The problem</div>
+    <h2>Everyone else treats<br>your ears like a spreadsheet</h2>
+    <p class="section-sub">The tools that exist today were built for data analysts, not listeners. They tell you a song has 127 BPM and 0.74 energy. But they can't tell you if it'll wreck you the same way.</p>
+
+    <div class="problem-grid">
+      <!-- Chosic -->
+      <div class="competitor-card">
+        <div class="competitor-name">Chosic</div>
+        <div class="competitor-ui">
+          <div class="data-row"><span class="label">BPM</span><span class="value">127</span></div>
+          <div class="data-row"><span class="label">Key</span><span class="value">A Minor</span></div>
+          <div class="data-row"><span class="label">Energy</span><span class="value">0.74</span></div>
+          <div class="data-row"><span class="label">Valence</span><span class="value">0.28</span></div>
+          <div class="data-row"><span class="label">Acousticness</span><span class="value">0.02</span></div>
+        </div>
+        <p class="competitor-verdict">Accurate data. Zero emotional context. You're left to decode what "valence 0.28" actually means for your next listen.</p>
+      </div>
+
+      <!-- Last.fm -->
+      <div class="competitor-card">
+        <div class="competitor-name">Last.fm / Similar Artists</div>
+        <div class="competitor-ui">
+          <div class="data-row"><span class="label">Similar to</span><span class="value" style="color:var(--sub);font-size:0.75rem">Artist A</span></div>
+          <div class="data-row"><span class="label">Tags</span><span class="value" style="color:var(--sub);font-size:0.75rem">electronic, dark, ambient</span></div>
+          <div class="data-row"><span class="label">Listeners</span><span class="value">1.2M</span></div>
+          <div class="data-row"><span class="label">Match reason</span><span class="value" style="color:var(--dim)">—</span></div>
+          <div class="data-row"><span class="label">Vibe context</span><span class="value" style="color:var(--dim)">—</span></div>
+        </div>
+        <p class="competitor-verdict">Community tags are useful. But "similar artists" doesn't mean similar feelings. You get names, not reasons.</p>
+      </div>
+
+      <!-- Spotify -->
+      <div class="blackbox-card">
+        <div class="competitor-name">Spotify Radio / SongDNA</div>
+        <div class="blackbox-recs">
+          <div class="blackbox-item">
+            <div class="blackbox-thumb" style="background: oklch(30% 0.08 285);"></div>
+            <div class="blackbox-info">
+              <div class="blackbox-title">Song Title Here</div>
+              <div class="blackbox-artist">Artist Name</div>
+            </div>
+            <span class="blackbox-why">?</span>
+          </div>
+          <div class="blackbox-item">
+            <div class="blackbox-thumb" style="background: oklch(25% 0.06 215);"></div>
+            <div class="blackbox-info">
+              <div class="blackbox-title">Another Song</div>
+              <div class="blackbox-artist">Another Artist</div>
+            </div>
+            <span class="blackbox-why">?</span>
+          </div>
+          <div class="blackbox-item">
+            <div class="blackbox-thumb" style="background: oklch(28% 0.07 155);"></div>
+            <div class="blackbox-info">
+              <div class="blackbox-title">One More Track</div>
+              <div class="blackbox-artist">Yet Another</div>
+            </div>
+            <span class="blackbox-why">?</span>
+          </div>
+        </div>
+        <p class="competitor-verdict">The algorithm knows why it picked these. You're not allowed to. Trust the machine, or don't. Those are your options.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Differentiators ── -->
+<section id="features">
+  <div class="section-inner">
+    <div class="section-label">What makes Simi different</div>
+    <h2>Built for the feeling,<br>not the frequency</h2>
+
+    <div class="diff-grid">
+      <div class="diff-visual">
+        <canvas id="diffCanvas" width="460" height="460" style="width:100%;border-radius:18px;"></canvas>
+      </div>
+
+      <div class="diff-features">
+
+        <div class="diff-feature">
+          <div class="feature-number">01</div>
+          <div class="feature-title">Emotional language, not audio stats</div>
+          <p class="feature-body">When you find a song that matches, Simi doesn't show you "energy: 0.81". It shows you why in terms you actually feel. Every match comes with its reason.</p>
+          <div class="vibe-chips-demo">
+            <span class="vibe-chip energy">Similar Energy</span>
+            <span class="vibe-chip mood">Dark Mood</span>
+            <span class="vibe-chip bpm">140 BPM</span>
+            <span class="vibe-chip genre">Same Genre</span>
+            <span class="vibe-chip energy">High Intensity</span>
+            <span class="vibe-chip mood">Upbeat Mood</span>
+          </div>
+        </div>
+
+        <div class="diff-feature">
+          <div class="feature-number">02</div>
+          <div class="feature-title">The Vibe Map — see the whole picture</div>
+          <p class="feature-body">Nobody else has this. Every recommendation plotted on a live scatter of energy vs. mood — so you can see at a glance which songs are true matches and which are outliers. Your source song is the reference point. Everything else orbits it.</p>
+        </div>
+
+        <div class="diff-feature">
+          <div class="feature-number">03</div>
+          <div class="feature-title">Blend: triangulate your exact vibe</div>
+          <p class="feature-body">Can't describe what you're looking for with one song? Give Simi two or three. It averages the vibe across all seeds and finds what lives in that exact emotional overlap.</p>
+          <div class="blend-demo">
+            <div class="blend-seeds">
+              <div class="blend-seed">
+                <div class="blend-seed-thumb" style="background: oklch(35% 0.12 285);"></div>
+                <div class="blend-seed-info">
+                  <div class="blend-seed-title">Verdansk</div>
+                  <div class="blend-seed-artist">Dave · 140 BPM · Intense</div>
+                </div>
+              </div>
+              <div class="blend-seed">
+                <div class="blend-seed-thumb" style="background: oklch(30% 0.09 215);"></div>
+                <div class="blend-seed-info">
+                  <div class="blend-seed-title">Midnight Rain</div>
+                  <div class="blend-seed-artist">Taylor Swift · 118 BPM · Dark</div>
+                </div>
+              </div>
+            </div>
+            <div class="blend-arrow">↓ averaged vibe</div>
+            <div class="blend-result">
+              <div>
+                <div class="blend-result-label">Blend</div>
+                <div class="blend-result-desc">129 BPM · Intense & Dark · finding matches...</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="diff-feature">
+          <div class="feature-number">04</div>
+          <div class="feature-title">Paste any link. No ecosystem lock-in.</div>
+          <p class="feature-body">Spotify link. YouTube link. SoundCloud link. Simi doesn't care which platform you use. Paste the URL and you're done. No account required, no subscription, no algorithm to game.</p>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Comparison table ── -->
+<section class="comparison">
+  <div class="section-inner">
+    <div class="section-label">Head to head</div>
+    <h2>The honest comparison</h2>
+
+    <div class="compare-table">
+      <div class="compare-head">
+        <div class="compare-head-cell">Feature</div>
+        <div class="compare-head-cell">Chosic</div>
+        <div class="compare-head-cell">Last.fm</div>
+        <div class="compare-head-cell">Spotify Radio</div>
+        <div class="compare-head-cell highlight">Simi</div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">Explains why songs match</div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">Visual vibe map</div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">Emotional language (not raw stats)</div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">Multi-song blend / seed mixing</div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">Platform-agnostic (Spotify + YouTube + SoundCloud)</div>
+        <div class="compare-cell"><span class="partial">Spotify only</span></div>
+        <div class="compare-cell"><span class="check">✓</span></div>
+        <div class="compare-cell"><span class="partial">Spotify only</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">Native mobile app</div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="check">✓</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">No account or subscription needed</div>
+        <div class="compare-cell"><span class="check">✓</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-cell feature-label">Audio feature data (BPM, energy, key)</div>
+        <div class="compare-cell"><span class="check">✓</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell"><span class="cross">✕</span></div>
+        <div class="compare-cell highlight"><span class="check">✓</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Positioning statement ── -->
+<section class="positioning">
+  <div class="pos-inner">
+    <p class="pos-quote">Chosic tells you the <strong>stats.</strong><br>Spotify makes the <strong>choice.</strong><br>Simi shows you the <strong>reason.</strong></p>
+    <p class="pos-body">Music discovery has always been a black box. Either you get raw data and decode it yourself, or you trust an algorithm that won't explain itself. Simi is the first tool that treats you like someone who deserves to know why.</p>
+    <a href="#cta" class="btn-primary" style="display:inline-flex;">Get Simi for iPhone</a>
+  </div>
+</section>
+
+<!-- ── CTA ── -->
+<section class="cta-section" id="cta">
+  <div class="cta-inner">
+    <div class="section-label" style="text-align:center">Available now</div>
+    <h2>Find your next favourite song</h2>
+    <p class="section-sub">Paste a link. See what matches your vibe. No account, no subscription — just the music that feels the same.</p>
+    <a href="#" class="btn-primary" style="display:inline-flex;font-size:1rem;padding:16px 32px;">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.7 9.05 7.4c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.39-1.32 2.76-2.54 3.99zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z"/></svg>
+      Download on the App Store
+    </a>
+  </div>
+</section>
+
+<footer>
+  <span class="nav-logo" style="font-size:1.1rem;">simi</span>
+  <span>find songs that feel the same</span>
+</footer>
+
+<script>
+// ── Hero Vibe Map ──────────────────────────────────────────────────────────
+(function() {
+  const canvas = document.getElementById('vibeCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const PAD = 40;
+
+  // Source song (YOU dot) — Verdansk: high energy, dark mood
+  const src = { vx: 0.22, vy: 0.85 };
+
+  // Recommendation dots — scattered around the source
+  const recs = [
+    { vx: 0.18, vy: 0.91, s: 0.97, phase: 0.0 },
+    { vx: 0.30, vy: 0.82, s: 0.96, phase: 0.8 },
+    { vx: 0.25, vy: 0.78, s: 0.95, phase: 1.6 },
+    { vx: 0.14, vy: 0.88, s: 0.94, phase: 2.4 },
+    { vx: 0.35, vy: 0.90, s: 0.93, phase: 3.2 },
+    { vx: 0.10, vy: 0.75, s: 0.92, phase: 0.4 },
+    { vx: 0.40, vy: 0.72, s: 0.88, phase: 1.2 },
+    { vx: 0.28, vy: 0.65, s: 0.85, phase: 2.0 },
+    { vx: 0.55, vy: 0.80, s: 0.82, phase: 2.8 },
+    { vx: 0.48, vy: 0.60, s: 0.79, phase: 3.6 },
+    // Scattered outliers
+    { vx: 0.65, vy: 0.55, s: 0.65, phase: 1.0 },
+    { vx: 0.72, vy: 0.40, s: 0.60, phase: 1.8 },
+    { vx: 0.80, vy: 0.65, s: 0.58, phase: 2.6 },
+    { vx: 0.50, vy: 0.30, s: 0.55, phase: 0.6 },
+  ];
+
+  function toX(v) { return PAD + v * (W - PAD * 2); }
+  function toY(e) { return (H - PAD) - e * (H - PAD * 2); }
+
+  function dotColor(score) {
+    if (score >= 0.9) return { fill: 'oklch(80% 0.18 155)', glow: 'oklch(80% 0.18 155 / 0.35)' };
+    if (score >= 0.75) return { fill: 'oklch(76% 0.14 215)', glow: 'oklch(76% 0.14 215 / 0.3)' };
+    return { fill: 'oklch(56% 0.22 285)', glow: 'oklch(56% 0.22 285 / 0.25)' };
+  }
+
+  let t = 0;
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    // Background
+    ctx.fillStyle = 'oklch(12% 0.009 265)';
+    ctx.beginPath();
+    ctx.roundRect(0, 0, W, H, 20);
+    ctx.fill();
+
+    // Grid lines (dividers at valence=0.6, energy=0.6)
+    const gx = toX(0.6), gy = toY(0.6);
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = 'oklch(22% 0.014 265)';
+    ctx.lineWidth = 1;
+
+    ctx.beginPath();
+    ctx.moveTo(PAD, gy); ctx.lineTo(W - PAD, gy);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(gx, PAD); ctx.lineTo(gx, H - PAD);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Quadrant labels
+    ctx.font = '500 11px Inter, system-ui';
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = 'oklch(80% 0.18 155 / 0.45)';
+    ctx.fillText('Energetic & Upbeat', (gx + W - PAD) / 2, (PAD + gy) / 2);
+
+    ctx.fillStyle = 'oklch(70% 0.18 25 / 0.45)';
+    ctx.fillText('Intense & Dark', (PAD + gx) / 2, (PAD + gy) / 2);
+
+    ctx.fillStyle = 'oklch(76% 0.14 215 / 0.45)';
+    ctx.fillText('Chill & Happy', (gx + W - PAD) / 2, (gy + H - PAD) / 2);
+
+    ctx.fillStyle = 'oklch(56% 0.22 285 / 0.45)';
+    ctx.fillText('Melancholic & Calm', (PAD + gx) / 2, (gy + H - PAD) / 2);
+
+    // Axis labels
+    ctx.font = '400 10px Inter, system-ui';
+    ctx.fillStyle = 'oklch(40% 0.018 265)';
+    ctx.textAlign = 'left';
+    ctx.fillText('← Dark', PAD, H - 12);
+    ctx.textAlign = 'right';
+    ctx.fillText('Upbeat →', W - PAD, H - 12);
+    ctx.textAlign = 'center';
+    ctx.fillText('Calm', 22, H - PAD);
+    ctx.fillText('Intense', 22, PAD + 8);
+
+    // Recommendation dots
+    recs.forEach(rec => {
+      const x = toX(rec.vx), y = toY(rec.vy);
+      const pulse = 1 + 0.08 * Math.sin(t * 1.5 + rec.phase);
+      const r = 5 * pulse;
+      const c = dotColor(rec.s);
+
+      // Glow
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r * 4);
+      grad.addColorStop(0, c.glow);
+      grad.addColorStop(1, 'transparent');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(x, y, r * 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Dot
+      ctx.fillStyle = c.fill;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // Source dot ("YOU")
+    const sx = toX(src.vx), sy = toY(src.vy);
+    const srcPulse = 1 + 0.12 * Math.sin(t * 2);
+
+    // Outer ring glow
+    const srcGrad = ctx.createRadialGradient(sx, sy, 0, sx, sy, 22 * srcPulse);
+    srcGrad.addColorStop(0, 'oklch(56% 0.22 285 / 0.2)');
+    srcGrad.addColorStop(1, 'transparent');
+    ctx.fillStyle = srcGrad;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 22 * srcPulse, 0, Math.PI * 2);
+    ctx.fill();
+
+    // White fill
+    ctx.fillStyle = 'oklch(15% 0.012 265)';
+    ctx.beginPath();
+    ctx.arc(sx, sy, 9, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Purple ring
+    ctx.strokeStyle = 'oklch(56% 0.22 285)';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 9, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // "YOU" label
+    ctx.font = '700 8px Inter, system-ui';
+    ctx.fillStyle = 'oklch(56% 0.22 285)';
+    ctx.textAlign = 'center';
+    ctx.fillText('YOU', sx, sy - 18);
+
+    t += 0.016;
+    requestAnimationFrame(draw);
+  }
+
+  draw();
+})();
+
+// ── Differentiator Canvas (static Vibe Map with highlighted cluster) ──────
+(function() {
+  const canvas = document.getElementById('diffCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const PAD = 44;
+
+  const src = { vx: 0.55, vy: 0.70 };
+
+  const cluster = [
+    { vx: 0.50, vy: 0.74, s: 0.94 },
+    { vx: 0.60, vy: 0.78, s: 0.92 },
+    { vx: 0.48, vy: 0.65, s: 0.90 },
+    { vx: 0.63, vy: 0.68, s: 0.87 },
+    { vx: 0.58, vy: 0.83, s: 0.85 },
+  ];
+
+  const scattered = [
+    { vx: 0.20, vy: 0.30, s: 0.50 },
+    { vx: 0.80, vy: 0.20, s: 0.45 },
+    { vx: 0.15, vy: 0.85, s: 0.48 },
+    { vx: 0.85, vy: 0.75, s: 0.42 },
+    { vx: 0.35, vy: 0.15, s: 0.40 },
+    { vx: 0.70, vy: 0.45, s: 0.55 },
+  ];
+
+  function toX(v) { return PAD + v * (W - PAD * 2); }
+  function toY(e) { return (H - PAD) - e * (H - PAD * 2); }
+
+  let t2 = 0;
+
+  function draw2() {
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.fillStyle = 'oklch(12% 0.009 265)';
+    ctx.beginPath();
+    ctx.roundRect(0, 0, W, H, 18);
+    ctx.fill();
+
+    // Grid
+    const gx = toX(0.6), gy = toY(0.6);
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'oklch(22% 0.014 265)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD, gy); ctx.lineTo(W-PAD, gy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gx, PAD); ctx.lineTo(gx, H-PAD); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Draw cluster zone highlight
+    const cx = toX(src.vx), cy = toY(src.vy);
+    const zoneGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 90);
+    zoneGrad.addColorStop(0, 'oklch(56% 0.22 285 / 0.08)');
+    zoneGrad.addColorStop(1, 'transparent');
+    ctx.fillStyle = zoneGrad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 90, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Scattered (dim)
+    scattered.forEach(d => {
+      const x = toX(d.vx), y = toY(d.vy);
+      ctx.fillStyle = 'oklch(40% 0.018 265)';
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // Cluster dots (bright)
+    cluster.forEach((d, i) => {
+      const x = toX(d.vx), y = toY(d.vy);
+      const pulse = 1 + 0.06 * Math.sin(t2 * 1.8 + i);
+      const r = 5 * pulse;
+
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r * 3.5);
+      grad.addColorStop(0, 'oklch(76% 0.14 215 / 0.3)');
+      grad.addColorStop(1, 'transparent');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(x, y, r * 3.5, 0, Math.PI * 2); ctx.fill();
+
+      ctx.fillStyle = 'oklch(76% 0.14 215)';
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    });
+
+    // Source dot
+    const srcP = 1 + 0.1 * Math.sin(t2 * 2.2);
+    const srcGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 20 * srcP);
+    srcGrad.addColorStop(0, 'oklch(56% 0.22 285 / 0.25)');
+    srcGrad.addColorStop(1, 'transparent');
+    ctx.fillStyle = srcGrad;
+    ctx.beginPath(); ctx.arc(cx, cy, 20 * srcP, 0, Math.PI * 2); ctx.fill();
+
+    ctx.fillStyle = 'oklch(15% 0.012 265)';
+    ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'oklch(56% 0.22 285)';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.stroke();
+
+    ctx.font = '700 8px Inter, system-ui';
+    ctx.fillStyle = 'oklch(56% 0.22 285)';
+    ctx.textAlign = 'center';
+    ctx.fillText('YOU', cx, cy - 18);
+
+    t2 += 0.016;
+    requestAnimationFrame(draw2);
+  }
+
+  draw2();
+})();
+</script>
+</body>
+</html>

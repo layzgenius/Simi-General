@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Music API Alternatives for Simi — Deep Research Report</title>
+<style>
+  :root {
+    --bg: #0f0f13;
+    --surface: #1a1a22;
+    --surface2: #22222d;
+    --border: #2e2e3d;
+    --accent: #7c6df0;
+    --accent2: #b06df0;
+    --green: #4ade80;
+    --yellow: #facc15;
+    --red: #f87171;
+    --text: #e8e8f0;
+    --muted: #8888a8;
+    --tag-bg: #25253a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.7; font-size: 15px; }
+
+  .hero { background: linear-gradient(135deg, #1a1230 0%, #0f1a2e 100%); padding: 60px 40px; border-bottom: 1px solid var(--border); }
+  .hero-inner { max-width: 860px; margin: 0 auto; }
+  .hero-tag { display: inline-block; background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 4px 12px; border-radius: 4px; margin-bottom: 20px; }
+  .hero h1 { font-size: 32px; font-weight: 700; line-height: 1.25; margin-bottom: 14px; }
+  .hero p { color: var(--muted); font-size: 15px; max-width: 620px; }
+  .hero-meta { margin-top: 24px; display: flex; gap: 24px; flex-wrap: wrap; }
+  .hero-meta span { font-size: 12px; color: var(--muted); }
+  .hero-meta strong { color: var(--text); }
+
+  .container { max-width: 860px; margin: 0 auto; padding: 48px 40px; }
+
+  /* Executive Summary */
+  .exec-box { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 28px 32px; margin-bottom: 48px; }
+  .exec-box h2 { font-size: 13px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); margin-bottom: 16px; }
+  .exec-box p { color: var(--muted); margin-bottom: 10px; }
+  .exec-box p:last-child { margin-bottom: 0; }
+
+  /* Section headings */
+  h2.section-title { font-size: 22px; font-weight: 700; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+  h3.sub-title { font-size: 16px; font-weight: 600; color: var(--accent); margin: 28px 0 10px; }
+
+  /* Alert boxes */
+  .alert { border-radius: 8px; padding: 16px 20px; margin: 24px 0; font-size: 14px; }
+  .alert-red { background: #2a1a1a; border: 1px solid #5a2a2a; border-left: 4px solid var(--red); }
+  .alert-yellow { background: #2a2518; border: 1px solid #5a4a18; border-left: 4px solid var(--yellow); }
+  .alert-green { background: #1a2a1e; border: 1px solid #1e4a28; border-left: 4px solid var(--green); }
+  .alert strong { display: block; margin-bottom: 4px; }
+
+  /* API Cards */
+  .card-grid { display: grid; gap: 20px; margin: 24px 0; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 24px; transition: border-color 0.2s; }
+  .card:hover { border-color: var(--accent); }
+  .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
+  .card-name { font-size: 17px; font-weight: 700; }
+  .card-name a { color: var(--text); text-decoration: none; }
+  .card-name a:hover { color: var(--accent); }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 12px; letter-spacing: 0.03em; }
+  .badge-top { background: #2d1f5e; color: var(--accent); border: 1px solid #4a3a88; }
+  .badge-free { background: #1a2f1a; color: var(--green); border: 1px solid #2a5a2a; }
+  .badge-paid { background: #2a2018; color: var(--yellow); border: 1px solid #5a4018; }
+  .badge-oss { background: #1a2035; color: #60a5fa; border: 1px solid #2a4060; }
+  .badge-risk { background: #2a1a1a; color: var(--red); border: 1px solid #5a2a2a; }
+  .badge-new { background: #2a1a35; color: var(--accent2); border: 1px solid #4a2a5a; }
+  .card p { color: var(--muted); font-size: 14px; margin-bottom: 12px; }
+  .card-features { list-style: none; margin: 12px 0; }
+  .card-features li { font-size: 13px; color: var(--muted); padding: 3px 0; padding-left: 18px; position: relative; }
+  .card-features li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: 700; font-size: 11px; top: 5px; }
+  .card-features li.x::before { content: "✗"; color: var(--red); }
+  .card-features li.warn::before { content: "~"; color: var(--yellow); }
+  .price-tag { display: inline-block; margin-top: 10px; font-size: 13px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; color: var(--text); }
+  .price-tag strong { color: var(--green); }
+  .card-simi { font-size: 12px; margin-top: 12px; padding: 8px 12px; background: #1e1a30; border: 1px solid #3a2a5a; border-radius: 6px; color: #c4b5fd; }
+  .card-simi strong { color: var(--accent2); }
+
+  /* Comparison table */
+  .table-wrap { overflow-x: auto; margin: 24px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: var(--surface2); color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--border); color: var(--text); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); }
+  .check { color: var(--green); font-weight: 700; }
+  .cross { color: var(--red); }
+  .partial { color: var(--yellow); }
+
+  /* Recommendation tier */
+  .tier { display: flex; gap: 16px; align-items: flex-start; padding: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; }
+  .tier-num { font-size: 22px; font-weight: 800; color: var(--accent); min-width: 32px; }
+  .tier-body h4 { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  .tier-body p { font-size: 13px; color: var(--muted); }
+
+  /* TL;DR action box */
+  .action-box { background: linear-gradient(135deg, #1e1430, #131e2e); border: 1px solid #3a2a5a; border-radius: 12px; padding: 32px; margin: 40px 0; }
+  .action-box h3 { font-size: 18px; font-weight: 700; margin-bottom: 16px; }
+  .action-steps { list-style: none; counter-reset: steps; }
+  .action-steps li { counter-increment: steps; padding: 10px 0 10px 36px; position: relative; border-bottom: 1px solid var(--border); font-size: 14px; color: var(--text); }
+  .action-steps li:last-child { border-bottom: none; }
+  .action-steps li::before { content: counter(steps); position: absolute; left: 0; top: 10px; background: var(--accent); color: #fff; font-size: 11px; font-weight: 800; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+  .action-steps li span { color: var(--muted); display: block; font-size: 12px; margin-top: 2px; }
+
+  /* Sources */
+  .sources { margin-top: 48px; padding-top: 32px; border-top: 1px solid var(--border); }
+  .sources h2 { font-size: 14px; font-weight: 700; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 16px; }
+  .sources ol { padding-left: 20px; }
+  .sources li { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .sources a { color: var(--accent); text-decoration: none; }
+  .sources a:hover { text-decoration: underline; }
+
+  .section { margin-bottom: 56px; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
+
+  @media (max-width: 600px) {
+    .hero { padding: 36px 20px; }
+    .container { padding: 32px 20px; }
+    .hero h1 { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="hero-inner">
+    <span class="hero-tag">Deep Research · Simi App</span>
+    <h1>Cyanite Alternatives &amp; Spotify Quota Workarounds</h1>
+    <p>A complete guide to music audio analysis APIs for indie developers — covering emotional imprint matching, audio features (energy, valence, BPM), and how to survive Spotify's API lockdown.</p>
+    <div class="hero-meta">
+      <span><strong>Date:</strong> June 5, 2026</span>
+      <span><strong>Context:</strong> Simi iOS music discovery app</span>
+      <span><strong>Mode:</strong> Standard deep research</span>
+      <span><strong>Sources:</strong> 15+ verified</span>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Executive Summary -->
+  <div class="exec-box">
+    <h2>Executive Summary</h2>
+    <p>Spotify's double blow — deprecating audio features in November 2024 and locking extended quota behind 250k MAU in May 2025 — has effectively closed the door on indie developers relying on their API. For a vibe-matching app like Simi, this is a real problem, but a solvable one.</p>
+    <p>The best path forward is a <strong>layered strategy</strong>: Cyanite.io (or Bridge.audio) for deep emotional analysis, Musicae.io's Extended Audio Features API as a near-perfect Spotify drop-in replacement, and Last.fm for free tag-based similarity. For Simi specifically, Cyanite is the closest match to the core "emotional imprint" philosophy — it's the only API explicitly designed around musical mood and emotion rather than just technical features.</p>
+    <p>A secondary finding: Lee Martin (the author of the spotify.leemartin.com report you found) specifically names Cyanite as his recommended Spotify audio features replacement, validating this direction.</p>
+  </div>
+
+  <!-- Context -->
+  <div class="section">
+    <h2 class="section-title">The Spotify Problem — What Actually Happened</h2>
+    <div class="alert alert-red">
+      <strong>⚠️ Two separate blows, 6 months apart</strong>
+      November 2024: Spotify deprecated <code>/audio-features</code>, <code>/audio-analysis</code>, <code>/recommendations</code>, and <code>/artists/{id}/related-artists</code> for new apps. May 2025: Extended quota mode now requires a legally registered business with 250,000 MAU minimum — making it unreachable for solo developers.
+    </div>
+    <p>The leemartin.dev State of Spotify Web API Report 2025 puts it bluntly: <em>"250,000 MAUs. This means that you need to have a massively successful app before seeking an integration with the Spotify Web API."</em> It's a catch-22 — you can't get access until you've already grown, but you can't grow without access.</p>
+    <p>For Simi, which currently uses Spotify links as input and relies on audio features for emotional matching, this means two things need solving: (1) getting audio feature data without Spotify's restricted endpoints, and (2) considering whether to reduce reliance on Spotify as the primary source of truth entirely.</p>
+
+    <h3 class="sub-title">What the leemartin.com report specifically recommends</h3>
+    <p>Lee Martin's report is worth reading in full. For the audio features gap specifically, he writes: <em>"I've been eyeing Cyanite as a potential alternative to Audio Features. Cyanite's business is analyzing the emotions of music and offers all of the measurements the Spotify Web API previously provided alongside even more data."</em> He also recommends the iTunes Search API for basic metadata lookup (no auth required) and Apple Music / MusicKit for playback and playlist creation.</p>
+  </div>
+
+  <!-- Category 1: Spotify Drop-ins -->
+  <div class="section">
+    <h2 class="section-title">Category 1 — Spotify Drop-in Replacements</h2>
+    <p style="color:var(--muted); margin-bottom:20px;">These restore the exact Spotify endpoints that were deprecated — same JSON format, same field names. Minimal code changes required if you're already using Spotify's API structure.</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://rapidapi.com/musicae-musicae-default/api/spotify-extended-audio-features-api" target="_blank">Musicae.io — Spotify Extended Audio Features API</a></div>
+          <div class="badges">
+            <span class="badge badge-top">Top Pick</span>
+            <span class="badge badge-new">New 2026</span>
+            <span class="badge badge-paid">RapidAPI</span>
+          </div>
+        </div>
+        <p>Built specifically because there was no stable Spotify audio features replacement. Mirrors Spotify's exact request/response format — literally a drop-in replacement. Restores all the deprecated endpoints.</p>
+        <ul class="card-features">
+          <li>Restores <code>/audio-features</code>, <code>/recommendations</code>, <code>/related-artists</code></li>
+          <li>Identical JSON response format to Spotify (valence, energy, danceability, tempo, key, etc.)</li>
+          <li>No OAuth / no 403 errors / no quota restrictions</li>
+          <li>Sub-second response times</li>
+          <li>Also has "DJ Track Audio Analysis API" with deeper scores: <code>dance_floor</code>, <code>chill</code>, <code>aggressive</code>, <code>hype</code>, <code>groove</code>, <code>peak_time</code></li>
+          <li>Available on RapidAPI (tiered pricing)</li>
+          <li class="warn">Relatively new (launched 2026) — maturity/longevity unproven</li>
+          <li class="warn">Available through RapidAPI only — third-party dependency</li>
+        </ul>
+        <div class="price-tag"><strong>Free tier</strong> via RapidAPI (limited calls) → paid tiers</div>
+        <div class="card-simi"><strong>For Simi:</strong> Best option if you want to keep your current Spotify-style data model with zero refactoring. The DJ Analysis API's emotional scores (chill, hype, groove) align well with Simi's vibe-matching goals.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Category 2: Cyanite-style audio intelligence -->
+  <div class="section">
+    <h2 class="section-title">Category 2 — AI Music Intelligence APIs (Cyanite Alternatives)</h2>
+    <p style="color:var(--muted); margin-bottom:20px;">These go beyond raw audio features — they use AI to understand emotional content, scene context, and sonic similarity. Closest to Simi's core "emotional imprint" concept.</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://cyanite.ai/" target="_blank">Cyanite.io</a></div>
+          <div class="badges">
+            <span class="badge badge-top">Best for Simi</span>
+            <span class="badge badge-free">Free test tier</span>
+          </div>
+        </div>
+        <p>The incumbent and most established AI music analysis API. Explicitly designed around the emotional content of music — not just technical features. Lee Martin specifically recommends it as his Spotify audio features replacement.</p>
+        <ul class="card-features">
+          <li>AI-generated mood, energy, genre, BPM tags</li>
+          <li>Similarity Search — matches tracks by sound, vibe, and era</li>
+          <li>Natural language search ("upbeat late-night indie pop")</li>
+          <li>Valence, arousal, emotional quadrant analysis</li>
+          <li>Upload your own audio OR search existing catalog</li>
+          <li>GraphQL API</li>
+          <li>Free tier available to test</li>
+          <li class="warn">Can struggle with low-quality audio files (demos)</li>
+          <li class="warn">Pricing scales up for catalog-level volume — not cheap at scale</li>
+        </ul>
+        <div class="price-tag">Free test tier → contact for paid plans</div>
+        <div class="card-simi"><strong>For Simi:</strong> The strongest philosophical match. Cyanite's approach to emotional quadrant analysis (valence × arousal) is essentially what Simi's Vibe Map is already doing. Deep integration could unlock the "emotional imprint" layer that makes Simi unique vs. generic music apps.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://www.bridge.audio/features/api/" target="_blank">Bridge.audio</a></div>
+          <div class="badges">
+            <span class="badge badge-paid">Enterprise lean</span>
+          </div>
+        </div>
+        <p>AI auto-tagging API validated by ~20 years of musicologist expertise. Highly detailed, consistent taxonomy for genre, mood, vocals, and instrumentation. Designed for music libraries and sync agencies at scale.</p>
+        <ul class="card-features">
+          <li>AI-powered mood, genre, vocal, instrumentation tags</li>
+          <li>Curated thesaurus refined by musicologists over 20 years</li>
+          <li>Webhook delivery for async batch processing</li>
+          <li>Upload audio → get structured tags</li>
+          <li class="warn">Positioned more toward professional music libraries and distributors</li>
+          <li class="warn">Pricing not indie-friendly — likely enterprise tiers</li>
+          <li class="warn">Less focused on similarity search vs. Cyanite</li>
+        </ul>
+        <div class="price-tag">Contact for pricing (likely $$)</div>
+        <div class="card-simi"><strong>For Simi:</strong> Excellent tag quality but probably over-priced for solo dev stage. Worth revisiting once Simi is generating revenue or needs catalog-level tagging.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://musicatlas.ai/developer/" target="_blank">MusicAtlas</a></div>
+          <div class="badges">
+            <span class="badge badge-new">Newer</span>
+          </div>
+        </div>
+        <p>Open music search and discovery infrastructure. Supports track-to-track similarity, mood/scene/lyrical search, and catalog matching. Pitched at technical founders building discovery and recommendation features.</p>
+        <ul class="card-features">
+          <li>Track-to-track similarity (up to 20 results per query)</li>
+          <li>Search by mood, scene, lyrical idea, or sonic reference</li>
+          <li>Audio traits, genre, platform metadata, possible influences</li>
+          <li>Designed for "more like this" recommendation flows</li>
+          <li class="warn">Pricing not publicly listed — requires API key request</li>
+          <li class="warn">Catalog coverage unclear vs. Spotify's 100M+ tracks</li>
+        </ul>
+        <div class="price-tag">Request API key at musicatlas.ai/developer/request-key</div>
+        <div class="card-simi"><strong>For Simi:</strong> The "search by scene or mood" capability is very relevant. Worth requesting an API key and testing — could complement Cyanite well for the discovery layer.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Category 3: Free/Cheap metadata -->
+  <div class="section">
+    <h2 class="section-title">Category 3 — Free & Low-Cost Metadata APIs</h2>
+    <p style="color:var(--muted); margin-bottom:20px;">Great for bootstrapping, layering additional signals, or supplementing more expensive APIs. Lower precision than AI-based tools but free to start.</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://www.last.fm/api" target="_blank">Last.fm API</a></div>
+          <div class="badges">
+            <span class="badge badge-free">Free</span>
+            <span class="badge badge-top">Already in Simi</span>
+          </div>
+        </div>
+        <p>One of the oldest and most comprehensive free music metadata APIs. Community-driven tags give surprisingly rich mood/genre data. Simi is already using this — key to understand what it can and can't do.</p>
+        <ul class="card-features">
+          <li>Free, up to 5 requests/second</li>
+          <li>Similar tracks and similar artists endpoints</li>
+          <li>Top tags per artist/track (mood, genre, decade — community-generated)</li>
+          <li>Artist bios, album data, listening counts</li>
+          <li>Tag similarity search</li>
+          <li class="warn">Tags are community-driven, not AI — inconsistent precision</li>
+          <li class="warn">No quantitative scores (no valence 0–1 scale like Spotify)</li>
+          <li class="warn">Coverage gaps for newer/indie artists</li>
+        </ul>
+        <div class="price-tag"><strong>Free</strong> — no credit card, generous rate limits</div>
+        <div class="card-simi"><strong>For Simi:</strong> Already integrated. Best used as a supplementary signal layer — especially for the "Same Genre / Same Mood" tags in your list view. Not sufficient alone for emotional imprint matching.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://soundcharts.com/en/audio-features-api" target="_blank">Soundcharts Audio Features API</a></div>
+          <div class="badges">
+            <span class="badge badge-free">1,000 free requests</span>
+            <span class="badge badge-paid">Paid tiers</span>
+          </div>
+        </div>
+        <p>Provides the full Spotify-equivalent audio features suite — without needing to upload audio. Look up tracks by ISRC or Spotify/Apple Music ID. No credit card required to start.</p>
+        <ul class="card-features">
+          <li>BPM, key, time signature, energy, valence, danceability, acousticness, instrumentalness, speechiness, liveness, loudness</li>
+          <li>No audio upload — use ISRC or platform track ID</li>
+          <li>1,000 free requests, no credit card required</li>
+          <li>Paid plans billed monthly</li>
+          <li class="warn">Covers existing catalog tracks only (no custom audio analysis)</li>
+        </ul>
+        <div class="price-tag"><strong>1,000 free requests</strong> → monthly paid plans</div>
+        <div class="card-simi"><strong>For Simi:</strong> Strong pragmatic choice for an early-stage MVP — gives Spotify-quality features for catalog tracks with zero friction to start. Pair with Last.fm tags for a free-tier combination that covers most use cases.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://audd.io/" target="_blank">AudD</a></div>
+          <div class="badges">
+            <span class="badge badge-free">300 free/month</span>
+            <span class="badge badge-paid">$2–5/1k</span>
+          </div>
+        </div>
+        <p>Primarily a music recognition (fingerprinting) API. Useful if you need to identify audio from a clip rather than look up known tracks. Less relevant for mood/energy analysis.</p>
+        <ul class="card-features">
+          <li>Audio fingerprinting from file, stream, or URL</li>
+          <li>Returns title, artist, album, ISRC, UPC</li>
+          <li>160M track database</li>
+          <li>Enterprise endpoint supports full-length files with timestamps</li>
+          <li class="warn">Recognition, not analysis — no mood/energy scores</li>
+          <li class="warn">300 free requests/month is low for production use</li>
+        </ul>
+        <div class="price-tag">300 free/month → <strong>$2–5 per 1,000 requests</strong></div>
+        <div class="card-simi"><strong>For Simi:</strong> Useful if you add a "hum or sing to find similar songs" feature. Not useful for the core audio features use case.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://performance-partners.apple.com/search-api" target="_blank">iTunes Search API</a></div>
+          <div class="badges">
+            <span class="badge badge-free">Completely free</span>
+          </div>
+        </div>
+        <p>Lee Martin's recommended alternative for basic music search. No authentication required, returns ISRCs which can be used to cross-reference other APIs. Also provides 30-second audio previews (which Spotify deprecated).</p>
+        <ul class="card-features">
+          <li>No authentication whatsoever</li>
+          <li>Track, album, artist metadata</li>
+          <li>ISRC included — cross-reference with other APIs</li>
+          <li>30-second audio previews still available</li>
+          <li class="warn">No audio features (energy, mood, valence)</li>
+          <li class="warn">Metadata only — use as a search/lookup layer</li>
+        </ul>
+        <div class="price-tag"><strong>Free</strong> — no key required</div>
+        <div class="card-simi"><strong>For Simi:</strong> Great as a search fallback when Spotify returns no results. The free preview audio could be useful for a "preview before saving" feature. Use ISRC to cross-reference with Soundcharts or Cyanite.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Category 4: Open Source -->
+  <div class="section">
+    <h2 class="section-title">Category 4 — Open Source / Self-Hosted</h2>
+
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-name"><a href="https://essentia.upf.edu/" target="_blank">Essentia (MTG/UPF)</a></div>
+          <div class="badges">
+            <span class="badge badge-oss">Open Source</span>
+            <span class="badge badge-free">Free (self-hosted)</span>
+          </div>
+        </div>
+        <p>Industry-standard open-source C++ audio analysis library from the Music Technology Group at UPF Barcelona. The same engine that powered AcousticBrainz. If you run it yourself, there are zero API costs.</p>
+        <ul class="card-features">
+          <li>BPM, key, energy, loudness, danceability</li>
+          <li>Mood models (happy/sad, aggressive/relaxed, etc.) via deep learning</li>
+          <li>Tonal, spectral, and temporal descriptors</li>
+          <li>Python and JavaScript (Essentia.js) bindings</li>
+          <li>Partial iOS support (cross-compiled)</li>
+          <li>AGPLv3 license (or commercial license on request)</li>
+          <li class="warn">Steep integration effort — especially for Swift/iOS on-device</li>
+          <li class="warn">Requires server infrastructure if running server-side</li>
+          <li class="warn">No built-in similarity search — you build that layer yourself</li>
+        </ul>
+        <div class="price-tag"><strong>$0</strong> — self-hosted, but engineering cost is real</div>
+        <div class="card-simi"><strong>For Simi:</strong> Best long-term option if you want full control and zero per-query cost at scale. Realistically, this is a V2 or V3 investment — the engineering lift is significant for iOS. Consider a server-side microservice wrapping Essentia + Python.</div>
+      </div>
+    </div>
+
+    <div class="alert alert-yellow">
+      <strong>⚠️ AcousticBrainz — Archived</strong>
+      AcousticBrainz (also built on Essentia) stopped collecting data in 2022. The existing dataset is still downloadable but there's no live API. Useful as a reference dataset but not for production use.
+    </div>
+  </div>
+
+  <!-- Comparison Table -->
+  <div class="section">
+    <h2 class="section-title">Head-to-Head Comparison</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>API</th>
+            <th>Mood/Emotion</th>
+            <th>Energy/Valence</th>
+            <th>BPM</th>
+            <th>Similarity</th>
+            <th>Free Tier</th>
+            <th>Indie Friendly</th>
+            <th>No Audio Upload</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Cyanite.io</strong></td>
+            <td><span class="check">✓✓</span> AI-powered</td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓✓</span> Native</td>
+            <td><span class="partial">~</span> Test only</td>
+            <td><span class="partial">~</span> Mid-tier</td>
+            <td><span class="partial">~</span> Catalog + upload</td>
+          </tr>
+          <tr>
+            <td><strong>Musicae.io (Extended)</strong></td>
+            <td><span class="partial">~</span> Valence proxy</td>
+            <td><span class="check">✓✓</span> Full Spotify set</td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓</span> Recommendations</td>
+            <td><span class="partial">~</span> RapidAPI free tier</td>
+            <td><span class="check">✓✓</span></td>
+            <td><span class="check">✓</span> ID-based</td>
+          </tr>
+          <tr>
+            <td><strong>Soundcharts</strong></td>
+            <td><span class="partial">~</span> Valence score</td>
+            <td><span class="check">✓✓</span> Full suite</td>
+            <td><span class="check">✓</span></td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="check">✓</span> 1,000 req</td>
+            <td><span class="check">✓✓</span></td>
+            <td><span class="check">✓✓</span> ISRC/ID</td>
+          </tr>
+          <tr>
+            <td><strong>Last.fm</strong></td>
+            <td><span class="partial">~</span> Community tags</td>
+            <td><span class="cross">✗</span> No scores</td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="check">✓</span> Similar tracks</td>
+            <td><span class="check">✓✓</span> Fully free</td>
+            <td><span class="check">✓✓</span></td>
+            <td><span class="check">✓</span></td>
+          </tr>
+          <tr>
+            <td><strong>MusicAtlas</strong></td>
+            <td><span class="check">✓</span> Scene/mood</td>
+            <td><span class="partial">~</span> Audio traits</td>
+            <td><span class="partial">~</span></td>
+            <td><span class="check">✓✓</span> Core feature</td>
+            <td><span class="partial">~</span> Unknown</td>
+            <td><span class="partial">~</span> Unknown</td>
+            <td><span class="check">✓</span></td>
+          </tr>
+          <tr>
+            <td><strong>Bridge.audio</strong></td>
+            <td><span class="check">✓✓</span> Deep AI tags</td>
+            <td><span class="partial">~</span></td>
+            <td><span class="check">✓</span></td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="cross">✗</span> Enterprise</td>
+            <td><span class="cross">✗</span> Upload required</td>
+          </tr>
+          <tr>
+            <td><strong>Essentia</strong></td>
+            <td><span class="check">✓✓</span> ML models</td>
+            <td><span class="check">✓✓</span></td>
+            <td><span class="check">✓✓</span></td>
+            <td><span class="cross">✗</span> DIY</td>
+            <td><span class="check">✓✓</span> OSS</td>
+            <td><span class="check">✓</span> If self-hosted</td>
+            <td><span class="cross">✗</span> Upload required</td>
+          </tr>
+          <tr>
+            <td><strong>AudD</strong></td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="cross">✗</span></td>
+            <td><span class="partial">~</span> 300/mo</td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓</span> Fingerprint</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Recommendation -->
+  <div class="section">
+    <h2 class="section-title">Recommended Stack for Simi</h2>
+    <p style="color:var(--muted); margin-bottom:20px;">A layered approach — each tier adds depth while managing cost. You don't need all of these at once; start with Tier 1+2 and layer up as you grow.</p>
+
+    <div class="tier">
+      <div class="tier-num">1</div>
+      <div class="tier-body">
+        <h4>Cyanite.io — Emotional intelligence core</h4>
+        <p>For Simi's "emotional imprint" philosophy, this is the best fit. It's the only API built around the emotional content of music — not just technical features. Use it for the vibe-matching layer. Free test tier lets you validate before committing.</p>
+      </div>
+    </div>
+
+    <div class="tier">
+      <div class="tier-num">2</div>
+      <div class="tier-body">
+        <h4>Musicae.io Extended Audio Features (via RapidAPI) — Spotify drop-in</h4>
+        <p>Restores <code>/audio-features</code> and <code>/recommendations</code> with zero code changes. Use this to keep your existing data model working while you evaluate deeper emotional APIs. The DJ Analysis API's extra scores (hype, chill, groove) are a bonus that directly serve Simi's vibe concept.</p>
+      </div>
+    </div>
+
+    <div class="tier">
+      <div class="tier-num">3</div>
+      <div class="tier-body">
+        <h4>Soundcharts Audio Features API — Free catalog lookup</h4>
+        <p>1,000 free requests with no credit card. Look up any catalog track by ISRC. Use as a fallback or to pre-cache features for the most popular tracks your users search. Reduces calls to paid APIs.</p>
+      </div>
+    </div>
+
+    <div class="tier">
+      <div class="tier-num">4</div>
+      <div class="tier-body">
+        <h4>Last.fm API — Free similarity &amp; tags</h4>
+        <p>Already in Simi. Fully free. Continue using for the "Same Genre / Same Mood" tags and similar artist graph. Layer on top of AI-scored results for richer reason strings shown to users.</p>
+      </div>
+    </div>
+
+    <div class="tier">
+      <div class="tier-num">5</div>
+      <div class="tier-body">
+        <h4>iTunes Search API — Zero-auth metadata fallback</h4>
+        <p>Use for track lookup when Spotify search is unavailable or rate-limited. ISRCs from iTunes let you cross-reference with Soundcharts and Cyanite. 30-second preview clips are a potential UX win.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Action Plan -->
+  <div class="action-box">
+    <h3>🎯 Concrete Next Steps for Simi</h3>
+    <ol class="action-steps">
+      <li>
+        Sign up for Cyanite.io free test tier and run 10–20 tracks through their API
+        <span>Compare their emotional tags against what Simi currently shows. Look specifically at mood/arousal quadrant outputs.</span>
+      </li>
+      <li>
+        Get a RapidAPI key and test Musicae.io's Extended Audio Features endpoint
+        <span>Test <code>/audio-features/{spotify_id}</code> with a handful of track IDs. Confirm the response format matches Spotify's exactly.</span>
+      </li>
+      <li>
+        Sign up for Soundcharts API (no credit card) and test audio feature lookup by ISRC
+        <span>Use iTunes Search API to get ISRCs for free, then feed them into Soundcharts. This gives you Spotify-quality features for free up to 1,000 requests.</span>
+      </li>
+      <li>
+        For the Cyanite innovator program application — answer "B) &lt; 10,000" audios
+        <span>Honest for MVP scale. If accepted, Cyanite's program may include extended API access that reduces cost concerns significantly.</span>
+      </li>
+      <li>
+        Reduce hard dependency on Spotify as input source
+        <span>Consider accepting Apple Music links, SoundCloud links, and YouTube Music links in addition to Spotify. iTunes Search API + ISRC cross-referencing makes this feasible without much overhead.</span>
+      </li>
+    </ol>
+  </div>
+
+  <!-- Sources -->
+  <div class="sources">
+    <h2>Sources</h2>
+    <ol>
+      <li><a href="https://spotify.leemartin.com/" target="_blank">State of Spotify Web API Report 2025 — Lee Martin</a></li>
+      <li><a href="https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api" target="_blank">Introducing some changes to our Web API — Spotify for Developers (Nov 2024)</a></li>
+      <li><a href="https://developer.spotify.com/blog/2025-04-15-updating-the-criteria-for-web-api-extended-access" target="_blank">Updating the Criteria for Web API Extended Access — Spotify for Developers (Apr 2025)</a></li>
+      <li><a href="https://medium.com/@musicae.io/spotify-audio-analysis-was-deprecated-heres-the-best-spotify-api-alternative-for-developers-585750724f48" target="_blank">Spotify Audio Analysis Was Deprecated: Here's the Best Spotify API Alternative — Musicae.io (Mar 2026)</a></li>
+      <li><a href="https://cyanite.ai/" target="_blank">Cyanite.ai — AI music tagging and similarity search</a></li>
+      <li><a href="https://soundcharts.com/en/audio-features-api" target="_blank">Soundcharts Audio Features API: BPM, Key &amp; Time Signature</a></li>
+      <li><a href="https://www.last.fm/api" target="_blank">Last.fm API Docs</a></li>
+      <li><a href="https://essentia.upf.edu/" target="_blank">Essentia — Open Source C++ Audio Analysis Library (MTG/UPF)</a></li>
+      <li><a href="https://audd.io/" target="_blank">AudD Music Recognition API</a></li>
+      <li><a href="https://musicatlas.ai/developer/" target="_blank">MusicAtlas Developer API</a></li>
+      <li><a href="https://www.bridge.audio/features/api/" target="_blank">Bridge.audio Auto-tagging API</a></li>
+      <li><a href="https://www.beatoven.ai/blog/best-cyanite-ai-alternatives/" target="_blank">3 Best Cyanite AI Alternatives for Music Analysis in 2025 — Beatoven.ai</a></li>
+      <li><a href="https://www.bridge.audio/blog/benchmark-of-the-best-ai-for-music-analysis-in-2025/" target="_blank">Benchmark of the best AI for music analysis in 2025 — Bridge.audio</a></li>
+      <li><a href="https://developer.spotify.com/documentation/web-api/concepts/quota-modes" target="_blank">Quota modes — Spotify for Developers</a></li>
+      <li><a href="https://developers.soundcharts.com/pricing" target="_blank">Soundcharts API Pricing</a></li>
+    </ol>
+  </div>
+
+</div>
+</body>
+</html>

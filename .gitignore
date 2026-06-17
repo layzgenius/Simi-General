@@ -1,0 +1,31 @@
+# Xcode
+*.xcuserstate
+*.xcbkptlist
+xcuserdata/
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ─────────────────────────────────────────────────────
+# SECRETS — never commit these files
+# Copy APIKeys.swift.template → APIKeys.swift and fill in real keys
+# ─────────────────────────────────────────────────────
+Simi/Simi/APIKeys.swift
+# deploy.sh contains live Cloudflare + Spotify credentials — never commit
+backend/spotify-token-proxy/deploy.sh
