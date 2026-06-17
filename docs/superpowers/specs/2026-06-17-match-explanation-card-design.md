@@ -160,6 +160,8 @@ Genre bridge 🌉     Jazz → Hip-Hop
 ### Timing
 `matchExplanation` is nil until `enrichWithABFeatures` runs (Stage 1, ~5s after display). Since `isExpanded` defaults to false, users never see a blank explanation panel — they can only expand after enrichment has populated `audioFeatures`, which is the same gate that triggers the explanation computation.
 
+Rows 1 and 2 (Emotional weight, Intensity) are intentionally absent until Stage 2 librosa enrichment completes — tag-estimated valence and energy values are genre-centroid defaults, not real measurements. The card fills in progressively as confidence increases. This is by design, not a loading gap.
+
 ### Fallback behavior in `SongCard`
 ```swift
 if let explanation = song.matchExplanation,
