@@ -1895,7 +1895,9 @@ class RecommendationEngine: ObservableObject {
             adjustedScore = totalScore
         }
 
+        #if DEBUG
         simiLog("🎯 [\(target.isEstimated ? "est" : "lib")] src=\(String(format:"%.2f",source.energy))/\(String(format:"%.2f",source.valence)) tgt=\(String(format:"%.2f",target.energy))/\(String(format:"%.2f",target.valence)) raw=\(String(format:"%.3f",totalScore)) avail=\(String(format:"%.2f",availableWeight)) adj=\(String(format:"%.3f",adjustedScore))")
+        #endif
 
         // For estimated features the first two slots are energy + mood — far more useful
         // than a generic "Same Genre" label. Only prepend genre for measured features.
