@@ -109,7 +109,7 @@ struct HomeView: View {
                 .foregroundStyle(LinearGradient.simiBrand)
                 .accessibilityLabel("Simi")
 
-            Text("find songs that feel the same")
+            Text("Paste any song. We'll find its emotional kin.")
                 .font(.simiBody.weight(.medium))
                 .foregroundColor(.simiSubtext)
         }
