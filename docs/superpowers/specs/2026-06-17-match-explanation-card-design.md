@@ -133,7 +133,8 @@ Different modes → row hidden.
 
 Compares `detectGenreFamily(sourceGenres)` vs `detectGenreFamily([targetGenre])`.  
 If genre families differ → `genreBridgeLabel = "\(sourceGenre.main) → \(targetGenre.main)"`  
-If same family → `genreBridgeLabel = nil`, row hidden.
+If same family → `genreBridgeLabel = nil`, row hidden.  
+If either genre family resolves to `.unknown` → `genreBridgeLabel = nil`. A bridge label like "Unknown → Jazz" carries no useful signal.
 
 ---
 
