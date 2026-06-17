@@ -1035,7 +1035,6 @@ class RecommendationEngine: ObservableObject {
     }
 
     // ──────────────────────────────────────────────
-    // ──────────────────────────────────────────────
     // MARK: - Match Explanation Builder
     // ──────────────────────────────────────────────
 
@@ -1114,7 +1113,7 @@ class RecommendationEngine: ObservableObject {
         // Genre bridge — compare genre families; show when they differ and both are known
         let sourceFamily = detectGenreFamily(sourceGenres)
         let targetFamily = detectGenreFamily([targetGenre])
-        var genreBridgeLabel: String? = nil
+        var genreBridgeLabel: String?
         if sourceFamily != targetFamily, sourceFamily != .unknown, targetFamily != .unknown,
            let srcGenreName = sourceGenres.first?.main {
             genreBridgeLabel = "\(srcGenreName) → \(targetGenre.main)"
