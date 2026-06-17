@@ -70,19 +70,21 @@ class RecommendationEngine: ObservableObject {
     /// Priority: Last.fm → iTunes Search API
     /// Returns at least [Genre(main: "Unknown")] — never empty.
     private func fetchGenresWithFallback(title: String, artist: String) async -> [Genre] {
-        // Stage 0: Supabase tag cache — instant, no API call needed
-        if let cached = await supabase.lookupTags(title: title, artist: artist), !cached.isEmpty {
-            return genresFromRawTags(cached)
+        // Stage 0: Supabase tag cache — instant, no API call needed.
+        // Require > 1 tag: single-tag entries were written by the old fetchTags path and
+        // reflect only the top genre (e.g. ["classic rock"]), losing "blues" for blues
+        // artists. Fall through to Stage 1 to refresh with the full raw-tag list.
+        if let cached = await supabase.lookupTags(title: title, artist: artist), cached.count > 1 {
+            return cached.map { Genre(main: $0.capitalized) }
         }
 
-        // Stage 1: Last.fm
-        if let lastFMGenres = try? await lastFMService.fetchTags(title: title, artist: artist),
-           !lastFMGenres.isEmpty,
-           lastFMGenres.first?.main != "Unknown" {
-            let rawTags = lastFMGenres.map { $0.main.lowercased() }
-            // Fire-and-forget — don't block the return path on a cache write
-            Task { await supabase.storeTags(title: title, artist: artist, tags: rawTags, source: "lastfm") }
-            return lastFMGenres
+        // Stage 1: Last.fm raw tags — returns the full ordered tag list (e.g. ["blues",
+        // "singer-songwriter", "classic rock"]), unlike fetchTags which returns only the
+        // top genre as a single Genre object and causes blues songs to resolve as .rock.
+        let rawLastFMTags = await lastFMService.fetchRawTags(title: title, artist: artist)
+        if !rawLastFMTags.isEmpty {
+            Task { await supabase.storeTags(title: title, artist: artist, tags: rawLastFMTags, source: "lastfm") }
+            return rawLastFMTags.map { Genre(main: $0.capitalized) }
         }
 
         // Stage 2: iTunes Search API
@@ -185,6 +187,10 @@ class RecommendationEngine: ObservableObject {
             "post-rock", "post-punk", "shoegaze", "darkwave", "hard rock", "classic rock",
             "grunge", "new wave", "progressive rock", "prog rock", "nu-metal", "metalcore",
             "pop punk", "folk rock",
+            // Blues — must be in specificSubgenres so it wins priority over "classic rock"
+            // when both appear in the tag list (e.g. Chris Isaak: "blues, singer-songwriter,
+            // classic rock" → primary="blues", not "classic rock" → detectGenreFamily → .blues).
+            "blues", "blues rock", "delta blues", "chicago blues", "swamp rock",
             // Acoustic / World
             "disco", "funk", "reggae", "dancehall", "ska",
             "afrobeats", "afropop",
@@ -339,6 +345,7 @@ class RecommendationEngine: ObservableObject {
                 history.record(song: song, query: urlString)
             }
             isLoading = false
+            infoMessage = "Fine-tuning scores…"
 
             // Background: embed result candidates so the catalog self-populates.
             if sourceFeatures.dclapEmbedding != nil {
@@ -346,6 +353,7 @@ class RecommendationEngine: ObservableObject {
             }
 
             await enrichWithABFeatures(sourceFeatures: sourceFeatures, genres: genres)
+            infoMessage = nil
             return
 
         } catch let error as SimiError {
@@ -522,12 +530,14 @@ class RecommendationEngine: ObservableObject {
             self.recommendations = merged
             history.record(song: song, query: query)
             isLoading = false
+            infoMessage = "Fine-tuning scores…"
 
             if sourceFeatures.dclapEmbedding != nil {
                 Task { await self.embedCandidatesInBackground(songs: merged, sourceFeatures: sourceFeatures) }
             }
 
             await enrichWithABFeatures(sourceFeatures: sourceFeatures, genres: genres)
+            infoMessage = nil
             return
 
         } catch let error as SimiError {
@@ -683,12 +693,14 @@ class RecommendationEngine: ObservableObject {
                 history.record(song: song, query: "\(song.title) \(song.artist)")
             }
             isLoading = false
+            infoMessage = "Fine-tuning scores…"
 
             if blended.dclapEmbedding != nil {
                 Task { await self.embedCandidatesInBackground(songs: merged, sourceFeatures: blended) }
             }
 
             await enrichWithABFeatures(sourceFeatures: blended, genres: mergedGenres, seedFeatures: allFeatures)
+            infoMessage = nil
 
         } catch let error as SimiError {
             errorMessage = error.localizedDescription
@@ -1023,6 +1035,94 @@ class RecommendationEngine: ObservableObject {
     }
 
     // ──────────────────────────────────────────────
+    // ──────────────────────────────────────────────
+    // MARK: - Match Explanation Builder
+    // ──────────────────────────────────────────────
+
+    /// Generates a human-readable explanation of why `target` was recommended for `source`.
+    /// Only includes rows where the data is reliable and the match is close enough to describe.
+    /// Called from enrichWithABFeatures after features are known — never in the initial mergeAndScore pass.
+    private func buildMatchExplanation(
+        source: AudioFeatures,
+        target: AudioFeatures,
+        sourceGenres: [Genre],
+        targetGenre: Genre
+    ) -> MatchExplanation {
+        var rows: [MatchExplanationRow] = []
+
+        // Row 1: Emotional weight — valence (prefer DEAM-regressed value, consistent with computeSimilarity)
+        let srcValence = source.valenceEssentia ?? source.valence
+        let tgtValence = target.valenceEssentia ?? target.valence
+        if abs(srcValence - tgtValence) < 0.20 {
+            let avg = (srcValence + tgtValence) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.35:        descriptor = "Same melancholic weight"
+            case 0.35..<0.50:    descriptor = "Same bittersweet edge"
+            case 0.50..<0.65:    descriptor = "Same balanced mood"
+            default:             descriptor = "Same bright energy"
+            }
+            rows.append(MatchExplanationRow(label: "Emotional weight", descriptor: descriptor))
+        }
+
+        // Row 2: Intensity — energy
+        if abs(source.energy - target.energy) < 0.20 {
+            let avg = (source.energy + target.energy) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.35:        descriptor = "Equally restrained"
+            case 0.35..<0.55:    descriptor = "Equally measured"
+            case 0.55..<0.75:    descriptor = "Equally driven"
+            default:             descriptor = "Equally intense"
+            }
+            rows.append(MatchExplanationRow(label: "Intensity", descriptor: descriptor))
+        }
+
+        // Row 3: Key — only when both songs have a real measured key (not a C-Major placeholder)
+        if !source.isKeyEstimated && !target.isKeyEstimated && source.mode == target.mode {
+            let descriptor = source.mode == 1 ? "Both major key" : "Both minor key"
+            rows.append(MatchExplanationRow(label: "Key", descriptor: descriptor))
+        }
+
+        // Row 4: Groove feel — librosa only (grooveRatio is nil for tag-estimated songs)
+        if let srcGroove = source.grooveRatio, let tgtGroove = target.grooveRatio,
+           abs(srcGroove - tgtGroove) < 0.35 {
+            let avg = (srcGroove + tgtGroove) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.5:         descriptor = "Smooth and flowing"
+            case 0.5..<0.9:      descriptor = "Equally measured pulse"
+            default:             descriptor = "Equally syncopated"
+            }
+            rows.append(MatchExplanationRow(label: "Groove feel", descriptor: descriptor))
+        }
+
+        // Row 5: Sonic texture — librosa only (spectralWarmth defaults to 0.5 for estimated songs,
+        // but isEstimated=false is the reliable gate since 0.5 is also a valid measured value)
+        if !source.isEstimated && !target.isEstimated,
+           abs(source.spectralWarmth - target.spectralWarmth) < 0.20 {
+            let avg = (source.spectralWarmth + target.spectralWarmth) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.35:        descriptor = "Both bright and airy"
+            case 0.35..<0.65:    descriptor = "Similar tonal warmth"
+            default:             descriptor = "Both warm and full"
+            }
+            rows.append(MatchExplanationRow(label: "Sonic texture", descriptor: descriptor))
+        }
+
+        // Genre bridge — compare genre families; show when they differ and both are known
+        let sourceFamily = detectGenreFamily(sourceGenres)
+        let targetFamily = detectGenreFamily([targetGenre])
+        var genreBridgeLabel: String? = nil
+        if sourceFamily != targetFamily, sourceFamily != .unknown, targetFamily != .unknown,
+           let srcGenreName = sourceGenres.first?.main {
+            genreBridgeLabel = "\(srcGenreName) → \(targetGenre.main)"
+        }
+
+        return MatchExplanation(rows: rows, genreBridgeLabel: genreBridgeLabel)
+    }
+
     // MARK: - Background AcousticBrainz Enrichment
     // ──────────────────────────────────────────────
 
@@ -1044,15 +1144,16 @@ class RecommendationEngine: ObservableObject {
 
         simiLog("🎵 Starting tag-feature enrichment for \(snapshot.count) songs...")
 
-        // Fill preview URLs first — batch needs them for librosa analysis.
-        await fillMissingPreviewURLs()
+        // Warm up the Railway container now so it's hot when batch-analyze fires after Stage 1.
+        // Cold starts take 5-15s; running this concurrently with tag estimation absorbs that cost.
+        let warmupTask = Task { await self.simiAudioService.warmUp() }
 
-        // Batch and tag estimation run concurrently:
-        // wall time = max(batch_time, slowest_tag_task).
-        let librosaURLs = recommendations.prefix(6).compactMap { $0.previewURL }
-        let batchTask = Task<[String: AudioFeatures], Never> {
-            await self.simiAudioService.batchAnalyze(urls: librosaURLs)
-        }
+        // Launch URL fill concurrently — tag estimation doesn't need preview URLs.
+        // Previously sequential: fill (~10-15 s) blocked tag estimation start, so first
+        // scores landed 20-30 s after display. Now both pipelines run in parallel:
+        // Stage 1 fires ~5 s after display (tag estimation only), then librosa starts
+        // after URL fill completes instead of blocking Stage 1.
+        let fillTask = Task { await self.fillMissingPreviewURLs() }
 
         var tagUpdates: [(index: Int, features: AudioFeatures)] = []
 
@@ -1132,6 +1233,12 @@ class RecommendationEngine: ObservableObject {
             recommendations[update.index].audioFeatures   = update.features
             recommendations[update.index].similarityScore = score
             recommendations[update.index].matchReasons    = reasons
+            recommendations[update.index].matchExplanation = buildMatchExplanation(
+                source: sourceFeatures,
+                target: update.features,
+                sourceGenres: genres,
+                targetGenre: recommendations[update.index].genre
+            )
             enrichedCount += 1
         }
 
@@ -1142,25 +1249,56 @@ class RecommendationEngine: ObservableObject {
         let coverageRatio = Double(enrichedCount) / Double(max(1, snapshot.count))
         if coverageRatio >= 0.3 {
             let before = recommendations.count
-            recommendations = recommendations.filter { $0.similarityScore >= 0.62 }
-            let removed = before - recommendations.count
-            if removed > 0 {
-                simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold 0.62)")
+            let filtered = recommendations.filter { $0.similarityScore >= 0.50 }
+            if filtered.count >= 10 {
+                // Normal case: enough high-confidence matches.
+                recommendations = filtered
+                let removed = before - recommendations.count
+                if removed > 0 {
+                    simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold 0.50)")
+                }
+            } else {
+                // Too few survivors — source likely has intro-biased energy (quiet preview for a
+                // loud genre) or tag centroids cluster far from the measured source.
+                // Keep top 15 by score rather than emptying the list.
+                recommendations = Array(recommendations.prefix(15))
+                simiLog("ℹ️ Quality filter bypassed (\(filtered.count) above 0.50) — keeping top 15")
             }
         }
 
         simiLog("✅ Tag enrichment done: \(enrichedCount)/\(snapshot.count) songs got features")
 
-        // ── STAGE 2: librosa overlay — top 6 get measured features, UI re-sorts ──
-        // Awaiting here does NOT block the Stage 1 render; SwiftUI already committed
-        // that update. This await only blocks this background task.
-        let batchFeatures = await batchTask.value
+        // Drop any songs that never received features — they start with score=0.5 from the
+        // nil-guard in computeSimilarity, which floats them above tag-estimated songs (~0.43)
+        // in the sorted list. Without features they'll show "Matching..." forever; better absent.
+        let nilCount = recommendations.filter { $0.audioFeatures == nil }.count
+        if nilCount > 0 {
+            recommendations = recommendations.filter { $0.audioFeatures != nil }
+            simiLog("🔪 Removed \(nilCount) songs with no features (would have shown 'Matching...' forever)")
+        }
+
+        // Stage 1 complete — scores are already updated. Clear the loading hint now so
+        // the user never waits more than ~5s. Stage 2 continues silently below.
+        infoMessage = nil
+
+        // ── STAGE 2: librosa overlay — top 8 get measured features, UI re-sorts silently ──
+        // Wait for URL fill and Railway warm-up. If the container didn't respond within 22s
+        // (deep cold start), skip batch-analyze rather than burning another 25s to timeout.
+        await fillTask.value
+        let railwayReady = await warmupTask.value
+        guard railwayReady else {
+            simiLog("⚠️ Railway not ready — skipping Stage 2 librosa (container cold, tag estimates kept)")
+            return
+        }
+        let librosaURLs = recommendations.prefix(16).compactMap { $0.previewURL }
+        guard !librosaURLs.isEmpty else { return }
+        let batchFeatures = await simiAudioService.batchAnalyze(urls: librosaURLs)
         let batchNilCount = librosaURLs.count - batchFeatures.count
-        if !librosaURLs.isEmpty && batchFeatures.isEmpty {
+        if batchFeatures.isEmpty {
             simiLog("⚠️ Batch librosa: 0/\(librosaURLs.count) — Railway may be cold, using tag estimates for all")
         } else if batchNilCount > 0 {
             simiLog("🎵 Batch librosa: \(batchFeatures.count)/\(librosaURLs.count) succeeded (\(batchNilCount) nil)")
-        } else if !batchFeatures.isEmpty {
+        } else {
             simiLog("🎵 Batch librosa: \(batchFeatures.count)/\(librosaURLs.count) succeeded")
         }
 
@@ -1180,6 +1318,12 @@ class RecommendationEngine: ObservableObject {
             recommendations[i].audioFeatures   = pyFeatures
             recommendations[i].similarityScore = score
             recommendations[i].matchReasons    = reasons
+            recommendations[i].matchExplanation = buildMatchExplanation(
+                source: sourceFeatures,
+                target: pyFeatures,
+                sourceGenres: genres,
+                targetGenre: recommendations[i].genre
+            )
             librosaUpdated = true
         }
         if librosaUpdated {
@@ -1360,38 +1504,111 @@ class RecommendationEngine: ObservableObject {
     }
 
     // ──────────────────────────────────────────────
+    // MARK: - Genre-aware Scoring Infrastructure
+    // ──────────────────────────────────────────────
+
+    private enum GenreFamily: Equatable {
+        case metal, rock, blues, hiphop, rnb, pop, electronic, folk, jazz, classical, unknown
+    }
+
+    private func detectGenreFamily(_ genres: [Genre]) -> GenreFamily {
+        let names = genres.map { $0.main.lowercased() }
+        func any(_ check: (String) -> Bool) -> Bool { names.contains(where: check) }
+        // Blues wins over rock/metal when any tag in the array is blues — Last.fm often returns
+        // "Classic Rock" first even for blues artists, so scan the whole list.
+        if any({ $0.contains("blues") }) { return .blues }
+        if any({ $0.contains("metal") || $0.contains("thrash") || $0.contains("metalcore") || $0.contains("deathcore") || $0.contains("doom") }) { return .metal }
+        if any({ $0.contains("hard rock") || $0.contains("punk") || $0.contains("grunge") || $0.contains("rock") || $0.contains("hardcore") || $0.contains("shoegaze") || $0.contains("post-rock") }) { return .rock }
+        if any({ $0.contains("hip") || $0.contains("rap") || $0.contains("trap") || $0.contains("drill") || $0.contains("grime") || $0.contains("phonk") }) { return .hiphop }
+        if any({ $0.contains("r&b") || $0.contains("rnb") || $0.contains("soul") || $0.contains("funk") || $0.contains("gospel") || $0.contains("slow jam") || $0.contains("neo-soul") }) { return .rnb }
+        if any({ $0.contains("jazz") }) { return .jazz }
+        if any({ $0.contains("classical") || $0.contains("orchestral") }) { return .classical }
+        if any({ $0.contains("electronic") || $0.contains("edm") || $0.contains("house") || $0.contains("techno") || $0.contains("trance") || $0.contains("drum and bass") || $0.contains("dubstep") || $0.contains("synthwave") || $0.contains("synth") }) { return .electronic }
+        if any({ $0.contains("folk") || $0.contains("acoustic") || $0.contains("country") || $0.contains("americana") || $0.contains("bluegrass") || $0.contains("singer-songwriter") }) { return .folk }
+        if any({ $0.contains("pop") }) { return .pop }
+        return .unknown
+    }
+
+    private struct GenreWeights {
+        var valence:          Double = 0.28
+        var energy:           Double = 0.15
+        var dance:            Double = 0.12
+        var mode:             Double = 0.09
+        var acousticness:     Double = 0.04
+        var grooveRatio:      Double = 0.09
+        var spectralContrast: Double = 0.09
+        var mfcc:             Double = 0.07
+        var chromaEntropy:    Double = 0.02
+        var tonalClarity:     Double = 0.01
+        var arousal:          Double = 0.10
+    }
+
+    private func genreWeights(for family: GenreFamily) -> GenreWeights {
+        switch family {
+        case .metal:
+            // Preview often captures soft intro (Enter Sandman energy=0.32) → energy unreliable.
+            // Mode (minor) and acousticness (near-zero for all metal) are the stable discriminators.
+            return GenreWeights(valence: 0.18, energy: 0.10, dance: 0.05, mode: 0.20,
+                                acousticness: 0.12, grooveRatio: 0.05, spectralContrast: 0.11,
+                                mfcc: 0.10, chromaEntropy: 0.03, tonalClarity: 0.04, arousal: 0.12)
+        case .rock:
+            return GenreWeights(valence: 0.22, energy: 0.20, dance: 0.08, mode: 0.15,
+                                acousticness: 0.08, grooveRatio: 0.05, spectralContrast: 0.09,
+                                mfcc: 0.08, chromaEntropy: 0.02, tonalClarity: 0.01, arousal: 0.10)
+        case .blues:
+            // Mode is the PRIMARY blues discriminator: minor-key dark/brooding vs. major-key
+            // upbeat boogie. Songs tagged "blues" span a huge energy range (quiet delta to electric
+            // Chicago), so energy is down-weighted. Acousticness separates acoustic-guitar delta
+            // from overdriven electric. Valence catches the dark/melancholic vs. joyful distinction.
+            return GenreWeights(valence: 0.26, energy: 0.10, dance: 0.08, mode: 0.22,
+                                acousticness: 0.12, grooveRatio: 0.06, spectralContrast: 0.05,
+                                mfcc: 0.06, chromaEntropy: 0.02, tonalClarity: 0.01, arousal: 0.10)
+        case .hiphop:
+            return GenreWeights(valence: 0.22, energy: 0.18, dance: 0.18, mode: 0.05,
+                                acousticness: 0.03, grooveRatio: 0.12, spectralContrast: 0.08,
+                                mfcc: 0.07, chromaEntropy: 0.02, tonalClarity: 0.01, arousal: 0.10)
+        case .rnb:
+            // grooveRatio + spectralContrast fix Zero vs. American Oxygen: same genre centroid,
+            // but Zero is funky/punchy (grooveRatio ~1.2) and AO is smooth (grooveRatio ~0.4).
+            return GenreWeights(valence: 0.24, energy: 0.12, dance: 0.16, mode: 0.05,
+                                acousticness: 0.04, grooveRatio: 0.14, spectralContrast: 0.12,
+                                mfcc: 0.07, chromaEntropy: 0.02, tonalClarity: 0.01, arousal: 0.10)
+        case .electronic:
+            return GenreWeights(valence: 0.20, energy: 0.20, dance: 0.22, mode: 0.04,
+                                acousticness: 0.02, grooveRatio: 0.08, spectralContrast: 0.09,
+                                mfcc: 0.07, chromaEntropy: 0.02, tonalClarity: 0.02, arousal: 0.12)
+        case .folk:
+            return GenreWeights(valence: 0.28, energy: 0.10, dance: 0.08, mode: 0.14,
+                                acousticness: 0.20, grooveRatio: 0.04, spectralContrast: 0.06,
+                                mfcc: 0.07, chromaEntropy: 0.03, tonalClarity: 0.02, arousal: 0.08)
+        case .jazz:
+            return GenreWeights(valence: 0.20, energy: 0.10, dance: 0.10, mode: 0.08,
+                                acousticness: 0.12, grooveRatio: 0.08, spectralContrast: 0.08,
+                                mfcc: 0.08, chromaEntropy: 0.10, tonalClarity: 0.04, arousal: 0.10)
+        case .classical:
+            return GenreWeights(valence: 0.20, energy: 0.12, dance: 0.05, mode: 0.15,
+                                acousticness: 0.20, grooveRatio: 0.03, spectralContrast: 0.08,
+                                mfcc: 0.10, chromaEntropy: 0.05, tonalClarity: 0.06, arousal: 0.12)
+        case .pop, .unknown:
+            return GenreWeights()  // defaults tuned for pop/general
+        }
+    }
+
+    // ──────────────────────────────────────────────
     // MARK: - Similarity Score Computation
     // ──────────────────────────────────────────────
 
     // Scoring philosophy: match the *emotional imprint* of a song, not its technical fingerprint.
     // People don't want the same BPM — they want the same feeling.
     //
-    // Weights (sum = 1.00):
-    //   valence        0.30 — emotional color; prefers valenceEssentia (DEAM) over Spotify proxy
-    //   arousal        0.10 — calm/relaxed vs energetic/excited (new DEAM axis, distinct from energy)
-    //   danceability   0.20 — groove/rhythm feel (slow jam vs. dance track within the same mood)
-    //   energy         0.15 — intensity of the feeling (mellow bedroom vs. mosh pit)
-    //   mode           0.09 — major/minor emotional signature; neutral when key is estimated
-    //   mfccCosine     0.08 — timbral texture similarity via MFCC cosine (when available)
-    //   acousticness   0.05 — sonic warmth texture (acoustic vs. electronic)
-    //   chromaEntropy  0.02 — tonal complexity (simple/resolved vs chromatic/tense)
-    //   tonalClarity   0.01 — harmonic focus (melody-driven vs. beat-driven)
-    //   bpm            0.00 — disabled: subsumed by arousal + danceability
-    //   spectralWarmth 0.00 — disabled pending sub-bass RMS fix (stored, contributes nothing)
-    //   vocalPresence  0.00 — disabled: 808 in y_harmonic inverts expected ordering (stored)
-    //   reverbSpace    0.00 — disabled: HF noise floor in trap inverts expected ordering (stored)
+    // Weights are genre-aware: genreWeights(for:) selects the right profile for each source.
+    // Defaults (pop/unknown) sum to base 0.70 always-applied + optional signals up to +0.37.
     //
-    // New signals:
-    //   arousal (DEAM): captures "how activated/calm" independently of loudness. A soft-but-intense
-    //     string quartet scores high arousal / low energy — a distinction librosa energy alone misses.
-    //   mfccCosine: captures timbral "feel" (warmth, breathiness, roughness) beyond valence/energy.
-    //     Cosine similarity on 20-coeff MFCC mean vectors; only applied when both songs have MFCC data.
-    //   chromaEntropy: tonal complexity. High = chromatic/jazzy/unresolved; low = clear diatonic melody.
-    //     Prevents matching a simple pop hook to a jazz standard on valence alone.
-    //
-    // Danceability still carries weight because it separates slow jams from club tracks even
-    // when both have warm valence — the critical failure mode within warm-valence genres like R&B.
-    // BPM tolerance widened to ±60 so songs at very different tempos can match on emotional feel.
+    // Optional signals (only when Railway backend has analyzed both tracks):
+    //   arousal   — calm/relaxed vs energetic/excited (DEAM, distinct from energy)
+    //   grooveRatio — onset_std/onset_mean syncopation proxy
+    //   spectralContrast — 7-band timbral "punch vs. flow"
+    //   mfccCosine — timbral texture similarity (20-coeff vectors)
     private func computeSimilarity(
         source: AudioFeatures,
         target: AudioFeatures?,
@@ -1401,8 +1618,23 @@ class RecommendationEngine: ObservableObject {
             return (0.5, [.genre])
         }
 
+        let family  = detectGenreFamily(genres)
+        simiLog("🎭 Genre family: \(family) from [\(genres.prefix(3).map { $0.main }.joined(separator: ", "))]")
+        let weights = genreWeights(for: family)
+
         var totalScore = 0.0
+        var availableWeight = 0.0   // weight of fields actually present in both songs
         var reasons: [MatchReason] = []
+
+        // Intro-bias override: when a measured source has low energy in a loud genre,
+        // the 30-second iTunes preview likely captured a quiet intro rather than the main
+        // body of the song (e.g. Enter Sandman's "hush little baby" verse → energy=0.32,
+        // acousticness=0.65 even though the main riff is ~0.85 energy / ~0.10 acoustic).
+        // Use genre-representative values for scoring so candidates aren't ranked DOWN for
+        // having the energy the full song actually has.
+        let introBiased = !source.isEstimated && source.energy < 0.45 && (family == .metal || family == .rock)
+        let effectiveEnergy       = introBiased ? 0.85 : source.energy
+        let effectiveAcousticness = introBiased ? 0.10 : source.acousticness
 
         // When BOTH source and target features are estimated from genre tags,
         // the raw diff will be ~0 (same tag map → same estimated values), making
@@ -1448,7 +1680,8 @@ class RecommendationEngine: ObservableObject {
         let tgtValence = target.valenceEssentia ?? target.valence
         let valenceDiff = abs(srcValence - tgtValence)
         let valenceScore = 1.0 - valenceDiff
-        totalScore += valenceScore * 0.30
+        totalScore += valenceScore * weights.valence
+        availableWeight += weights.valence
         if !bothEstimated && valenceDiff < 0.15 {
             // Emotionally specific: name the actual mood shared, not just "Same Mood"
             let avgValence = (srcValence + tgtValence) / 2
@@ -1466,15 +1699,17 @@ class RecommendationEngine: ObservableObject {
         // Only applied when both songs have Essentia arousal; falls through silently otherwise.
         if let srcArousal = source.arousal, let tgtArousal = target.arousal {
             let arousalDiff = abs(srcArousal - tgtArousal)
-            totalScore += (1.0 - arousalDiff) * 0.10
+            totalScore += (1.0 - arousalDiff) * weights.arousal
+            availableWeight += weights.arousal
         }
 
         // Energy — the intensity of the feeling (mosh-pit vs. bedroom).
-        let energyDiff = abs(source.energy - target.energy)
+        let energyDiff = abs(effectiveEnergy - target.energy)
         let energyScore = 1.0 - energyDiff
-        totalScore += energyScore * 0.15
+        totalScore += energyScore * weights.energy
+        availableWeight += weights.energy
         if !bothEstimated && energyDiff < 0.15 {
-            let avgEnergy = (source.energy + target.energy) / 2
+            let avgEnergy = (effectiveEnergy + target.energy) / 2
             if avgEnergy > 0.65 {
                 // Distinguish anthemic (soaring, low danceability) from dance-floor (built to move).
                 // Both are "high intensity" but feel emotionally different.
@@ -1501,11 +1736,12 @@ class RecommendationEngine: ObservableObject {
         // separate a slow jam from a club banger.
         let danceDiff = abs(source.danceability - target.danceability)
         let danceScore = 1.0 - danceDiff
-        totalScore += danceScore * 0.20
+        totalScore += danceScore * weights.dance
+        availableWeight += weights.dance
 
         // Cross-archetype penalty (a): measured high-energy songs with diverging danceability.
         // Soaring anthems (Purple Rain) and dance tracks (Beat It) share intensity but not shape.
-        if !bothEstimated && source.energy > 0.60 && target.energy > 0.60 && danceDiff > 0.25 {
+        if !bothEstimated && effectiveEnergy > 0.60 && target.energy > 0.60 && danceDiff > 0.25 {
             totalScore = max(0, totalScore - 0.05)
         }
         // Cross-archetype penalty (b): slow-jam source vs. club/dance-heavy target.
@@ -1515,14 +1751,13 @@ class RecommendationEngine: ObservableObject {
             totalScore = max(0, totalScore - 0.06)
         }
         // Cross-archetype penalty (c): upward energy gap.
-        // When a recommended song has significantly more energy than the source, it's pulling
-        // in a different emotional direction. e.g. HUMBLE. (aggressive, 0.66 energy) shouldn't
-        // rank equally to cloud-rap (atmospheric, 0.59) when the source is mid-energy (0.50).
-        // Threshold 0.14 = just under one energy bucket width — avoids penalising natural variance.
-        // Multiplier 2.0 → a gap of 0.165 gives penalty ~0.05; cap at 0.10 (one full energy bucket).
-        let energyGap = target.energy - source.energy
+        // Uses effectiveEnergy so intro-biased sources (quiet preview in a loud genre) don't
+        // penalise candidates for having the energy the full song actually has.
+        // Cap raised to 0.15 (from 0.10) — songs with energy gap ≥ 0.33 (e.g. mellow source
+        // vs hard-rock target) need more than 0.10 headroom to pull their score below "Very similar".
+        let energyGap = target.energy - effectiveEnergy
         if energyGap > 0.14 {
-            let gapPenalty = min(0.10, (energyGap - 0.14) * 2.0)
+            let gapPenalty = min(0.15, (energyGap - 0.14) * 2.0)
             totalScore = max(0, totalScore - gapPenalty)
         }
 
@@ -1538,7 +1773,33 @@ class RecommendationEngine: ObservableObject {
            srcMFCC.count == tgtMFCC.count, !srcMFCC.isEmpty {
             let cosine = mfccCosineSimilarity(srcMFCC, tgtMFCC)  // [-1, 1]
             let mfccScore = (cosine + 1.0) / 2.0                 // → [0, 1]
-            totalScore += mfccScore * 0.08
+            totalScore += mfccScore * weights.mfcc
+            availableWeight += weights.mfcc
+        }
+
+        // Groove ratio — syncopation/punchiness (onset_std / onset_mean).
+        // Funky/syncopated tracks (Zero, Uptown Funk) score ~0.8–1.8;
+        // smooth/flowing score ~0.3–0.7. Key discriminator within same-genre R&B
+        // where valence/energy/danceability tag estimates all cluster near genre centroids.
+        if let srcGroove = source.grooveRatio, let tgtGroove = target.grooveRatio {
+            let grooveDiff = abs(srcGroove - tgtGroove)
+            let grooveScore = max(0.0, 1.0 - grooveDiff / 2.0)  // groove range ~0–2 → normalize
+            totalScore += grooveScore * weights.grooveRatio
+            availableWeight += weights.grooveRatio
+            if grooveDiff < 0.3 {
+                reasons.append(.danceFloor)
+            }
+        }
+
+        // Spectral contrast cosine — timbral "punch vs. flow" across 7 frequency bands.
+        // A funky bass+brass track (Zero) diverges sharply from a smooth mid-forward track
+        // (American Oxygen) even when valence/energy/danceability are similar.
+        if let srcSC = source.spectralContrast, let tgtSC = target.spectralContrast,
+           srcSC.count == tgtSC.count, !srcSC.isEmpty {
+            let scCosine = mfccCosineSimilarity(srcSC, tgtSC)
+            let scScore = (scCosine + 1.0) / 2.0
+            totalScore += scScore * weights.spectralContrast
+            availableWeight += weights.spectralContrast
         }
 
         // Chroma entropy — tonal complexity / harmonic tension.
@@ -1548,30 +1809,42 @@ class RecommendationEngine: ObservableObject {
         if let srcEntropy = source.chromaEntropy, let tgtEntropy = target.chromaEntropy {
             let maxEntropy = 3.0   // practical ceiling for music
             let entropyScore = max(0, 1.0 - abs(srcEntropy - tgtEntropy) / maxEntropy)
-            totalScore += entropyScore * 0.02
+            totalScore += entropyScore * weights.chromaEntropy
+            availableWeight += weights.chromaEntropy
         }
 
         // Acousticness — sonic texture (acoustic warmth vs. electronic brightness).
-        let acousticScore = 1.0 - abs(source.acousticness - target.acousticness)
-        totalScore += acousticScore * 0.05
-        if abs(source.acousticness - target.acousticness) < 0.2 { reasons.append(.acoustics) }
+        // Uses effectiveAcousticness so intro-biased sources don't skew this dimension.
+        let acousticScore = 1.0 - abs(effectiveAcousticness - target.acousticness)
+        totalScore += acousticScore * weights.acousticness
+        availableWeight += weights.acousticness
+        if abs(effectiveAcousticness - target.acousticness) < 0.2 { reasons.append(.acoustics) }
 
         // Mode — major/minor emotional signature. Major keys tend to feel brighter and more
-        // resolved; minor keys darker and more tense. Only applied when both songs have
-        // real key measurements (librosa or Spotify). Neutral 0.5 when mode is estimated.
+        // resolved; minor keys darker and more tense.
+        // Three-way scoring based on data quality:
+        //   both measured:   hard match (1.0 / 0.30) — full confidence
+        //   source measured, target estimated: soft match (0.72 / 0.38) — estimated mode
+        //     carries genre-level signal (blues/metal → minor, pop/folk → major) but is
+        //     unreliable for individual songs, so we use softer weights
+        //   source estimated: neutral 0.5 — can't make a directional claim
         let modeScore: Double
         if !source.isKeyEstimated && !target.isKeyEstimated {
-            modeScore = source.mode == target.mode ? 1.0 : 0.3
+            modeScore = source.mode == target.mode ? 1.0 : 0.30
+        } else if !source.isKeyEstimated {
+            modeScore = source.mode == target.mode ? 0.72 : 0.38
         } else {
             modeScore = 0.5
         }
-        totalScore += modeScore * 0.09
+        totalScore += modeScore * weights.mode
+        availableWeight += weights.mode
 
         // Spectral warmth — disabled pending sub-bass RMS fix. Stored, contributes nothing.
         totalScore += (1.0 - abs(source.spectralWarmth - target.spectralWarmth)) * 0.00
 
         // Tonal clarity — harmonic focus (melody-driven trap vs. beat-driven trap).
-        totalScore += (1.0 - abs(source.tonalClarity - target.tonalClarity)) * 0.01
+        totalScore += (1.0 - abs(source.tonalClarity - target.tonalClarity)) * weights.tonalClarity
+        availableWeight += weights.tonalClarity
 
         // Vocal presence — disabled (weight 0.00); stored, contributes nothing.
         // Calibration: 808 sine waves stay in y_harmonic, inverting expected ordering.
@@ -1585,12 +1858,45 @@ class RecommendationEngine: ObservableObject {
         // so raw diff scores overstate precision (e.g. "trap" vs "trap" → 0.87 from
         // identical centroid values). Compress toward 0.65 proportional to how much
         // estimation was involved — preserves relative ordering, kills false perfects.
+        //
+        // Mixed case (one measured, one estimated): normalize by availableWeight first.
+        // Optional librosa fields (MFCC, arousal, groove, etc.) are nil on estimated songs,
+        // so totalScore only accumulates the ~0.69 weight that was actually computable —
+        // treating that as a score-out-of-1.10 makes every mixed match look ~40% too low.
+        // Dividing by the weight that was actually available re-bases the score correctly
+        // before compression, so "best possible match with available data" reads ~0.90
+        // instead of ~0.62. Relative ordering is preserved; only the scale is corrected.
         let adjustedScore: Double
         switch (source.isEstimated, target.isEstimated) {
-        case (true, true):              adjustedScore = 0.65 + (totalScore - 0.65) * 0.50
-        case (true, false), (false, true): adjustedScore = 0.65 + (totalScore - 0.65) * 0.75
-        case (false, false):            adjustedScore = totalScore
+        case (true, true):
+            // Source has locally-measured energy + key/mode (Railway failed but local audio ran):
+            // treat it like a measured source. The only "estimated" parts are valence (tag merge)
+            // and optional fields (MFCC, arousal) — same situation as (false, true).
+            // Pure tag-only sources (isKeyEstimated=true) keep the tighter 0.50 compression
+            // WITHOUT normalization, to prevent false-high scores from identical centroid pairs
+            // (e.g. "trap" vs "trap" should stay near 65%, not float to 82%).
+            if !source.isKeyEstimated {
+                let normalized = availableWeight > 0 ? min(1.0, totalScore / availableWeight) : totalScore
+                adjustedScore = 0.65 + (normalized - 0.65) * 0.65
+            } else {
+                adjustedScore = 0.65 + (totalScore - 0.65) * 0.50
+            }
+        case (true, false), (false, true):
+            // Normalization corrects for missing optional fields (MFCC, arousal, groove…) that
+            // are nil on tag-estimated targets — they don't contribute to totalScore or
+            // availableWeight, so dividing by availableWeight re-bases to "score of what we can see."
+            // Compression factor 0.50: estimated features cluster near genre centroids (all blues
+            // songs get nearly identical energy/valence/acousticness), so a normalized score of
+            // ~0.85 is the genre-centroid floor, not a signal of real similarity. Only songs with
+            // normalized > 0.87 (genuinely tight on all estimated dimensions) reach "Very similar".
+            // Stage 2 Railway analysis replaces these estimates for the top 8 songs.
+            let normalized = availableWeight > 0 ? min(1.0, totalScore / availableWeight) : totalScore
+            adjustedScore = 0.65 + (normalized - 0.65) * 0.50
+        case (false, false):
+            adjustedScore = totalScore
         }
+
+        simiLog("🎯 [\(target.isEstimated ? "est" : "lib")] src=\(String(format:"%.2f",source.energy))/\(String(format:"%.2f",source.valence)) tgt=\(String(format:"%.2f",target.energy))/\(String(format:"%.2f",target.valence)) raw=\(String(format:"%.3f",totalScore)) avail=\(String(format:"%.2f",availableWeight)) adj=\(String(format:"%.3f",adjustedScore))")
 
         // For estimated features the first two slots are energy + mood — far more useful
         // than a generic "Same Genre" label. Only prepend genre for measured features.
@@ -2141,17 +2447,66 @@ class RecommendationEngine: ObservableObject {
             finalBPM = estimatedBPM
         }
 
+        // Acousticness: genre-appropriate values instead of 0.0.
+        // All-zero meant the acousticness dimension provided zero discrimination between a
+        // "classical" and a "techno" song when comparing against a measured source.
+        // These values match Spotify API ranges by genre — acoustic/classical ≈ 0.75+,
+        // electric rock ≈ 0.08, electronic ≈ 0.02.
+        let acousticnessByTag: [String: Double] = [
+            "classical": 0.80, "acoustic": 0.78, "folk": 0.72, "singer-songwriter": 0.68,
+            "bluegrass": 0.65, "bossa nova": 0.62, "americana": 0.55, "country": 0.52,
+            "jazz": 0.48, "smooth jazz": 0.52, "blues": 0.40, "soul": 0.22, "gospel": 0.28,
+            "reggae": 0.32, "neo-soul": 0.22, "neo soul": 0.22, "r&b": 0.14, "rnb": 0.14,
+            "funk": 0.10, "motown": 0.18, "lo-fi": 0.28, "lofi": 0.28,
+            "bedroom pop": 0.32, "dream pop": 0.28, "indie pop": 0.22, "chillwave": 0.25,
+            "pop": 0.16, "k-pop": 0.08, "electropop": 0.06, "synth-pop": 0.05, "synth pop": 0.05,
+            "indie rock": 0.12, "folk rock": 0.38, "indie": 0.20, "alternative": 0.14,
+            "rock": 0.09, "classic rock": 0.10, "progressive rock": 0.10, "pop punk": 0.07,
+            "grunge": 0.08, "alt-rock": 0.10, "shoegaze": 0.12, "post-rock": 0.10,
+            "punk": 0.06, "hard rock": 0.05, "metal": 0.04, "heavy metal": 0.04,
+            "metalcore": 0.02, "nu-metal": 0.03, "doom": 0.06, "post-punk": 0.10,
+            "hip-hop": 0.07, "hip hop": 0.07, "rap": 0.06, "trap": 0.04,
+            "boom bap": 0.08, "drill": 0.03, "phonk": 0.03, "grime": 0.04,
+            "electronic": 0.03, "edm": 0.02, "house": 0.02, "techno": 0.01,
+            "trance": 0.02, "synthwave": 0.05, "ambient": 0.30, "vaporwave": 0.18,
+        ]
+        let sortedAcousticMap = acousticnessByTag.sorted { $0.key.count > $1.key.count }
+        let estimatedAcousticness = tags.compactMap { tag -> Double? in
+            if let exact = acousticnessByTag[tag] { return exact }
+            return sortedAcousticMap.first(where: { tag.contains($0.key) || $0.key.contains(tag) })?.value
+        }.first ?? 0.10  // default: slightly electronic lean (most un-tagged genres)
+
+        // Mode estimation: minor-leaning genres → 0, otherwise major → 1.
+        // This feeds the soft mode comparison in computeSimilarity when source has a
+        // real measured key — it won't be used for hard match logic (isKeyEstimated stays true).
+        // Only check whether the tag contains a keyword, not the reverse —
+        // "punk".contains("post-punk") = false (correct), but "post-punk".contains("punk")
+        // = true which would incorrectly make any "punk" tag trigger minor mode.
+        let minorGenreKeywords = ["blues", "metal", "doom", "emo", "gothic", "darkwave",
+                                   "grunge", "shoegaze", "post-punk", "dark trap", "drill",
+                                   "phonk", "grime"]
+        // Use only the PRIMARY tag for mode — checking all tags inflates scores for songs
+        // where "blues" is a secondary label (e.g. "Can't Help Falling In Love": rock, blues,
+        // singer-songwriter). Acousticness already uses the primary tag; mode should too.
+        let estimatedMode: Int
+        if let primaryTag = tags.first,
+           minorGenreKeywords.contains(where: { primaryTag.contains($0) }) {
+            estimatedMode = 0
+        } else {
+            estimatedMode = 1
+        }
+
         return AudioFeatures(
             bpm:              finalBPM,
             energy:           totalE / totalWeight,
             valence:          totalV / totalWeight,
             danceability:     totalD / totalWeight,
-            acousticness:     0.0,
+            acousticness:     estimatedAcousticness,
             instrumentalness: 0.0,
             liveness:         0.0,
             loudness:         -10.0,
             key:              0,
-            mode:             1,
+            mode:             estimatedMode,
             isEstimated:      true
         )
     }
