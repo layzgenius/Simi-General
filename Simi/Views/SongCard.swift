@@ -210,7 +210,7 @@ struct SongCard: View {
             }
             .padding(.horizontal, 14)
             .padding(.top, 14)
-            .padding(.bottom, song.matchReasons.isEmpty ? 14 : 8)
+            .padding(.bottom, song.matchReasons.isEmpty && song.matchExplanation?.genreBridgeLabel == nil ? 14 : 8)
 
             // ── Match reason chips — full-width row so they never get squished ──
             if !song.matchReasons.isEmpty {
@@ -234,7 +234,7 @@ struct SongCard: View {
             }
 
             // ── Genre bridge ──
-            if let bridge = song.matchExplanation?.genreBridgeLabel {
+            if let bridge = song.matchExplanation?.genreBridgeLabel, !bridge.isEmpty {
                 HStack {
                     Text("\(bridge) 🌉")
                         .font(.simiMicro.weight(.semibold))
