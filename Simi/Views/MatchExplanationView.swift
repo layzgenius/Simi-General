@@ -35,7 +35,7 @@ struct MatchExplanationView: View {
                     .accessibilityLabel("\(row.label): \(row.descriptor)")
                 }
 
-                if let bridge = explanation.genreBridgeLabel {
+                if let bridge = explanation.genreBridgeLabel, !bridge.isEmpty {
                     HStack(alignment: .top) {
                         Text("Genre bridge")
                             .font(.simiMicro)

@@ -1105,9 +1105,8 @@ class RecommendationEngine: ObservableObject {
         let sourceFamily = detectGenreFamily(sourceGenres)
         let targetFamily = detectGenreFamily([targetGenre])
         var genreBridgeLabel: String?
-        if sourceFamily != targetFamily, sourceFamily != .unknown, targetFamily != .unknown,
-           let srcGenreName = sourceGenres.first?.main {
-            genreBridgeLabel = "\(srcGenreName) → \(targetGenre.main)"
+        if sourceFamily != targetFamily, sourceFamily != .unknown, targetFamily != .unknown {
+            genreBridgeLabel = "\(sourceFamily.displayName) → \(targetFamily.displayName)"
         }
 
         return MatchExplanation(rows: rows, genreBridgeLabel: genreBridgeLabel)
@@ -1467,6 +1466,22 @@ class RecommendationEngine: ObservableObject {
 
     private enum GenreFamily: Equatable {
         case metal, rock, blues, hiphop, rnb, pop, electronic, folk, jazz, classical, unknown
+
+        var displayName: String {
+            switch self {
+            case .metal:      return "Metal"
+            case .rock:       return "Rock"
+            case .blues:      return "Blues"
+            case .hiphop:     return "Hip-Hop"
+            case .rnb:        return "R&B"
+            case .pop:        return "Pop"
+            case .electronic: return "Electronic"
+            case .folk:       return "Folk"
+            case .jazz:       return "Jazz"
+            case .classical:  return "Classical"
+            case .unknown:    return ""
+            }
+        }
     }
 
     private func detectGenreFamily(_ genres: [Genre]) -> GenreFamily {
