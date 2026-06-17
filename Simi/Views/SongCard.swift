@@ -239,11 +239,18 @@ struct SongCard: View {
                     .background(Color.simiBorder)
                     .padding(.horizontal, 14)
 
-                AudioFeaturesGrid(features: features)
-                    .padding(14)
-                    .transition(reduceMotion
-                        ? .opacity
-                        : .opacity.combined(with: .move(edge: .top)))
+                Group {
+                    if let explanation = song.matchExplanation,
+                       !explanation.rows.isEmpty || explanation.genreBridgeLabel != nil {
+                        MatchExplanationView(explanation: explanation)
+                    } else {
+                        AudioFeaturesGrid(features: features)
+                    }
+                }
+                .padding(14)
+                .transition(reduceMotion
+                    ? .opacity
+                    : .opacity.combined(with: .move(edge: .top)))
             }
         }
         .background(Color.simiCard)
@@ -428,7 +435,15 @@ struct AudioFeaturesGrid: View {
             mode: 1
         ),
         similarityScore: 0.87,
-        matchReasons: [.genre, .bpm, .vibe]
+        matchReasons: [.genre, .bpm, .vibe],
+        matchExplanation: MatchExplanation(
+            rows: [
+                MatchExplanationRow(label: "Emotional weight", descriptor: "Same bright energy"),
+                MatchExplanationRow(label: "Intensity",        descriptor: "Equally driven"),
+                MatchExplanationRow(label: "Key",              descriptor: "Both major key"),
+            ],
+            genreBridgeLabel: nil
+        )
     )
 
     VStack {
