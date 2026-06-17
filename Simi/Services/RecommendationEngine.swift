@@ -1041,7 +1041,8 @@ class RecommendationEngine: ObservableObject {
         // Row 1: Emotional weight — valence (prefer DEAM-regressed value, consistent with computeSimilarity)
         let srcValence = source.valenceEssentia ?? source.valence
         let tgtValence = target.valenceEssentia ?? target.valence
-        if abs(srcValence - tgtValence) < 0.20 {
+        if !source.isEstimated && !target.isEstimated,
+           abs(srcValence - tgtValence) < 0.20 {
             let avg = (srcValence + tgtValence) / 2
             let descriptor: String
             switch avg {
@@ -1054,7 +1055,8 @@ class RecommendationEngine: ObservableObject {
         }
 
         // Row 2: Intensity — energy
-        if abs(source.energy - target.energy) < 0.20 {
+        if !source.isEstimated && !target.isEstimated,
+           abs(source.energy - target.energy) < 0.20 {
             let avg = (source.energy + target.energy) / 2
             let descriptor: String
             switch avg {
