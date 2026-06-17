@@ -1023,6 +1023,94 @@ class RecommendationEngine: ObservableObject {
     }
 
     // ──────────────────────────────────────────────
+    // ──────────────────────────────────────────────
+    // MARK: - Match Explanation Builder
+    // ──────────────────────────────────────────────
+
+    /// Generates a human-readable explanation of why `target` was recommended for `source`.
+    /// Only includes rows where the data is reliable and the match is close enough to describe.
+    /// Called from enrichWithABFeatures after features are known — never in the initial mergeAndScore pass.
+    private func buildMatchExplanation(
+        source: AudioFeatures,
+        target: AudioFeatures,
+        sourceGenres: [Genre],
+        targetGenre: Genre
+    ) -> MatchExplanation {
+        var rows: [MatchExplanationRow] = []
+
+        // Row 1: Emotional weight — valence (prefer DEAM-regressed value, consistent with computeSimilarity)
+        let srcValence = source.valenceEssentia ?? source.valence
+        let tgtValence = target.valenceEssentia ?? target.valence
+        if abs(srcValence - tgtValence) < 0.20 {
+            let avg = (srcValence + tgtValence) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.35:        descriptor = "Same melancholic weight"
+            case 0.35..<0.50:    descriptor = "Same bittersweet edge"
+            case 0.50..<0.65:    descriptor = "Same balanced mood"
+            default:             descriptor = "Same bright energy"
+            }
+            rows.append(MatchExplanationRow(label: "Emotional weight", descriptor: descriptor))
+        }
+
+        // Row 2: Intensity — energy
+        if abs(source.energy - target.energy) < 0.20 {
+            let avg = (source.energy + target.energy) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.35:        descriptor = "Equally restrained"
+            case 0.35..<0.55:    descriptor = "Equally measured"
+            case 0.55..<0.75:    descriptor = "Equally driven"
+            default:             descriptor = "Equally intense"
+            }
+            rows.append(MatchExplanationRow(label: "Intensity", descriptor: descriptor))
+        }
+
+        // Row 3: Key — only when both songs have a real measured key (not a C-Major placeholder)
+        if !source.isKeyEstimated && !target.isKeyEstimated && source.mode == target.mode {
+            let descriptor = source.mode == 1 ? "Both major key" : "Both minor key"
+            rows.append(MatchExplanationRow(label: "Key", descriptor: descriptor))
+        }
+
+        // Row 4: Groove feel — librosa only (grooveRatio is nil for tag-estimated songs)
+        if let srcGroove = source.grooveRatio, let tgtGroove = target.grooveRatio,
+           abs(srcGroove - tgtGroove) < 0.35 {
+            let avg = (srcGroove + tgtGroove) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.5:         descriptor = "Smooth and flowing"
+            case 0.5..<0.9:      descriptor = "Equally measured pulse"
+            default:             descriptor = "Equally syncopated"
+            }
+            rows.append(MatchExplanationRow(label: "Groove feel", descriptor: descriptor))
+        }
+
+        // Row 5: Sonic texture — librosa only (spectralWarmth defaults to 0.5 for estimated songs,
+        // but isEstimated=false is the reliable gate since 0.5 is also a valid measured value)
+        if !source.isEstimated && !target.isEstimated,
+           abs(source.spectralWarmth - target.spectralWarmth) < 0.20 {
+            let avg = (source.spectralWarmth + target.spectralWarmth) / 2
+            let descriptor: String
+            switch avg {
+            case ..<0.35:        descriptor = "Both bright and airy"
+            case 0.35..<0.65:    descriptor = "Similar tonal warmth"
+            default:             descriptor = "Both warm and full"
+            }
+            rows.append(MatchExplanationRow(label: "Sonic texture", descriptor: descriptor))
+        }
+
+        // Genre bridge — compare genre families; show when they differ and both are known
+        let sourceFamily = detectGenreFamily(sourceGenres)
+        let targetFamily = detectGenreFamily([targetGenre])
+        var genreBridgeLabel: String?
+        if sourceFamily != targetFamily, sourceFamily != .unknown, targetFamily != .unknown,
+           let srcGenreName = sourceGenres.first?.main {
+            genreBridgeLabel = "\(srcGenreName) → \(targetGenre.main)"
+        }
+
+        return MatchExplanation(rows: rows, genreBridgeLabel: genreBridgeLabel)
+    }
+
     // MARK: - Background AcousticBrainz Enrichment
     // ──────────────────────────────────────────────
 
@@ -1132,6 +1220,12 @@ class RecommendationEngine: ObservableObject {
             recommendations[update.index].audioFeatures   = update.features
             recommendations[update.index].similarityScore = score
             recommendations[update.index].matchReasons    = reasons
+            recommendations[update.index].matchExplanation = buildMatchExplanation(
+                source: sourceFeatures,
+                target: update.features,
+                sourceGenres: genres,
+                targetGenre: recommendations[update.index].genre
+            )
             enrichedCount += 1
         }
 
@@ -1180,6 +1274,12 @@ class RecommendationEngine: ObservableObject {
             recommendations[i].audioFeatures   = pyFeatures
             recommendations[i].similarityScore = score
             recommendations[i].matchReasons    = reasons
+            recommendations[i].matchExplanation = buildMatchExplanation(
+                source: sourceFeatures,
+                target: pyFeatures,
+                sourceGenres: genres,
+                targetGenre: recommendations[i].genre
+            )
             librosaUpdated = true
         }
         if librosaUpdated {
@@ -1357,6 +1457,32 @@ class RecommendationEngine: ObservableObject {
             }
         }
         return primary + overflow
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Genre Family Detection
+    // ──────────────────────────────────────────────
+
+    private enum GenreFamily: Equatable {
+        case metal, rock, blues, hiphop, rnb, pop, electronic, folk, jazz, classical, unknown
+    }
+
+    private func detectGenreFamily(_ genres: [Genre]) -> GenreFamily {
+        let names = genres.map { $0.main.lowercased() }
+        func any(_ check: (String) -> Bool) -> Bool { names.contains(where: check) }
+        // Blues wins over rock/metal when any tag in the array is blues — Last.fm often returns
+        // "Classic Rock" first even for blues artists, so scan the whole list.
+        if any({ $0.contains("blues") }) { return .blues }
+        if any({ $0.contains("metal") || $0.contains("thrash") || $0.contains("metalcore") || $0.contains("deathcore") || $0.contains("doom") }) { return .metal }
+        if any({ $0.contains("hard rock") || $0.contains("punk") || $0.contains("grunge") || $0.contains("rock") || $0.contains("hardcore") || $0.contains("shoegaze") || $0.contains("post-rock") }) { return .rock }
+        if any({ $0.contains("hip") || $0.contains("rap") || $0.contains("trap") || $0.contains("drill") || $0.contains("grime") || $0.contains("phonk") }) { return .hiphop }
+        if any({ $0.contains("r&b") || $0.contains("rnb") || $0.contains("soul") || $0.contains("funk") || $0.contains("gospel") || $0.contains("slow jam") || $0.contains("neo-soul") }) { return .rnb }
+        if any({ $0.contains("jazz") }) { return .jazz }
+        if any({ $0.contains("classical") || $0.contains("orchestral") }) { return .classical }
+        if any({ $0.contains("electronic") || $0.contains("edm") || $0.contains("house") || $0.contains("techno") || $0.contains("trance") || $0.contains("drum and bass") || $0.contains("dubstep") || $0.contains("synthwave") || $0.contains("synth") }) { return .electronic }
+        if any({ $0.contains("folk") || $0.contains("acoustic") || $0.contains("country") || $0.contains("americana") || $0.contains("bluegrass") || $0.contains("singer-songwriter") }) { return .folk }
+        if any({ $0.contains("pop") }) { return .pop }
+        return .unknown
     }
 
     // ──────────────────────────────────────────────
