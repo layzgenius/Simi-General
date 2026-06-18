@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from audio_analyzer import analyze_from_url, analyze_from_bytes, init_essentia, init_dclap, get_dclap_embedding
-from similarity_engine import compute_similarity, AudioFeaturesDict, build_embedding
+from similarity_engine import compute_similarity, AudioFeaturesDict, build_embedding, build_explanation, Genre
 
 app = FastAPI(title="Simi Audio Analyzer", version="1.0.0")
 
@@ -117,6 +118,34 @@ class StoreVectorRequest(BaseModel):
 
 class StoreVectorResponse(BaseModel):
     stored: bool
+
+
+class GenreItem(BaseModel):
+    main: str
+    sub:  str = ""
+
+
+class ExplainRequest(BaseModel):
+    source:       AudioFeatures
+    target:       AudioFeatures
+    sourceGenres: list[GenreItem] = []
+    targetGenre:  Optional[GenreItem] = None
+
+
+class ExplanationRowItem(BaseModel):
+    label:      str
+    descriptor: str
+
+
+class ExplanationDetail(BaseModel):
+    rows:             list[ExplanationRowItem]
+    genreBridgeLabel: Optional[str] = None
+
+
+class ExplainResponse(BaseModel):
+    score:        float
+    matchReasons: list[str]
+    explanation:  ExplanationDetail
 
 
 # ─────────────────────────────────────────────
@@ -318,6 +347,49 @@ async def similarity(req: SimilarityRequest) -> SimilarityResponse:
     """
     score, reasons = compute_similarity(req.source.to_dict(), req.target.to_dict())
     return SimilarityResponse(score=score, reasons=reasons)
+
+
+@app.post("/explain", response_model=ExplainResponse)
+async def explain(req: ExplainRequest) -> ExplainResponse:
+    """
+    Returns similarity score, match reasons, and a structured human-readable
+    explanation for why two songs match emotionally.
+
+    Mirrors buildMatchExplanation() in RecommendationEngine.swift.
+    Rows are only populated when the audio features are measured (isEstimated=False)
+    and the delta is within the threshold — same gates as the iOS app.
+
+    sourceGenres / targetGenre are optional — omit them when genre metadata is
+    unavailable and the genreBridgeLabel field will be null.
+    """
+    score, reasons = compute_similarity(req.source.to_dict(), req.target.to_dict())
+
+    src_genres: Optional[list[Genre]] = (
+        [{"main": g.main, "sub": g.sub} for g in req.sourceGenres] or None
+    )
+    tgt_genre: Optional[Genre] = (
+        {"main": req.targetGenre.main, "sub": req.targetGenre.sub}
+        if req.targetGenre else None
+    )
+
+    explanation = build_explanation(
+        source=req.source.to_dict(),
+        target=req.target.to_dict(),
+        source_genres=src_genres,
+        target_genre=tgt_genre,
+    )
+
+    return ExplainResponse(
+        score=score,
+        matchReasons=reasons,
+        explanation=ExplanationDetail(
+            rows=[
+                ExplanationRowItem(label=r["label"], descriptor=r["descriptor"])
+                for r in explanation["rows"]
+            ],
+            genreBridgeLabel=explanation["genreBridgeLabel"],
+        ),
+    )
 
 
 @app.post("/store-vector", response_model=StoreVectorResponse)

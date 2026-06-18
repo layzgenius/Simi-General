@@ -136,3 +136,58 @@ def test_build_explanation_major_key():
     result = build_explanation(src, tgt)
     by_label = {r["label"]: r["descriptor"] for r in result["rows"]}
     assert by_label.get("Key") == "Both major key"
+
+
+# ── POST /explain endpoint ────────────────────────────────────────────
+
+from fastapi.testclient import TestClient
+
+_SOURCE_PAYLOAD = {
+    "bpm": 92, "energy": 0.41, "valence": 0.28, "danceability": 0.44,
+    "acousticness": 0.62, "instrumentalness": 0.01, "liveness": 0.09,
+    "loudness": -9.1, "key": 9, "mode": 0,
+    "isEstimated": False, "isKeyEstimated": False,
+    "spectralWarmth": 0.38, "grooveRatio": 0.62,
+}
+_TARGET_PAYLOAD = {
+    "bpm": 88, "energy": 0.38, "valence": 0.31, "danceability": 0.49,
+    "acousticness": 0.55, "instrumentalness": 0.0, "liveness": 0.11,
+    "loudness": -10.2, "key": 11, "mode": 0,
+    "isEstimated": False, "isKeyEstimated": False,
+    "spectralWarmth": 0.42, "grooveRatio": 0.58,
+}
+
+def _make_client():
+    from main import app
+    return TestClient(app)
+
+def test_explain_endpoint_200():
+    client = _make_client()
+    resp = client.post("/explain", json={"source": _SOURCE_PAYLOAD, "target": _TARGET_PAYLOAD})
+    assert resp.status_code == 200
+
+def test_explain_endpoint_response_shape():
+    client = _make_client()
+    data = client.post("/explain", json={"source": _SOURCE_PAYLOAD, "target": _TARGET_PAYLOAD}).json()
+    assert isinstance(data["score"], float)
+    assert isinstance(data["matchReasons"], list)
+    assert isinstance(data["explanation"]["rows"], list)
+    assert data["explanation"]["genreBridgeLabel"] is None
+
+def test_explain_endpoint_with_genres():
+    client = _make_client()
+    payload = {
+        "source": _SOURCE_PAYLOAD,
+        "target": _TARGET_PAYLOAD,
+        "sourceGenres": [{"main": "Jazz", "sub": "Contemporary Jazz"}],
+        "targetGenre":  {"main": "Hip-Hop", "sub": "Lo-fi"},
+    }
+    data = client.post("/explain", json=payload).json()
+    assert data["explanation"]["genreBridgeLabel"] == "Jazz → Hip-Hop"
+
+def test_explain_endpoint_rows_populated():
+    client = _make_client()
+    data = client.post("/explain", json={"source": _SOURCE_PAYLOAD, "target": _TARGET_PAYLOAD}).json()
+    labels = [r["label"] for r in data["explanation"]["rows"]]
+    assert "Emotional weight" in labels
+    assert "Key" in labels
