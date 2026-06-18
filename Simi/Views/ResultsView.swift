@@ -43,6 +43,11 @@ struct ResultsView: View {
     @State private var breadth: Double = 0.5
     @State private var surpriseOrder: [String] = []
 
+    // Pro Export
+    @State private var showExportPicker = false
+    @State private var exportShareItems: [Any] = []
+    @State private var showExportSheet   = false
+
     // True only when Spotify's audio-features endpoint provided a real musical key.
     // Tag estimation and audio preview analysis never detect pitch — they always fall back
     // to key=0/mode=1 (C Major) as a placeholder. isKeyEstimated=false means Spotify measured it.
@@ -145,6 +150,25 @@ struct ResultsView: View {
         surpriseOrder = []
     }
 
+    // ──────────────────────────────────────────────
+    // MARK: - Pro Export
+    // ──────────────────────────────────────────────
+
+    private enum ExportFormat { case csv, json }
+
+    private func triggerExport(format: ExportFormat) {
+        guard let seed = engine.sourceSong else { return }
+        let (filename, data): (String, Data)
+        switch format {
+        case .csv:  (filename, data) = ProExportService.csv(seed: seed, results: engine.recommendations)
+        case .json: (filename, data) = ProExportService.json(seed: seed, results: engine.recommendations)
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+        try? data.write(to: url)
+        exportShareItems = [url]
+        showExportSheet = true
+    }
+
     var body: some View {
         ZStack {
             Color.simiBackground.ignoresSafeArea()
@@ -228,6 +252,31 @@ struct ResultsView: View {
                 }
                 .accessibilityLabel("New Search")
                 .accessibilityHint("Returns to the search screen")
+            }
+
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if !engine.isLoading && !engine.recommendations.isEmpty {
+                    Button {
+                        showExportPicker = true
+                    } label: {
+                        Image(systemName: "tablecells")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.simiAccent)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Export results")
+                    .accessibilityHint("Export the match list as CSV or JSON")
+                    .confirmationDialog("Export results", isPresented: $showExportPicker, titleVisibility: .visible) {
+                        Button("Export as CSV") { triggerExport(format: .csv) }
+                        Button("Export as JSON") { triggerExport(format: .json) }
+                        Button("Cancel", role: .cancel) { }
+                    }
+                    .sheet(isPresented: $showExportSheet) {
+                        ActivitySheetView(items: exportShareItems)
+                            .presentationDetents([.medium, .large])
+                    }
+                }
             }
 
             ToolbarItem(placement: .navigationBarTrailing) {
