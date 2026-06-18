@@ -324,6 +324,86 @@ struct ResultsView: View {
     }
 
     // ──────────────────────────────────────────────
+    // MARK: - Breadth Empty States
+    // ──────────────────────────────────────────────
+
+    var closeMatchEmptyState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "target")
+                .font(.system(size: 30, weight: .light))
+                .foregroundColor(.simiSubtext.opacity(0.45))
+                .accessibilityHidden(true)
+
+            VStack(spacing: 6) {
+                Text("No near-perfect matches")
+                    .font(.simiHeadline)
+                    .foregroundColor(.simiText)
+                Text("None of the results score above 85%. Move the slider toward the center to see more.")
+                    .font(.simiCaption)
+                    .foregroundColor(.simiSubtext)
+                    .multilineTextAlignment(.center)
+            }
+
+            Button {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
+                    breadth = 0.5
+                }
+            } label: {
+                Text("Show all results")
+                    .font(.simiBody.weight(.semibold))
+                    .foregroundColor(.simiAccent)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show all results")
+            .accessibilityHint("Resets discovery slider to center")
+        }
+        .padding(.horizontal, 32)
+        .padding(.vertical, 48)
+        .frame(maxWidth: .infinity)
+        .transition(.opacity)
+    }
+
+    var surpriseMeEmptyState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 30, weight: .light))
+                .foregroundColor(.simiSubtext.opacity(0.45))
+                .accessibilityHidden(true)
+
+            VStack(spacing: 6) {
+                Text("No hidden gems this time")
+                    .font(.simiHeadline)
+                    .foregroundColor(.simiText)
+                Text("All matches are high-confidence finds. Try a different seed song to discover more variety.")
+                    .font(.simiCaption)
+                    .foregroundColor(.simiSubtext)
+                    .multilineTextAlignment(.center)
+            }
+
+            Button {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
+                    breadth = 0.5
+                }
+            } label: {
+                Text("Show all results")
+                    .font(.simiBody.weight(.semibold))
+                    .foregroundColor(.simiAccent)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Show all results")
+            .accessibilityHint("Resets discovery slider to center")
+        }
+        .padding(.horizontal, 32)
+        .padding(.vertical, 48)
+        .frame(maxWidth: .infinity)
+        .transition(.opacity)
+    }
+
+    // ──────────────────────────────────────────────
     // MARK: - Key Filter Empty State
     // ──────────────────────────────────────────────
 
@@ -559,7 +639,11 @@ struct ResultsView: View {
 
     @ViewBuilder
     func listContent(proxy: ScrollViewProxy) -> some View {
-        if displayedRecommendations.isEmpty && filterSameKey {
+        if displayedRecommendations.isEmpty && breadthBucket == 0 {
+            closeMatchEmptyState
+        } else if displayedRecommendations.isEmpty && breadthBucket == 2 {
+            surpriseMeEmptyState
+        } else if displayedRecommendations.isEmpty && filterSameKey {
             keyFilterEmptyState
         } else {
             VStack(spacing: 12) {
@@ -582,6 +666,7 @@ struct ResultsView: View {
             }
             .padding(.bottom, 24)
             .animation(reduceMotion ? nil : .spring(response: 0.4, dampingFraction: 0.85), value: filterSameKey)
+            .animation(reduceMotion ? nil : .spring(response: 0.4, dampingFraction: 0.85), value: breadthBucket)
         }
     }
 
