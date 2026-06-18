@@ -32,6 +32,9 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       title: `"${data.title}" — Emotional Profile | Simi`,
       description: `${vibe}. Find songs that feel like ${data.title}.`,
     },
+    alternates: {
+      canonical: `https://simi.app/song/${spotifyId}`,
+    },
   }
 }
 
