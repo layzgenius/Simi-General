@@ -476,7 +476,8 @@ struct ResultsView: View {
             keyFilterEmptyState
         } else {
             VStack(spacing: 12) {
-                crossGenreBanner
+                Group { crossGenreBanner }
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: crossGenreCount >= 2)
                 ForEach(Array(displayedRecommendations.enumerated()), id: \.element.id) { index, song in
                     SongCard(song: song, rank: index + 1)
                         .id(song.id)
@@ -494,7 +495,6 @@ struct ResultsView: View {
             }
             .padding(.bottom, 24)
             .animation(reduceMotion ? nil : .spring(response: 0.4, dampingFraction: 0.85), value: filterSameKey)
-            .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: crossGenreCount)
         }
     }
 
