@@ -212,6 +212,7 @@ struct SongCard: View {
                         // Share
                         Button {
                             Task { @MainActor in
+                                shareImage = nil
                                 let artwork = await ShareCardView.fetchArtwork(song.albumArt)
                                 let card = ShareCardView(
                                     song: song,
@@ -243,7 +244,7 @@ struct SongCard: View {
             }
             .padding(.horizontal, 14)
             .padding(.top, 14)
-            .padding(.bottom, song.matchReasons.isEmpty && song.matchExplanation?.genreBridgeLabel == nil ? 14 : 8)
+            .padding(.bottom, song.matchReasons.isEmpty && (song.matchExplanation?.genreBridgeLabel ?? "").isEmpty ? 14 : 8)
 
             // ── Match reason chips — full-width row so they never get squished ──
             if !song.matchReasons.isEmpty {

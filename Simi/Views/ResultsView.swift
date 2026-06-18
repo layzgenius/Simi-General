@@ -347,6 +347,7 @@ struct ResultsView: View {
             Button {
                 withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
                     breadth = 0.5
+                    filterSameKey = false
                 }
             } label: {
                 Text("Show all results")
@@ -385,6 +386,7 @@ struct ResultsView: View {
             Button {
                 withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
                     breadth = 0.5
+                    filterSameKey = false
                 }
             } label: {
                 Text("Show all results")
@@ -427,6 +429,8 @@ struct ResultsView: View {
             Button {
                 withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
                     filterSameKey = false
+                    breadth = 0.5
+                    surpriseOrder = []
                 }
             } label: {
                 Text("Show all results")
