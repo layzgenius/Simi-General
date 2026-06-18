@@ -118,8 +118,8 @@ def build_explanation(
     tgt_key_est   = target.get("isKeyEstimated", True)
 
     # Row 1: Emotional weight — valence (valenceEssentia preferred)
-    src_v = source.get("valenceEssentia") or source["valence"]
-    tgt_v = target.get("valenceEssentia") or target["valence"]
+    src_v = source["valenceEssentia"] if source.get("valenceEssentia") is not None else source["valence"]
+    tgt_v = target["valenceEssentia"] if target.get("valenceEssentia") is not None else target["valence"]
     if not src_estimated and not tgt_estimated and abs(src_v - tgt_v) < 0.20:
         avg = (src_v + tgt_v) / 2
         if avg < 0.35:

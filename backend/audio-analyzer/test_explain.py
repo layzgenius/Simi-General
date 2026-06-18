@@ -120,6 +120,16 @@ def test_build_explanation_valence_essentia_used_over_valence():
     by_label = {r["label"]: r["descriptor"] for r in result["rows"]}
     assert by_label.get("Emotional weight") == "Same bright energy"
 
+def test_build_explanation_valence_essentia_zero_not_ignored():
+    # valenceEssentia=0.0 is a valid measured value (very melancholic)
+    # The None-check must NOT fall back to valence=0.90 (which would give "Same bright energy")
+    src = dict(_SOURCE, valenceEssentia=0.0, valence=0.90, isEstimated=False)
+    tgt = dict(_TARGET, valenceEssentia=0.0, valence=0.90, isEstimated=False)
+    result = build_explanation(src, tgt)
+    by_label = {r["label"]: r["descriptor"] for r in result["rows"]}
+    # avg valenceEssentia = 0.0 → "Same melancholic weight" (not "Same bright energy")
+    assert by_label.get("Emotional weight") == "Same melancholic weight"
+
 def test_build_explanation_major_key():
     src = dict(_SOURCE, mode=1)
     tgt = dict(_TARGET, mode=1)
