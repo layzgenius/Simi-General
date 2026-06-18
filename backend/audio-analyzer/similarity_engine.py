@@ -20,6 +20,7 @@ class AudioFeaturesDict(TypedDict, total=False):
     bpm:              float
     energy:           float
     valence:          float
+    valenceEssentia:  float
     danceability:     float
     acousticness:     float
     instrumentalness: float
@@ -33,6 +34,7 @@ class AudioFeaturesDict(TypedDict, total=False):
     tonalClarity:     float
     vocalPresence:    float
     reverbSpace:      float
+    grooveRatio:      float
 
 
 # Raw values must match MatchReason.rawValue in Song.swift exactly.
@@ -54,6 +56,133 @@ class _R:
     INSTRUMENTAL_FEEL   = "Instrumental feel"
     SPACIOUS_PRODUCTION = "Spacious production"
     DRY_AND_TIGHT       = "Dry & tight"
+
+
+class Genre(TypedDict, total=False):
+    main: str
+    sub:  str
+
+
+class ExplanationRow(TypedDict):
+    label:      str
+    descriptor: str
+
+
+class ExplanationResult(TypedDict):
+    rows:             list[ExplanationRow]
+    genreBridgeLabel: str | None
+
+
+# (displayName, keywords) — matched in priority order
+_GENRE_FAMILIES: dict[str, tuple[str, list[str]]] = {
+    "blues":      ("Blues",      ["blues"]),
+    "metal":      ("Metal",      ["metal", "thrash", "metalcore", "deathcore", "doom"]),
+    "rock":       ("Rock",       ["hard rock", "punk", "grunge", "rock", "hardcore", "shoegaze", "post-rock"]),
+    "hiphop":     ("Hip-Hop",    ["hip", "rap", "trap", "drill", "grime", "phonk"]),
+    "rnb":        ("R&B",        ["r&b", "rnb", "soul", "funk", "gospel", "slow jam", "neo-soul"]),
+    "jazz":       ("Jazz",       ["jazz"]),
+    "classical":  ("Classical",  ["classical", "orchestral"]),
+    "electronic": ("Electronic", ["electronic", "edm", "house", "techno", "trance", "drum and bass", "dubstep", "synthwave", "synth"]),
+    "folk":       ("Folk",       ["folk", "acoustic", "country", "americana", "bluegrass", "singer-songwriter"]),
+    "pop":        ("Pop",        ["pop"]),
+}
+_FAMILY_ORDER = ["blues", "metal", "rock", "hiphop", "rnb", "jazz", "classical", "electronic", "folk", "pop"]
+
+
+def detect_genre_family(genres: list[Genre]) -> tuple[str, str] | None:
+    """Returns (family_key, displayName) for the dominant genre family, or None."""
+    names = [g.get("main", "").lower() for g in genres]
+    for family_key in _FAMILY_ORDER:
+        display, keywords = _GENRE_FAMILIES[family_key]
+        if any(kw in name for name in names for kw in keywords):
+            return family_key, display
+    return None
+
+
+def build_explanation(
+    source: AudioFeaturesDict,
+    target: AudioFeaturesDict,
+    source_genres: list[Genre] | None = None,
+    target_genre:  Genre | None = None,
+) -> ExplanationResult:
+    """
+    Ports buildMatchExplanation() from RecommendationEngine.swift.
+    Rows are only populated when audio features are measured (isEstimated=False)
+    and the delta is within the threshold — identical gates to the iOS app.
+    """
+    rows: list[ExplanationRow] = []
+
+    src_estimated = source.get("isEstimated", True)
+    tgt_estimated = target.get("isEstimated", True)
+    src_key_est   = source.get("isKeyEstimated", True)
+    tgt_key_est   = target.get("isKeyEstimated", True)
+
+    # Row 1: Emotional weight — valence (valenceEssentia preferred)
+    src_v = source.get("valenceEssentia") or source["valence"]
+    tgt_v = target.get("valenceEssentia") or target["valence"]
+    if not src_estimated and not tgt_estimated and abs(src_v - tgt_v) < 0.20:
+        avg = (src_v + tgt_v) / 2
+        if avg < 0.35:
+            desc = "Same melancholic weight"
+        elif avg < 0.50:
+            desc = "Same bittersweet edge"
+        elif avg < 0.65:
+            desc = "Same balanced mood"
+        else:
+            desc = "Same bright energy"
+        rows.append({"label": "Emotional weight", "descriptor": desc})
+
+    # Row 2: Intensity — energy
+    if not src_estimated and not tgt_estimated and abs(source["energy"] - target["energy"]) < 0.20:
+        avg = (source["energy"] + target["energy"]) / 2
+        if avg < 0.35:
+            desc = "Equally restrained"
+        elif avg < 0.55:
+            desc = "Equally measured"
+        elif avg < 0.75:
+            desc = "Equally driven"
+        else:
+            desc = "Equally intense"
+        rows.append({"label": "Intensity", "descriptor": desc})
+
+    # Row 3: Key — only when both measured (not C-Major placeholder)
+    if not src_key_est and not tgt_key_est and source.get("mode") == target.get("mode"):
+        mode = source.get("mode", 1)
+        rows.append({"label": "Key", "descriptor": "Both major key" if mode == 1 else "Both minor key"})
+
+    # Row 4: Groove feel — grooveRatio presence gates this row (librosa only)
+    src_groove = source.get("grooveRatio")
+    tgt_groove = target.get("grooveRatio")
+    if src_groove is not None and tgt_groove is not None and abs(src_groove - tgt_groove) < 0.35:
+        avg = (src_groove + tgt_groove) / 2
+        if avg < 0.5:
+            desc = "Smooth and flowing"
+        elif avg < 0.9:
+            desc = "Equally measured pulse"
+        else:
+            desc = "Equally syncopated"
+        rows.append({"label": "Groove feel", "descriptor": desc})
+
+    # Row 5: Sonic texture — spectralWarmth (librosa only, isEstimated gates)
+    if not src_estimated and not tgt_estimated and abs(source.get("spectralWarmth", 0.5) - target.get("spectralWarmth", 0.5)) < 0.20:
+        avg = (source.get("spectralWarmth", 0.5) + target.get("spectralWarmth", 0.5)) / 2
+        if avg < 0.35:
+            desc = "Both bright and airy"
+        elif avg < 0.65:
+            desc = "Similar tonal warmth"
+        else:
+            desc = "Both warm and full"
+        rows.append({"label": "Sonic texture", "descriptor": desc})
+
+    # Genre bridge
+    genre_bridge: str | None = None
+    if source_genres and target_genre:
+        src_family = detect_genre_family(source_genres)
+        tgt_family = detect_genre_family([target_genre])
+        if src_family and tgt_family and src_family[0] != tgt_family[0]:
+            genre_bridge = f"{src_family[1]} → {tgt_family[1]}"
+
+    return {"rows": rows, "genreBridgeLabel": genre_bridge}
 
 
 def build_embedding(features: AudioFeaturesDict) -> list[float]:
