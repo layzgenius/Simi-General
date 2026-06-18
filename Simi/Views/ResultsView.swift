@@ -479,7 +479,7 @@ struct ResultsView: View {
                 Group { crossGenreBanner }
                     .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: crossGenreCount >= 2)
                 ForEach(Array(displayedRecommendations.enumerated()), id: \.element.id) { index, song in
-                    SongCard(song: song, rank: index + 1)
+                    SongCard(song: song, rank: index + 1, sourceSong: engine.sourceSong)
                         .id(song.id)
                         .padding(.horizontal, 20)
                         .overlay(

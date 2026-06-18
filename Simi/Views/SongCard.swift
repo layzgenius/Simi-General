@@ -58,8 +58,11 @@ struct SongCard: View {
 
     let song: SimilarSong
     let rank: Int
+    var sourceSong: Song? = nil
 
     @State private var isExpanded = false
+    @State private var shareImage: UIImage? = nil
+    @State private var showShareSheet = false
     @Environment(\.accessibilityReduceMotion) var reduceMotion
     @ObservedObject private var previewPlayer = PreviewPlayer.shared
 
@@ -204,6 +207,36 @@ struct SongCard: View {
                         .accessibilityLabel("Search on YouTube")
                         .contextMenu {
                             Label("Search on YouTube", systemImage: "play.rectangle.fill")
+                        }
+
+                        // Share
+                        Button {
+                            Task { @MainActor in
+                                let artwork = await ShareCardView.fetchArtwork(song.albumArt)
+                                let card = ShareCardView(
+                                    song: song,
+                                    sourceSong: sourceSong,
+                                    matchArtwork: artwork,
+                                    seedArtwork: nil
+                                )
+                                let renderer = ImageRenderer(content: card)
+                                renderer.scale = 3.0
+                                shareImage = renderer.uiImage
+                                showShareSheet = shareImage != nil
+                            }
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundColor(.simiSubtext)
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Share this match")
+                        .sheet(isPresented: $showShareSheet) {
+                            if let img = shareImage {
+                                ActivitySheetView(items: [img])
+                                    .presentationDetents([.medium, .large])
+                            }
                         }
                     }
                 }
