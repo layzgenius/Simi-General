@@ -20,7 +20,24 @@ import urllib.request
 import numpy as np
 import librosa
 import httpx
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+
+# Two workers = two librosa analyses running truly in parallel, each in its own
+# process with its own GIL. ThreadPoolExecutor lets GIL-bound librosa code run
+# only one thread at a time; ProcessPoolExecutor bypasses that entirely.
+# max_workers=2 keeps memory within Railway's container limits (~150 MB per worker).
+_process_pool: ProcessPoolExecutor | None = None
+_process_pool_lock = threading.Lock()
+
+
+def _get_process_pool() -> ProcessPoolExecutor:
+    global _process_pool
+    if _process_pool is None:
+        with _process_pool_lock:
+            if _process_pool is None:
+                _process_pool = ProcessPoolExecutor(max_workers=2)
+    return _process_pool
 
 
 # ─────────────────────────────────────────────
@@ -580,6 +597,8 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
     """
     Download an iTunes (or any) 30-second audio preview and extract
     a full AudioFeatures struct compatible with Simi's iOS models.
+    Download is async; CPU-bound librosa work runs in a ProcessPoolExecutor
+    so the event loop is never blocked.
     """
     try:
         async with httpx.AsyncClient(
@@ -594,118 +613,30 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
         print(f"❌ Download failed for {preview_url!r}: {e}")
         return None
 
-    # Write to temp file — kept alive through Essentia, deleted at the end
     suffix = ".m4a" if "m4a" in preview_url.lower() else ".mp3"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
+    loop = asyncio.get_running_loop()
     try:
-        y, sr = librosa.load(tmp_path, sr=22050, mono=True, duration=30.0)
+        return await loop.run_in_executor(_get_process_pool(), analyze_from_file, tmp_path)
     except Exception as e:
-        print(f"❌ librosa load failed: {e}")
+        print(f"❌ analyze_from_url executor failed: {e}")
+        return None
+    finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-        return None
-
-    if len(y) < sr * 5:
-        print("❌ Audio too short for reliable analysis")
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        return None
-
-    # ── Extract features ─────────────────────
-    # Energy/loudness use the louder half to avoid quiet-intro bias —
-    # e.g. Enter Sandman's clean guitar intro pulls full-clip RMS to 0.21.
-    half         = len(y) // 2
-    energy       = max(_rms_energy(y[:half]),    _rms_energy(y[half:]))
-    loudness     = max(_loudness_dbfs(y[:half]),  _loudness_dbfs(y[half:]))
-    acousticness = _acousticness(y, sr)
-
-    bpm_arr, _ = librosa.beat.beat_track(y=y, sr=sr)
-    raw_bpm = float(bpm_arr) if np.isscalar(bpm_arr) else float(bpm_arr[0])
-    bpm = _correct_bpm(y, sr, raw_bpm, energy)
-
-    danceability     = _danceability(y, sr, bpm)
-    key, mode = detect_key(y, sr, bpm, energy, danceability, acousticness)
-
-    instrumentalness = _instrumentalness(y, sr)
-    liveness         = _liveness(y, sr)
-
-    # Compute HPSS, spectral contrast, and tonnetz once — shared by _valence()
-    # and the extended features extractor.
-    y_harmonic, _ = librosa.effects.hpss(y)
-    sc = librosa.feature.spectral_contrast(y=y_harmonic, sr=sr, n_bands=6)
-    tn = librosa.feature.tonnetz(y=y_harmonic, sr=sr)
-
-    # spectral_warmth: KNOWN BROKEN — sc[0:3].mean() measures harmonic definition,
-    # not bass warmth. Direction is inverted vs. spec (orchestral > trap).
-    # Fixed at 0.5 so it contributes zero diff in similarity scoring.
-    spectral_warmth = 0.5
-    tonal_clarity   = float(np.clip(np.sqrt((tn ** 2).mean()) / 0.35, 0.0, 1.0))
-
-    # vocal_presence / reverb_space — disabled pending correct extraction.
-    vocal_presence = 0.5
-    reverb_space   = 0.5
-
-    valence = _valence(y, sr, mode, bpm, energy, danceability, acousticness,
-                       y_harmonic=y_harmonic, sc=sc, tn=tn)
-
-    # ── Extended librosa features ─────────────
-    ext = _extract_extended(y, sr, sc)
-
-    # ── Essentia DEAM + DCLAP (both need tmp_path still on disk) ────────
-    av           = extract_arousal_valence(tmp_path)
-    dclap_emb    = get_dclap_embedding(tmp_path)
-    try:
-        os.unlink(tmp_path)
-    except OSError:
-        pass
-    arousal_val = round(av[0], 4) if av else None
-    val_ess_val = round(av[1], 4) if av else None
-
-    features = AudioFeatures(
-        bpm=round(bpm, 2),
-        energy=round(energy, 4),
-        valence=round(valence, 4),
-        danceability=round(danceability, 4),
-        acousticness=round(acousticness, 4),
-        instrumentalness=round(instrumentalness, 4),
-        liveness=round(liveness, 4),
-        loudness=round(loudness, 2),
-        key=key,
-        mode=mode,
-        spectral_warmth=round(spectral_warmth, 4),
-        tonal_clarity=round(tonal_clarity, 4),
-        vocal_presence=round(vocal_presence, 4),
-        reverb_space=round(reverb_space, 4),
-        is_estimated=False,
-        is_key_estimated=False,
-        **ext,
-        arousal=arousal_val,
-        valence_essentia=val_ess_val,
-        dclap_embedding=dclap_emb,
-    )
-
-    print(f"✅ Analyzed: {bpm:.1f}BPM  energy={energy:.2f}  valence={valence:.2f}  "
-          f"dance={danceability:.2f}  acoustic={acousticness:.2f}  "
-          f"key={key} {'major' if mode else 'minor'}  "
-          f"tc={tonal_clarity:.3f}  "
-          f"arousal={arousal_val}  val_ess={val_ess_val}")
-
-    return features
 
 
 async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures | None:
     """
     Analyze pre-downloaded audio bytes — skips the CDN download step.
     iOS downloads the preview on-device and POSTs raw bytes here via /analyze-bytes.
-    Saves to a temp file and delegates to analyze_from_file in a thread executor
-    so the event loop isn't blocked during CPU-intensive librosa work.
+    Saves to a temp file and runs analyze_from_file in a ProcessPoolExecutor so
+    two concurrent requests run truly in parallel (each worker has its own GIL).
     """
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
@@ -713,7 +644,7 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
 
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, analyze_from_file, tmp_path)
+        return await loop.run_in_executor(_get_process_pool(), analyze_from_file, tmp_path)
     except Exception as e:
         print(f"❌ analyze_from_bytes failed: {e}")
         return None
