@@ -56,6 +56,22 @@ struct ResultsView: View {
         engine.sourceSong?.audioFeatures?.keyName ?? "?"
     }
 
+    private var crossGenreCount: Int {
+        engine.recommendations.filter {
+            guard let label = $0.matchExplanation?.genreBridgeLabel else { return false }
+            return !label.isEmpty
+        }.count
+    }
+
+    @ViewBuilder
+    private var crossGenreBanner: some View {
+        if crossGenreCount >= 2 {
+            CrossGenreBannerView(count: crossGenreCount)
+                .padding(.horizontal, 20)
+                .transition(.opacity)
+        }
+    }
+
     // Re-ranked recommendations based on slider proximity.
     // Always applies when sliders are expanded — slidersActive is UI-only (dot, reset, border).
     var adjustedRecommendations: [SimilarSong] {
@@ -460,6 +476,7 @@ struct ResultsView: View {
             keyFilterEmptyState
         } else {
             VStack(spacing: 12) {
+                crossGenreBanner
                 ForEach(Array(displayedRecommendations.enumerated()), id: \.element.id) { index, song in
                     SongCard(song: song, rank: index + 1)
                         .id(song.id)
@@ -477,6 +494,7 @@ struct ResultsView: View {
             }
             .padding(.bottom, 24)
             .animation(reduceMotion ? nil : .spring(response: 0.4, dampingFraction: 0.85), value: filterSameKey)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: crossGenreCount)
         }
     }
 
@@ -793,6 +811,43 @@ struct FilterChip: View {
         .frame(minHeight: 44)
         .contentShape(Rectangle())
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: isActive)
+    }
+}
+
+// ──────────────────────────────────────────────
+// MARK: - Cross-Genre Banner
+// Shown at the top of the list when ≥2 results cross genre families.
+// ──────────────────────────────────────────────
+
+struct CrossGenreBannerView: View {
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("🌉")
+                .font(.system(size: 22))
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(count) genre-crossing matches")
+                    .font(.simiBody.weight(.semibold))
+                    .foregroundColor(.simiText)
+                Text("Same feeling, different world")
+                    .font(.simiCaption)
+                    .foregroundColor(.simiSubtext)
+            }
+
+            Spacer()
+        }
+        .padding(14)
+        .background(Color.simiAccent.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.simiAccent.opacity(0.25), lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(count) genre-crossing matches. Same feeling, different world.")
     }
 }
 
