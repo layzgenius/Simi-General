@@ -39,6 +39,10 @@ struct ResultsView: View {
     // Same Key filter
     @State private var filterSameKey: Bool = false
 
+    // Discovery Breadth — 0=Close Match, 0.5=Normal, 1=Surprise Me
+    @State private var breadth: Double = 0.5
+    @State private var surpriseOrder: [String] = []
+
     // True only when Spotify's audio-features endpoint provided a real musical key.
     // Tag estimation and audio preview analysis never detect pitch — they always fall back
     // to key=0/mode=1 (C Major) as a placeholder. isKeyEstimated=false means Spotify measured it.
@@ -54,6 +58,10 @@ struct ResultsView: View {
 
     private var sourceKeyName: String {
         engine.sourceSong?.audioFeatures?.keyName ?? "?"
+    }
+
+    private var breadthBucket: Int {
+        breadth < 0.25 ? 0 : breadth > 0.75 ? 2 : 1
     }
 
     private var crossGenreCount: Int {
@@ -91,17 +99,40 @@ struct ResultsView: View {
         return proximity * 0.6 + song.similarityScore * 0.4
     }
 
-    // Final list shown in the UI: slider-adjusted → key-filtered
+    // Final list shown in the UI: slider-adjusted → key-filtered → breadth-filtered
     var displayedRecommendations: [SimilarSong] {
-        guard filterSameKey, let (key, mode) = sourceKey else {
-            return adjustedRecommendations
+        // Step 1: key filter (unchanged)
+        var base: [SimilarSong]
+        if filterSameKey, let (key, mode) = sourceKey {
+            base = adjustedRecommendations.filter { song in
+                // Only filter songs where the key is known (not estimated).
+                // isKeyEstimated=false means the key came from Spotify or GetSongBPM.
+                // Songs with no key data pass false so we don't hide what we can't measure.
+                guard let f = song.audioFeatures, !f.isKeyEstimated else { return false }
+                return f.key == key && f.mode == mode
+            }
+        } else {
+            base = adjustedRecommendations
         }
-        return adjustedRecommendations.filter { song in
-            // Only filter songs where the key is known (not estimated).
-            // isKeyEstimated=false means the key came from Spotify or GetSongBPM.
-            // Songs with no key data pass false so we don't hide what we can't measure.
-            guard let f = song.audioFeatures, !f.isKeyEstimated else { return false }
-            return f.key == key && f.mode == mode
+
+        // Step 2: breadth filter
+        switch breadthBucket {
+        case 0: // Close Match — only high-confidence results
+            return base
+                .filter { $0.similarityScore >= 0.85 }
+                .sorted { $0.similarityScore > $1.similarityScore }
+        case 2: // Surprise Me — mid-range results in stable shuffle order
+            var pool = base.filter { $0.similarityScore >= 0.65 && $0.similarityScore < 0.85 }
+            if !surpriseOrder.isEmpty {
+                pool.sort { a, b in
+                    let ai = surpriseOrder.firstIndex(of: a.id) ?? Int.max
+                    let bi = surpriseOrder.firstIndex(of: b.id) ?? Int.max
+                    return ai < bi
+                }
+            }
+            return pool
+        default: // Normal — full list (current behavior)
+            return base
         }
     }
 
@@ -110,6 +141,8 @@ struct ResultsView: View {
         targetEnergy  = features?.energy  ?? 0.5
         targetValence = features?.valence ?? 0.5
         slidersActive = false
+        breadth = 0.5
+        surpriseOrder = []
     }
 
     var body: some View {
@@ -144,6 +177,13 @@ struct ResultsView: View {
                                 .padding(.bottom, 4)
                         }
 
+                        // ── Breadth Slider (list mode only) ──
+                        if viewMode == .list {
+                            breadthSliderPanel
+                                .padding(.horizontal, 20)
+                                .padding(.bottom, 8)
+                        }
+
                         // ── Mood Shift Sliders (list mode only) ──
                         if viewMode == .list {
                             moodSliderPanel
@@ -166,6 +206,11 @@ struct ResultsView: View {
             }
         }
         .onAppear { resetSliders(); filterSameKey = false }
+        .onChange(of: engine.recommendations.count) { _, _ in
+            if breadthBucket == 2 {
+                surpriseOrder = engine.recommendations.map { $0.id }.shuffled()
+            }
+        }
         .navigationBarBackButtonHidden(true)
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
@@ -197,6 +242,48 @@ struct ResultsView: View {
                 .accessibilityLabel(engine.isLoading ? "Finding songs" : "\(engine.recommendations.count) songs found")
             }
         }
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Breadth Slider
+    // ──────────────────────────────────────────────
+
+    var breadthSliderPanel: some View {
+        VStack(spacing: 6) {
+            Slider(value: $breadth, in: 0...1)
+                .tint(.simiAccent)
+                .accessibilityLabel("Discovery breadth")
+                .accessibilityValue(breadthBucket == 0 ? "Closer match" : breadthBucket == 2 ? "Surprise me" : "Normal")
+                .onChange(of: breadthBucket) { _, newBucket in
+                    if newBucket == 2 && surpriseOrder.isEmpty {
+                        surpriseOrder = engine.recommendations.map { $0.id }.shuffled()
+                    } else if newBucket != 2 {
+                        surpriseOrder = []
+                    }
+                }
+
+            HStack {
+                Text("Closer match")
+                    .font(.simiMicro)
+                    .foregroundColor(breadthBucket == 0 ? .simiAccent : .simiSubtext)
+                Spacer()
+                Text("Surprise me")
+                    .font(.simiMicro)
+                    .foregroundColor(breadthBucket == 2 ? .simiAccent : .simiSubtext)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(Color.simiCard)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(
+                    breadthBucket != 1 ? Color.simiAccent.opacity(0.5) : Color.simiBorder,
+                    lineWidth: 1
+                )
+        )
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: breadthBucket)
     }
 
     // ──────────────────────────────────────────────
