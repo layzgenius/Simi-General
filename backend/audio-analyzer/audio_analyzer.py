@@ -17,11 +17,18 @@ import os
 import tempfile
 import threading
 import urllib.request
+import warnings
 import numpy as np
 import librosa
 import httpx
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+
+# Suppress librosa/soundfile fallback noise. PySoundFile can't decode MP3/M4A
+# (libsndfile has no MP3 codec), so librosa always falls back to audioread for
+# those formats. This is expected; the warnings add no actionable signal.
+warnings.filterwarnings("ignore", message="PySoundFile failed", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
 
 # Two workers = two librosa analyses running truly in parallel, each in its own
 # process with its own GIL. ThreadPoolExecutor lets GIL-bound librosa code run
