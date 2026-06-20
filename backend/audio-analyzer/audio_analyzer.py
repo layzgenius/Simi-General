@@ -15,13 +15,11 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
-import threading
 import urllib.request
 import warnings
 import numpy as np
 import librosa
 import httpx
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 # Suppress librosa/soundfile fallback noise. PySoundFile can't decode MP3/M4A
@@ -29,22 +27,6 @@ from dataclasses import dataclass
 # those formats. This is expected; the warnings add no actionable signal.
 warnings.filterwarnings("ignore", message="PySoundFile failed", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
-
-# Two workers = two librosa analyses running truly in parallel, each in its own
-# process with its own GIL. ThreadPoolExecutor lets GIL-bound librosa code run
-# only one thread at a time; ProcessPoolExecutor bypasses that entirely.
-# max_workers=2 keeps memory within Railway's container limits (~150 MB per worker).
-_process_pool: ProcessPoolExecutor | None = None
-_process_pool_lock = threading.Lock()
-
-
-def _get_process_pool() -> ProcessPoolExecutor:
-    global _process_pool
-    if _process_pool is None:
-        with _process_pool_lock:
-            if _process_pool is None:
-                _process_pool = ProcessPoolExecutor(max_workers=2)
-    return _process_pool
 
 
 # ─────────────────────────────────────────────
@@ -604,7 +586,7 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
     """
     Download an iTunes (or any) 30-second audio preview and extract
     a full AudioFeatures struct compatible with Simi's iOS models.
-    Download is async; CPU-bound librosa work runs in a ProcessPoolExecutor
+    Download is async; CPU-bound librosa work runs in a thread pool executor
     so the event loop is never blocked.
     """
     try:
@@ -627,7 +609,7 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
 
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(_get_process_pool(), analyze_from_file, tmp_path)
+        return await loop.run_in_executor(None, analyze_from_file, tmp_path)
     except Exception as e:
         print(f"❌ analyze_from_url executor failed: {e}")
         return None
@@ -642,8 +624,8 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
     """
     Analyze pre-downloaded audio bytes — skips the CDN download step.
     iOS downloads the preview on-device and POSTs raw bytes here via /analyze-bytes.
-    Saves to a temp file and runs analyze_from_file in a ProcessPoolExecutor so
-    two concurrent requests run truly in parallel (each worker has its own GIL).
+    Saves to a temp file and runs analyze_from_file in the default thread pool
+    executor so the event loop is never blocked.
     """
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
@@ -651,7 +633,7 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
 
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(_get_process_pool(), analyze_from_file, tmp_path)
+        return await loop.run_in_executor(None, analyze_from_file, tmp_path)
     except Exception as e:
         print(f"❌ analyze_from_bytes failed: {e}")
         return None
