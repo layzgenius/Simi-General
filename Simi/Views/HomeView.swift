@@ -87,8 +87,8 @@ struct HomeView: View {
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
-            .onChange(of: engine.isLoading) { _, isLoading in
-                if !isLoading && !engine.recommendations.isEmpty {
+            .onChange(of: engine.sourceSong) { _, song in
+                if song != nil {
                     navigateToResults = true
                 }
             }
@@ -657,7 +657,8 @@ struct HomeView: View {
             VStack(spacing: 8) {
                 ForEach(engine.history.entries.prefix(5)) { entry in
                     HistoryRow(entry: entry, manager: engine.history) {
-                        Task {
+                        engine.activeSearchTask?.cancel()
+                        engine.activeSearchTask = Task {
                             // Re-run via the original path — URL searches use the URL,
                             // text searches use title + artist. queryString preserves this.
                             let query = entry.queryString
@@ -689,7 +690,8 @@ struct HomeView: View {
 
     func startSearch() {
         guard isSearchReady else { return }
-        Task {
+        engine.activeSearchTask?.cancel()
+        engine.activeSearchTask = Task {
             switch searchMode {
             case .url:
                 let validURLs = pastedURLs.map { $0.trimmingCharacters(in: .whitespaces) }
