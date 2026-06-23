@@ -719,6 +719,15 @@ struct ResultsView: View {
                     SkeletonCard()
                         .padding(.horizontal, 20)
                 }
+                PulsingDotsView()
+                    .padding(.top, 12)
+                Text(engine.loadingMessage)
+                    .font(.simiMicro)
+                    .foregroundColor(.simiSubtext)
+                    .id(engine.loadingMessage)
+                    .transition(.opacity)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: engine.loadingMessage)
+                    .padding(.top, 4)
             }
             .padding(.bottom, 24)
         } else if displayedRecommendations.isEmpty && breadthBucket == 0 {
@@ -1184,6 +1193,35 @@ struct CrossGenreBannerView: View {
         )
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(count) genre-crossing matches. Same feeling, different world.")
+    }
+}
+
+// ──────────────────────────────────────────────
+// MARK: - Pulsing Dots
+// ──────────────────────────────────────────────
+
+private struct PulsingDotsView: View {
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
+    @State private var animate = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(Color.simiAccent)
+                    .frame(width: 8, height: 8)
+                    .opacity(reduceMotion ? 0.6 : (animate ? 1.0 : 0.3))
+                    .animation(
+                        reduceMotion ? nil : Animation
+                            .easeInOut(duration: 0.4)
+                            .repeatForever(autoreverses: true)
+                            .delay(Double(i) * 0.2),
+                        value: animate
+                    )
+            }
+        }
+        .onAppear { animate = true }
+        .onDisappear { animate = false }
     }
 }
 
