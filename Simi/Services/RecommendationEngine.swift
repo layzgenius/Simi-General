@@ -57,9 +57,6 @@ class RecommendationEngine: ObservableObject {
     private let previewAnalyzer      = PreviewAudioAnalyzer.shared
     let history                     = SearchHistoryManager()
 
-    // Tracks the active search so a new search can cancel it before Railway gets re-hit.
-    var activeSearchTask: Task<Void, Never>?
-
     // Stored so background enrichment can re-score recommendations
     private var lastSourceFeatures: AudioFeatures?
     private var lastSeedFeatures: [AudioFeatures] = []   // Individual seed features for multi-seed scoring
@@ -1318,6 +1315,7 @@ class RecommendationEngine: ObservableObject {
         let coverageRatio = Double(enrichedCount) / Double(max(1, snapshot.count))
         if coverageRatio >= 0.3 {
             let before = recommendations.count
+            // Intentional: removes low-quality songs after render; remaining cards keep their relative order.
             recommendations = recommendations.filter { $0.similarityScore >= 0.62 }
             let removed = before - recommendations.count
             if removed > 0 {

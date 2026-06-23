@@ -238,12 +238,16 @@ struct ResultsView: View {
                 surpriseOrder = engine.recommendations.map { $0.id }.shuffled()
             }
             guard count > 0, cardAppeared.isEmpty else { return }
-            cardAppeared = Array(repeating: false, count: count)
-            for i in 0..<count {
-                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.08) {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        guard i < cardAppeared.count else { return }
-                        cardAppeared[i] = true
+            if reduceMotion {
+                cardAppeared = Array(repeating: true, count: count)
+            } else {
+                cardAppeared = Array(repeating: false, count: count)
+                for i in 0..<count {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.08) {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            guard i < cardAppeared.count else { return }
+                            cardAppeared[i] = true
+                        }
                     }
                 }
             }
