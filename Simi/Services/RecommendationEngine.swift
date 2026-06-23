@@ -222,7 +222,7 @@ class RecommendationEngine: ObservableObject {
         }
 
         isLoading = true
-        loadingMessage = "Finding song…"
+        loadingMessage = "Reading the song…"
         errorMessage = nil
         infoMessage = nil
         recommendations = []
@@ -243,7 +243,7 @@ class RecommendationEngine: ObservableObject {
             let song = try await resolveSong(from: parsed)
             self.sourceSong = song
 
-            loadingMessage = "Analyzing audio…"
+            loadingMessage = "Analyzing the feeling…"
             // Launch source-independent candidate fetches immediately — don't stall behind Railway/GetSongBPM.
             // genres, Last.fm similar tracks, and ListenBrainz only need title+artist, not audio features.
             async let featuresTask      = fetchAudioFeaturesWithFallback(song: song)
@@ -279,7 +279,7 @@ class RecommendationEngine: ObservableObject {
             let sourceFeatures = features  // immutable copy — safe to capture in async let / Task
 
             // Feature-dependent searches + audio-derived emotional tags.
-            loadingMessage = "Finding similar songs…"
+            loadingMessage = "Searching for its emotional kin…"
             async let spotifyRecsTask = spotifyService.getRecommendations(seedTrackID: song.id, features: sourceFeatures)
             async let vectorTask      = supabase.fetchSimilarByVector(embedding: SupabaseCacheService.buildEmbedding(from: sourceFeatures))
             async let dclapTask       = fetchVectorCandidates(embedding: sourceFeatures.dclapEmbedding ?? [])
@@ -299,10 +299,32 @@ class RecommendationEngine: ObservableObject {
                 return await self.lastFMService.fetchEmotionalTagCandidates(rawTags: audioOnlyTags)
             }
 
-            let genres           = await genresTask
-            let spotifyRecs      = (try? await spotifyRecsTask) ?? []
+            // Phase 1: await early candidates (Last.fm + ListenBrainz arrive first)
             let lastFMTracks     = await similarTracksTask
             let lbTracks         = await lbTask
+
+            // Early Supabase pre-fetch — runs while Spotify/vector/DCLAP are still in flight.
+            // Results passed to prefetchCandidateFeatures() as prewarmedCache to skip duplicate lookups.
+            let earlyLookupTask = Task<[String: AudioFeatures], Never> {
+                var cache: [String: AudioFeatures] = [:]
+                await withTaskGroup(of: (String, AudioFeatures?).self) { group in
+                    for track in (lastFMTracks + lbTracks).prefix(20) {
+                        group.addTask {
+                            let key = "\(track.title)|\(track.artist)".lowercased()
+                            let features = await self.supabase.lookupFeatures(title: track.title, artist: track.artist)
+                            return (key, features)
+                        }
+                    }
+                    for await (key, features) in group {
+                        if let features { cache[key] = features }
+                    }
+                }
+                return cache
+            }
+
+            // Phase 2: await remaining candidates
+            let genres           = await genresTask
+            let spotifyRecs      = (try? await spotifyRecsTask) ?? []
             let vectorCandidates = await vectorTask
             let dclapCandidates  = await dclapTask
             self.detectedGenres  = genres
@@ -334,11 +356,13 @@ class RecommendationEngine: ObservableObject {
                 return
             }
 
-            loadingMessage = "Almost ready…"
+            loadingMessage = "Putting it together…"
+            let earlyCache = await earlyLookupTask.value
             let enriched = await prefetchCandidateFeatures(
                 candidates: merged,
                 sourceFeatures: sourceFeatures,
-                genres: genres
+                genres: genres,
+                prewarmedCache: earlyCache
             )
             self.recommendations = enriched
             if let song = self.sourceSong {
@@ -428,7 +452,7 @@ class RecommendationEngine: ObservableObject {
         }
 
         isLoading = true
-        loadingMessage = "Finding song…"
+        loadingMessage = "Reading the song…"
         errorMessage = nil
         recommendations = []
         sourceSong = nil
@@ -440,7 +464,7 @@ class RecommendationEngine: ObservableObject {
             }
             self.sourceSong = song
 
-            loadingMessage = "Analyzing audio…"
+            loadingMessage = "Analyzing the feeling…"
             // Launch source-independent candidate fetches immediately.
             async let featuresTask      = fetchAudioFeaturesWithFallback(song: song)
             async let tagsEarlyTask     = fetchRawTagsCached(song: song)
@@ -472,7 +496,7 @@ class RecommendationEngine: ObservableObject {
             self.lastSourceFeatures = features
             let sourceFeatures = features
 
-            loadingMessage = "Finding similar songs…"
+            loadingMessage = "Searching for its emotional kin…"
             async let spotifyRecsTask = spotifyService.getRecommendations(seedTrackID: song.id, features: sourceFeatures)
             async let vectorTask      = supabase.fetchSimilarByVector(embedding: SupabaseCacheService.buildEmbedding(from: sourceFeatures))
             async let dclapTask2      = fetchVectorCandidates(embedding: sourceFeatures.dclapEmbedding ?? [])
@@ -490,10 +514,32 @@ class RecommendationEngine: ObservableObject {
                 return await self.lastFMService.fetchEmotionalTagCandidates(rawTags: audioOnlyTags)
             }
 
-            let genres           = await genresTask
-            let spotifyRecs      = (try? await spotifyRecsTask) ?? []
+            // Phase 1: await early candidates (Last.fm + ListenBrainz arrive first)
             let lastFMTracks     = await similarTracksTask
             let lbTracks         = await lbTask
+
+            // Early Supabase pre-fetch — runs while Spotify/vector/DCLAP are still in flight.
+            // Results passed to prefetchCandidateFeatures() as prewarmedCache to skip duplicate lookups.
+            let earlyLookupTask = Task<[String: AudioFeatures], Never> {
+                var cache: [String: AudioFeatures] = [:]
+                await withTaskGroup(of: (String, AudioFeatures?).self) { group in
+                    for track in (lastFMTracks + lbTracks).prefix(20) {
+                        group.addTask {
+                            let key = "\(track.title)|\(track.artist)".lowercased()
+                            let features = await self.supabase.lookupFeatures(title: track.title, artist: track.artist)
+                            return (key, features)
+                        }
+                    }
+                    for await (key, features) in group {
+                        if let features { cache[key] = features }
+                    }
+                }
+                return cache
+            }
+
+            // Phase 2: await remaining candidates
+            let genres           = await genresTask
+            let spotifyRecs      = (try? await spotifyRecsTask) ?? []
             let vectorCandidates = await vectorTask
             let dclapCandidates2 = await dclapTask2
             self.detectedGenres  = genres
@@ -525,11 +571,13 @@ class RecommendationEngine: ObservableObject {
                 return
             }
 
-            loadingMessage = "Almost ready…"
+            loadingMessage = "Putting it together…"
+            let earlyCache = await earlyLookupTask.value
             let enriched = await prefetchCandidateFeatures(
                 candidates: merged,
                 sourceFeatures: sourceFeatures,
-                genres: genres
+                genres: genres,
+                prewarmedCache: earlyCache
             )
             self.recommendations = enriched
             history.record(song: song, query: query)
@@ -1549,17 +1597,18 @@ class RecommendationEngine: ObservableObject {
     // ──────────────────────────────────────────────
 
     /// Enriches all candidates with Supabase cache + Last.fm tag estimation before first render.
-    /// Runs as two racing tasks: the enrichment work vs. a 10-second timeout.
-    /// Whichever finishes first wins — skeletons never persist past 10s.
+    /// Runs as two racing tasks: the enrichment work vs. a 7-second timeout.
+    /// Whichever finishes first wins — skeletons never persist past 7s.
     private func prefetchCandidateFeatures(
         candidates: [SimilarSong],
         sourceFeatures: AudioFeatures,
         genres: [Genre],
-        seedFeatures: [AudioFeatures] = []
+        seedFeatures: [AudioFeatures] = [],
+        prewarmedCache: [String: AudioFeatures] = [:]
     ) async -> [SimilarSong] {
         guard !candidates.isEmpty else { return candidates }
 
-        // Race: enrichment vs. 10s timeout. Returns unenriched candidates on timeout.
+        // Race: enrichment vs. 7s timeout. Returns unenriched candidates on timeout.
         return await withTaskGroup(of: [SimilarSong].self) { group in
             // Task A: do the actual enrichment
             group.addTask {
@@ -1567,12 +1616,13 @@ class RecommendationEngine: ObservableObject {
                     candidates: candidates,
                     sourceFeatures: sourceFeatures,
                     genres: genres,
-                    seedFeatures: seedFeatures
+                    seedFeatures: seedFeatures,
+                    prewarmedCache: prewarmedCache
                 )
             }
-            // Task B: 10-second timeout fallback
+            // Task B: 7-second timeout fallback
             group.addTask {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                try? await Task.sleep(nanoseconds: 7_000_000_000)
                 simiLog("⚠️ prefetchCandidateFeatures timed out — revealing with best-effort features")
                 return candidates
             }
@@ -1587,16 +1637,22 @@ class RecommendationEngine: ObservableObject {
         candidates: [SimilarSong],
         sourceFeatures: AudioFeatures,
         genres: [Genre],
-        seedFeatures: [AudioFeatures]
+        seedFeatures: [AudioFeatures],
+        prewarmedCache: [String: AudioFeatures] = [:]
     ) async -> [SimilarSong] {
         var result = candidates
 
         // Collect (index, features) for all candidates in parallel.
+        // Priority 0: prewarmed cache (populated by earlyLookupTask during candidate fetch phase).
         // Priority 1: Supabase cache (instant, no rate-limit concern).
         // Priority 2: Last.fm tag estimation for cache misses (staggered 20ms, capped at index 15).
         let fetched: [(Int, AudioFeatures?)] = await withTaskGroup(of: (Int, AudioFeatures?).self) { group in
             for (index, song) in candidates.enumerated() {
                 group.addTask {
+                    let cacheKey = "\(song.title)|\(song.artist)".lowercased()
+                    if let prewarmed = prewarmedCache[cacheKey] {
+                        return (index, prewarmed)
+                    }
                     if let cached = await self.supabase.lookupFeatures(title: song.title, artist: song.artist) {
                         return (index, cached)
                     }
