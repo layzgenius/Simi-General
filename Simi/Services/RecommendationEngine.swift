@@ -337,7 +337,13 @@ class RecommendationEngine: ObservableObject {
                 return
             }
 
-            self.recommendations = merged
+            loadingMessage = "Almost ready…"
+            let enriched = await prefetchCandidateFeatures(
+                candidates: merged,
+                sourceFeatures: sourceFeatures,
+                genres: genres
+            )
+            self.recommendations = enriched
             if let song = self.sourceSong {
                 history.record(song: song, query: urlString)
             }
@@ -522,7 +528,13 @@ class RecommendationEngine: ObservableObject {
                 return
             }
 
-            self.recommendations = merged
+            loadingMessage = "Almost ready…"
+            let enriched = await prefetchCandidateFeatures(
+                candidates: merged,
+                sourceFeatures: sourceFeatures,
+                genres: genres
+            )
+            self.recommendations = enriched
             history.record(song: song, query: query)
             isLoading = false
 
@@ -680,7 +692,15 @@ class RecommendationEngine: ObservableObject {
                 excludeIDs: seedIDSet,
                 seedFeatures: allFeatures          // ← score against each seed independently
             )
-            self.recommendations = merged
+
+            loadingMessage = "Almost ready…"
+            let enriched = await prefetchCandidateFeatures(
+                candidates: merged,
+                sourceFeatures: blended,
+                genres: mergedGenres,
+                seedFeatures: allFeatures
+            )
+            self.recommendations = enriched
 
             for song in resolvedSongs {
                 history.record(song: song, query: "\(song.title) \(song.artist)")
@@ -1272,7 +1292,7 @@ class RecommendationEngine: ObservableObject {
         }
 
         if enrichedCount > 0 {
-            recommendations.sort { $0.similarityScore > $1.similarityScore }
+            simiLog("✅ Background tag enrichment updated \(enrichedCount) songs (positions frozen)")
         }
 
         let coverageRatio = Double(enrichedCount) / Double(max(1, snapshot.count))
@@ -1359,8 +1379,7 @@ class RecommendationEngine: ObservableObject {
         }
 
         if librosaSucceeded > 0 {
-            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded")
-            recommendations.sort { $0.similarityScore > $1.similarityScore }
+            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded (positions frozen)")
         } else {
             simiLog("⚠️ Librosa Stage 2: 0/\(librosaTargets.count) — Railway may be cold or busy")
         }
@@ -1505,6 +1524,98 @@ class RecommendationEngine: ObservableObject {
 
         results.sort { $0.similarityScore > $1.similarityScore }
         return applyArtistDiversity(results, sourceArtist: sourceSong.artist)
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Pre-render Enrichment
+    // ──────────────────────────────────────────────
+
+    /// Enriches all candidates with Supabase cache + Last.fm tag estimation before first render.
+    /// Runs as two racing tasks: the enrichment work vs. a 10-second timeout.
+    /// Whichever finishes first wins — skeletons never persist past 10s.
+    private func prefetchCandidateFeatures(
+        candidates: [SimilarSong],
+        sourceFeatures: AudioFeatures,
+        genres: [Genre],
+        seedFeatures: [AudioFeatures] = []
+    ) async -> [SimilarSong] {
+        guard !candidates.isEmpty else { return candidates }
+
+        // Race: enrichment vs. 10s timeout. Returns unenriched candidates on timeout.
+        return await withTaskGroup(of: [SimilarSong].self) { group in
+            // Task A: do the actual enrichment
+            group.addTask {
+                await self.runPrefetchEnrichment(
+                    candidates: candidates,
+                    sourceFeatures: sourceFeatures,
+                    genres: genres,
+                    seedFeatures: seedFeatures
+                )
+            }
+            // Task B: 10-second timeout fallback
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                simiLog("⚠️ prefetchCandidateFeatures timed out — revealing with best-effort features")
+                return candidates
+            }
+            // First to finish wins; cancel the other
+            let first = await group.next()!
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private func runPrefetchEnrichment(
+        candidates: [SimilarSong],
+        sourceFeatures: AudioFeatures,
+        genres: [Genre],
+        seedFeatures: [AudioFeatures]
+    ) async -> [SimilarSong] {
+        var result = candidates
+
+        // Collect (index, features) for all candidates in parallel.
+        // Priority 1: Supabase cache (instant, no rate-limit concern).
+        // Priority 2: Last.fm tag estimation for cache misses (staggered 20ms, capped at index 15).
+        let fetched: [(Int, AudioFeatures?)] = await withTaskGroup(of: (Int, AudioFeatures?).self) { group in
+            for (index, song) in candidates.enumerated() {
+                group.addTask {
+                    if let cached = await self.supabase.lookupFeatures(title: song.title, artist: song.artist) {
+                        return (index, cached)
+                    }
+                    // Stagger: indices 0–15 get 20ms delay each (max 300ms).
+                    // Indices 16+ fire immediately — they don't wait longer.
+                    if index > 0 {
+                        try? await Task.sleep(nanoseconds: UInt64(min(index, 15)) * 20_000_000)
+                    }
+                    let tags = await self.lastFMService.fetchRawTags(title: song.title, artist: song.artist)
+                    let estimated = await self.estimateFeaturesFromTags(tags)
+                    return (index, estimated)
+                }
+            }
+            var updates: [(Int, AudioFeatures?)] = []
+            for await update in group { updates.append(update) }
+            return updates
+        }
+
+        let explanationSource = seedFeatures.count > 1 ? centroid(of: seedFeatures) : sourceFeatures
+
+        for (idx, features) in fetched {
+            guard let features, idx < result.count else { continue }
+            let (score, reasons) = seedFeatures.count > 1
+                ? computeSimilarityMultiSeed(seeds: seedFeatures, target: features, genres: genres)
+                : computeSimilarity(source: sourceFeatures, target: features, genres: genres)
+            result[idx].audioFeatures    = features
+            result[idx].similarityScore  = score
+            result[idx].matchReasons     = reasons
+            result[idx].matchExplanation = buildMatchExplanation(
+                source: explanationSource,
+                target: features,
+                sourceGenres: genres,
+                targetGenre: result[idx].genre
+            )
+        }
+
+        return result.sorted { $0.similarityScore > $1.similarityScore }
     }
 
     // ──────────────────────────────────────────────
