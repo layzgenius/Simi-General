@@ -1357,18 +1357,19 @@ class RecommendationEngine: ObservableObject {
         }
 
         if enrichedCount > 0 {
-            simiLog("✅ Background tag enrichment updated \(enrichedCount) songs (positions frozen)")
+            simiLog("✅ Background tag enrichment updated \(enrichedCount) songs")
         }
 
         let coverageRatio = Double(enrichedCount) / Double(max(1, snapshot.count))
         if coverageRatio >= 0.3 {
             let before = recommendations.count
-            // Intentional: removes low-quality songs after render; remaining cards keep their relative order.
             recommendations = recommendations.filter { $0.similarityScore >= 0.62 }
             let removed = before - recommendations.count
             if removed > 0 {
                 simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold 0.62)")
             }
+            // Re-sort after quality filter so the highest-scoring songs surface to the top.
+            recommendations.sort { $0.similarityScore > $1.similarityScore }
         }
 
         simiLog("✅ Tag enrichment done: \(enrichedCount)/\(snapshot.count) songs got features")
@@ -1445,7 +1446,9 @@ class RecommendationEngine: ObservableObject {
         }
 
         if librosaSucceeded > 0 {
-            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded (positions frozen)")
+            // Re-sort after librosa upgrades so measured-feature winners surface to the top.
+            recommendations.sort { $0.similarityScore > $1.similarityScore }
+            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded, re-sorted")
         } else {
             simiLog("⚠️ Librosa Stage 2: 0/\(librosaTargets.count) — Railway may be cold or busy")
         }
