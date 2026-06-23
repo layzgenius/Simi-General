@@ -1855,7 +1855,11 @@ class RecommendationEngine: ObservableObject {
         let valenceDiff = abs(srcValence - tgtValence)
         let valenceScore = 1.0 - valenceDiff
         totalScore += valenceScore * 0.30
-        if !bothEstimated && valenceDiff < 0.15 {
+        // Tighter threshold when source is measured but target is tag-estimated:
+        // soul-genre centroids cluster close enough that a 0.15 gate produces false "Same Mood"
+        // labels between emotionally opposite songs (e.g. Tar Baby vs Respect).
+        let moodThreshold = (!source.isEstimated && target.isEstimated) ? 0.10 : 0.15
+        if !bothEstimated && valenceDiff < moodThreshold {
             // Emotionally specific: name the actual mood shared, not just "Same Mood"
             let avgValence = (srcValence + tgtValence) / 2
             let avgEnergy  = (source.energy + target.energy) / 2
@@ -1879,9 +1883,12 @@ class RecommendationEngine: ObservableObject {
         }
 
         // Energy — the intensity of the feeling (mosh-pit vs. bedroom).
+        // Restrained sources (energy < 0.45) need energy matching more strictly — the whole
+        // point of a quiet song is that it's quiet. Danceability gives up weight to compensate.
+        let energyWeight = source.energy < 0.45 ? 0.25 : 0.15
         let energyDiff = abs(source.energy - target.energy)
         let energyScore = 1.0 - energyDiff
-        totalScore += energyScore * 0.15
+        totalScore += energyScore * energyWeight
         if !bothEstimated && energyDiff < 0.15 {
             let avgEnergy = (source.energy + target.energy) / 2
             if avgEnergy > 0.65 {
@@ -1907,10 +1914,12 @@ class RecommendationEngine: ObservableObject {
 
         // Danceability — introspective slow jam vs. built-to-move club track.
         // Discriminates within warm-valence genres (R&B, soul) where valence alone can't
-        // separate a slow jam from a club banger.
+        // separate a slow jam from a club banger. Weight reduced for restrained sources
+        // since energy already carries the primary discrimination signal there.
+        let danceWeight = source.energy < 0.45 ? 0.10 : 0.20
         let danceDiff = abs(source.danceability - target.danceability)
         let danceScore = 1.0 - danceDiff
-        totalScore += danceScore * 0.20
+        totalScore += danceScore * danceWeight
 
         // Cross-archetype penalty (a): measured high-energy songs with diverging danceability.
         // Soaring anthems (Purple Rain) and dance tracks (Beat It) share intensity but not shape.
@@ -1927,11 +1936,11 @@ class RecommendationEngine: ObservableObject {
         // When a recommended song has significantly more energy than the source, it's pulling
         // in a different emotional direction. e.g. HUMBLE. (aggressive, 0.66 energy) shouldn't
         // rank equally to cloud-rap (atmospheric, 0.59) when the source is mid-energy (0.50).
-        // Floor: skip when source.energy < 0.40. Very quiet sources (ambient, bedroom R&B,
-        // atmospheric darkwave) are outliers in their own genre — penalising every normal-energy
-        // track in that genre for being louder produces wrong results (After Dark 0.33 → all
-        // darkwave gets −0.10, killing genuinely similar matches).
-        if source.energy >= 0.40 {
+        // Floor: skip when source.energy < 0.30. Below 0.30 (ambient, drone, extreme darkwave)
+        // the source is an outlier even within its genre — penalising every normal-energy track
+        // produces false negatives. Sources in the 0.30–0.45 restrained zone (Tar Baby, After Dark)
+        // should still penalise overtly energetic candidates.
+        if source.energy >= 0.30 {
             let energyGap = target.energy - source.energy
             if energyGap > 0.14 {
                 let gapPenalty = min(0.10, (energyGap - 0.14) * 2.0)
