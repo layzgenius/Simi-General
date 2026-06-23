@@ -23,11 +23,11 @@ Current flow shows results at ~3–5s but re-sorts them 15–40s later as enrich
 
 ```
 0s   → Source song card appears (resolved from URL)
-0s   → 3–5 animated skeleton cards appear below it
+0s   → 4 animated skeleton cards appear below it
 1–3s → Candidates fetched (Last.fm, ListenBrainz, Spotify recs, vector search)
 3–6s → prefetchCandidateFeatures() runs:
-         - Supabase batch cache lookup for all candidates (fast, parallel)
-         - Last.fm tag estimation for cache misses (staggered 20ms apart)
+         - Supabase lookup via withTaskGroup (all candidates in parallel)
+         - Last.fm tag estimation for cache misses (staggered, see below)
          - buildMatchExplanation() runs per candidate (explanations pre-baked)
 6–8s → mergeAndScore() with enriched features → correct initial order
        Results reveal with stagger animation (~80ms between cards)
@@ -42,7 +42,8 @@ Current flow shows results at ~3–5s but re-sorts them 15–40s later as enrich
 
 - New `prefetchCandidateFeatures(candidates: [SimilarSong], sourceFeatures: AudioFeatures, genres: [Genre]) async -> [SimilarSong]`
   - Supabase lookup via `withTaskGroup` — all candidates in parallel, each a single indexed read. No new batch API needed; `lookupFeatures(title:artist:)` is already per-song.
-  - Last.fm tag estimation for misses (staggered 20ms per song, capped at index 15)
+  - Last.fm tag estimation for cache misses: stagger 20ms per song for indices 0–15 (max 300ms delay). Songs at index > 15 fire simultaneously after the 300ms cap — they don't wait longer, but do not get additional delay. This matches the existing enrichment cap logic and avoids burst-firing all tail songs at once while keeping total wait bounded.
+  - If `prefetchCandidateFeatures()` has not completed within **10 seconds**, reveal results with whatever features are available. This is the max-wait fallback: skeletons never persist past 10s regardless of upstream slowness. Any remaining enrichment continues in the same background path as before.
   - Calls `buildMatchExplanation()` per candidate once features are known
   - Returns candidates with `audioFeatures` and `matchExplanation` populated
 - `mergeAndScore()` receives pre-enriched candidates → scores are good on first pass
@@ -51,7 +52,7 @@ Current flow shows results at ~3–5s but re-sorts them 15–40s later as enrich
 
 **`ResultsView.swift`**
 
-- New `SkeletonCard` view: pulsing placeholder matching SongCard height/layout
+- New `SkeletonCard` view: pulsing placeholder matching SongCard height/layout **including FeedbackRow height** — skeleton must be the same height as a fully-rendered card to avoid height jumps when results replace skeletons during the reveal animation
 - While `engine.isLoading && engine.recommendations.isEmpty`: show source song card (if resolved) + 4 skeleton cards
 - When `engine.recommendations` becomes non-empty: animate cards in with stagger
   - Each card: `.opacity(0) → 1` + `.offset(y: 12) → 0` with 80ms delay per rank
@@ -66,6 +67,9 @@ Current flow shows results at ~3–5s but re-sorts them 15–40s later as enrich
 - Supabase cache, Railway keep-alive, DCLAP embedding pipeline
 - Quality filter (0.62 threshold) still applies after enrichment
 
+### Railway Background Enrichment — Silent Updates
+Railway enrichment runs after first render and can update `audioFeatures` and `matchExplanation` on top-5 songs. This means a user who expands a card at 7s, closes it, and re-expands at 15s may see improved emotional language the second time. This is correct and expected behavior — silent improvement, not a jarring change.
+
 ---
 
 ## Section 2: Emotional Language for Estimated Songs
@@ -78,12 +82,12 @@ Current flow shows results at ~3–5s but re-sorts them 15–40s later as enrich
 Loosen gates for valence and energy rows. Keep strict gates for rows that are genuinely unreliable when estimated.
 
 **Valence row (Emotional weight)**
-- Gate: `abs(srcValence - tgtValence) < 0.20` (threshold unchanged)
+- Gate: `abs(srcValence - tgtValence) < 0.20` (threshold unchanged, `isEstimated` check removed)
 - Measured: existing precise descriptors — "Same melancholic weight", "Same bittersweet edge", "Same balanced mood", "Same bright energy"
-- Estimated: softer descriptors — "Similar emotional feel", "Similar bittersweet range", "Similar balanced mood", "Similar warmth"
+- Estimated (either song has `isEstimated = true`): softer descriptors — "Similar emotional feel", "Similar bittersweet range", "Similar balanced mood", "Similar warmth"
 
 **Energy row (Intensity)**
-- Gate: `abs(source.energy - target.energy) < 0.20` (threshold unchanged)
+- Gate: `abs(source.energy - target.energy) < 0.20` (threshold unchanged, `isEstimated` check removed)
 - Measured: existing — "Equally restrained", "Equally measured", "Equally driven", "Equally intense"
 - Estimated: softer — "Roughly as restrained", "Roughly as measured", "Roughly as driven", "Roughly as intense"
 
@@ -91,17 +95,18 @@ Loosen gates for valence and energy rows. Keep strict gates for rows that are ge
 
 **Groove feel row** — unchanged, stays gated on non-nil `grooveRatio`. Nil for all estimated songs.
 
-**Sonic texture row** — unchanged, stays gated on `!source.isEstimated && !target.isEstimated`. `spectralWarmth` defaults to 0.5 for estimated songs; the delta check would always pass.
+**Sonic texture row** — unchanged, stays gated on `!source.isEstimated && !target.isEstimated`. `spectralWarmth` defaults to 0.5 for estimated songs; the delta check would always pass falsely.
 
 **Genre bridge** — already shows for all songs, no change.
 
 ### `AudioFeaturesGrid` Fallback
-Still shown when `matchExplanation` has zero rows AND no genre bridge. After this change this should be rare — only songs where even tag estimation failed.
+Still shown when `matchExplanation` has zero rows AND no genre bridge. After this change this is rare — only songs where tag estimation failed entirely (no Last.fm tags found and no Supabase cache entry).
 
 ### Implementation
 Single function `buildMatchExplanation()` in `RecommendationEngine.swift`:
-- Add `isSourceEstimated: Bool` and `isTargetEstimated: Bool` local vars
-- Switch descriptor string based on whether either song is estimated
+- Add `isEitherEstimated: Bool` local var — `true` when either source or target has `isEstimated = true`
+- Remove `isEstimated` guards from valence and energy rows
+- Switch descriptor string based on `isEitherEstimated`
 - No new files, no model changes
 
 ---
@@ -126,6 +131,19 @@ var feedbackState: FeedbackState? = nil
 
 Not persisted to Supabase. Lives in memory for the session only.
 
+### Struct Mutation — Important Implementation Note
+
+`SimilarSong` is a struct. Direct property mutation on a value inside a `@Published` array does not trigger SwiftUI re-render. The feedback action in `RecommendationEngine` must use index-based reassignment:
+
+```swift
+func setFeedback(songID: String, state: FeedbackState?) {
+    guard let idx = recommendations.firstIndex(where: { $0.id == songID }) else { return }
+    recommendations[idx].feedbackState = state
+}
+```
+
+`SongCard` calls `engine.setFeedback(songID:state:)` — it never mutates the song directly.
+
 ### UI
 
 **Placement:** A `FeedbackRow` below the platform links row on every `SongCard`. Always visible — not behind the expand tap.
@@ -133,7 +151,7 @@ Not persisted to Supabase. Lives in memory for the session only.
 **Appearance (neutral / no feedback):**
 Three small pill buttons in a row, left-aligned:
 - "Fits" — teal text, transparent background, 1px teal border
-- "Close" — amber text, transparent background, 1px amber border  
+- "Close" — amber text, transparent background, 1px amber border
 - "Miss" — muted text, transparent background, 1px muted border
 
 Compact: font `.simiMicro`, padding 6×12, gap 8pt between pills.
@@ -142,11 +160,11 @@ Compact: font `.simiMicro`, padding 6×12, gap 8pt between pills.
 - `fits`: "Fits ✓" pill fills teal, card gets a 2px left-border accent in teal
 - `close`: "Close ~" pill fills amber, card unchanged otherwise
 - `miss`: "Miss ✗" pill fills rose, card body drops to 50% opacity
-- Tapping active state toggles back to neutral
+- Tapping active state calls `setFeedback(songID:state: nil)` to return to neutral
 
 **Behavior:**
-- Tapping a pill sets `feedbackState` on the song in `engine.recommendations`
-- This triggers SwiftUI re-render via `@Published var recommendations`
+- Tapping a pill calls `engine.setFeedback(songID: song.id, state: newState)`
+- `recommendations[idx]` is reassigned → `@Published` fires → SwiftUI re-renders
 - No re-sort under any condition
 - `miss` songs dim in place; they don't move
 
@@ -168,10 +186,10 @@ These are explicitly deferred to a future phase, after validating that users act
 
 | File | Change |
 |------|--------|
-| `Simi/Services/RecommendationEngine.swift` | Add `prefetchCandidateFeatures()`, loosen `buildMatchExplanation()` gates, remove sort from enrichment stage |
+| `Simi/Services/RecommendationEngine.swift` | Add `prefetchCandidateFeatures()`, `setFeedback()`, loosen `buildMatchExplanation()` gates, remove sort from enrichment stage |
 | `Simi/Models/Song.swift` | Add `FeedbackState` enum + `feedbackState` property to `SimilarSong` |
 | `Simi/Views/SongCard.swift` | Add `FeedbackRow` subview, teal left-border accent, miss opacity |
-| `Simi/Views/ResultsView.swift` | Add `SkeletonCard` view, stagger animation on reveal |
+| `Simi/Views/ResultsView.swift` | Add `SkeletonCard` view (FeedbackRow-height-aware), stagger animation on reveal |
 | `Simi/Views/HomeView.swift` | Show source song card as soon as resolved |
 | `Simi/Views/MatchExplanationView.swift` | No changes needed — already handles any `MatchExplanation` |
 
@@ -181,6 +199,6 @@ These are explicitly deferred to a future phase, after validating that users act
 
 1. No visible re-sort after first render under any condition
 2. Something appears on screen within 1s of starting a search (source card or skeletons)
-3. Results reveal fully-scored at ~6–8s
-4. Every expanded card shows emotional language rows, not raw percentages (except songs with zero features)
-5. Feedback pills are tappable and visually respond; miss songs dim; no re-sort occurs
+3. Results reveal fully-scored at ~6–8s; skeletons never persist past 10s (fallback reveals best-effort results)
+4. Most expanded cards show emotional language rows rather than raw percentages — `AudioFeaturesGrid` only appears when tag estimation failed entirely and no genre bridge exists
+5. Feedback pills are tappable and visually respond; miss songs dim in place; no re-sort occurs under any feedback state
