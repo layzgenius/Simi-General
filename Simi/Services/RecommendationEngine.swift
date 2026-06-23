@@ -57,6 +57,9 @@ class RecommendationEngine: ObservableObject {
     private let previewAnalyzer      = PreviewAudioAnalyzer.shared
     let history                     = SearchHistoryManager()
 
+    // Tracks the active search so a new search can cancel it before Railway gets re-hit.
+    var activeSearchTask: Task<Void, Never>?
+
     // Stored so background enrichment can re-score recommendations
     private var lastSourceFeatures: AudioFeatures?
     private var lastSeedFeatures: [AudioFeatures] = []   // Individual seed features for multi-seed scoring
@@ -1177,15 +1180,8 @@ class RecommendationEngine: ObservableObject {
 
         simiLog("🎵 Starting tag-feature enrichment for \(snapshot.count) songs...")
 
-        // Fill preview URLs first — batch needs them for librosa analysis.
+        // Fill preview URLs so the audio player can play songs.
         await fillMissingPreviewURLs()
-
-        // Batch and tag estimation run concurrently:
-        // wall time = max(batch_time, slowest_tag_task).
-        let librosaURLs = recommendations.prefix(6).compactMap { $0.previewURL }
-        let batchTask = Task<[String: AudioFeatures], Never> {
-            await self.simiAudioService.batchAnalyze(urls: librosaURLs)
-        }
 
         var tagUpdates: [(index: Int, features: AudioFeatures)] = []
 
@@ -1291,46 +1287,82 @@ class RecommendationEngine: ObservableObject {
 
         simiLog("✅ Tag enrichment done: \(enrichedCount)/\(snapshot.count) songs got features")
 
-        // ── STAGE 2: librosa overlay — top 6 get measured features, UI re-sorts ──
-        // Awaiting here does NOT block the Stage 1 render; SwiftUI already committed
-        // that update. This await only blocks this background task.
-        let batchFeatures = await batchTask.value
-        let batchNilCount = librosaURLs.count - batchFeatures.count
-        if !librosaURLs.isEmpty && batchFeatures.isEmpty {
-            simiLog("⚠️ Batch librosa: 0/\(librosaURLs.count) — Railway may be cold, using tag estimates for all")
-        } else if batchNilCount > 0 {
-            simiLog("🎵 Batch librosa: \(batchFeatures.count)/\(librosaURLs.count) succeeded (\(batchNilCount) nil)")
-        } else if !batchFeatures.isEmpty {
-            simiLog("🎵 Batch librosa: \(batchFeatures.count)/\(librosaURLs.count) succeeded")
+        // ── STAGE 2: librosa enrichment for top candidates ──
+        // Check cancellation first — a new search may have fired during Stage 1.
+        guard !Task.isCancelled else {
+            simiLog("⚠️ Librosa enrichment cancelled before Stage 2 — new search started")
+            return
         }
 
-        var librosaUpdated = false
-        for i in recommendations.indices {
-            guard let previewURL = recommendations[i].previewURL,
-                  let pyFeatures = batchFeatures[previewURL] else { continue }
-            let songTitle  = recommendations[i].title
-            let songArtist = recommendations[i].artist
-            let songId     = recommendations[i].id
-            simiLog("🎵 Librosa enriched \"\(songTitle)\": energy=\(String(format: "%.2f", pyFeatures.energy)) valence=\(String(format: "%.2f", pyFeatures.valence)) mode=\(pyFeatures.mode == 1 ? "major" : "minor")")
-            Task { await self.supabase.storeFeatures(title: songTitle, artist: songArtist, features: pyFeatures, source: "librosa") }
-            Task { await self.supabase.storeVector(spotifyID: songId, title: songTitle, artist: songArtist, features: pyFeatures) }
-            let (score, reasons) = seedFeatures.count > 1
-                ? computeSimilarityMultiSeed(seeds: seedFeatures, target: pyFeatures, genres: genres)
-                : computeSimilarity(source: sourceFeatures, target: pyFeatures, genres: genres)
-            recommendations[i].audioFeatures   = pyFeatures
-            recommendations[i].similarityScore = score
-            recommendations[i].matchReasons    = reasons
-            let explanationSource = seedFeatures.count > 1 ? centroid(of: seedFeatures) : sourceFeatures
-            recommendations[i].matchExplanation = buildMatchExplanation(
-                source: explanationSource,
-                target: pyFeatures,
-                sourceGenres: genres,
-                targetGenre: recommendations[i].genre
-            )
-            librosaUpdated = true
+        let librosaTargets = recommendations
+            .prefix(5)
+            .enumerated()
+            .compactMap { (i, song) -> (index: Int, url: String)? in
+                guard let url = song.previewURL,
+                      song.audioFeatures?.isEstimated != false else { return nil }
+                return (index: i, url: url)
+            }
+
+        guard !librosaTargets.isEmpty else {
+            simiLog("🎵 No librosa candidates (all measured or no preview URLs)")
+            return
         }
-        if librosaUpdated {
+
+        simiLog("🎵 Starting librosa enrichment for \(librosaTargets.count) candidates (max 2 concurrent)...")
+
+        // Chunk into pairs to keep Railway at ≤2 concurrent requests.
+        // Python GIL serializes librosa; >2 concurrent causes queue buildup and timeouts.
+        let chunks = stride(from: 0, to: librosaTargets.count, by: 2).map {
+            Array(librosaTargets[$0..<min($0 + 2, librosaTargets.count)])
+        }
+
+        var librosaSucceeded = 0
+        for chunk in chunks {
+            guard !Task.isCancelled else {
+                simiLog("⚠️ Librosa enrichment cancelled mid-run — new search started")
+                return
+            }
+
+            let batchResults: [(Int, AudioFeatures?)] = await withTaskGroup(of: (Int, AudioFeatures?).self) { group in
+                for (idx, url) in chunk {
+                    group.addTask {
+                        guard !Task.isCancelled else { return (idx, nil) }
+                        let features = await self.simiAudioService.analyzePreview(url: url)
+                        return (idx, features)
+                    }
+                }
+                var results: [(Int, AudioFeatures?)] = []
+                for await result in group { results.append(result) }
+                return results
+            }
+
+            for (idx, features) in batchResults {
+                guard let features, idx < recommendations.count else { continue }
+                let song = recommendations[idx]
+                let (score, reasons) = seedFeatures.count > 1
+                    ? computeSimilarityMultiSeed(seeds: seedFeatures, target: features, genres: genres)
+                    : computeSimilarity(source: sourceFeatures, target: features, genres: genres)
+                recommendations[idx].audioFeatures   = features
+                recommendations[idx].similarityScore = score
+                recommendations[idx].matchReasons    = reasons
+                let explanationSource = seedFeatures.count > 1 ? centroid(of: seedFeatures) : sourceFeatures
+                recommendations[idx].matchExplanation = buildMatchExplanation(
+                    source: explanationSource,
+                    target: features,
+                    sourceGenres: genres,
+                    targetGenre: recommendations[idx].genre
+                )
+                // Write to Supabase so the next time this song appears it's a cache hit — no Railway call.
+                Task { await self.supabase.storeFeatures(title: song.title, artist: song.artist, features: features, source: "librosa") }
+                librosaSucceeded += 1
+            }
+        }
+
+        if librosaSucceeded > 0 {
+            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded")
             recommendations.sort { $0.similarityScore > $1.similarityScore }
+        } else {
+            simiLog("⚠️ Librosa Stage 2: 0/\(librosaTargets.count) — Railway may be cold or busy")
         }
     }
 
@@ -1624,10 +1656,10 @@ class RecommendationEngine: ObservableObject {
             let srcValenceForLabel = source.valenceEssentia ?? source.valence
             if srcValenceForLabel < 0.42 {
                 reasons.append(.darkMood)       // Genuinely dark: metal, emo, sad rap
-            } else if srcValenceForLabel > 0.72 {
-                reasons.append(.upbeatMood)     // Genuinely bright: pop, dance, k-pop
+            } else if srcValenceForLabel > 0.72 && source.energy > 0.50 {
+                reasons.append(.upbeatMood)     // Genuinely bright AND energetic: pop, dance, k-pop
             } else {
-                reasons.append(.mood)           // Neutral: "Similar Mood" — honest
+                reasons.append(.mood)           // Warm, mellow, or mid-range: "Same Mood"
             }
         }
 
@@ -1641,12 +1673,15 @@ class RecommendationEngine: ObservableObject {
         if !bothEstimated && valenceDiff < 0.15 {
             // Emotionally specific: name the actual mood shared, not just "Same Mood"
             let avgValence = (srcValence + tgtValence) / 2
+            let avgEnergy  = (source.energy + target.energy) / 2
             if avgValence < 0.40 {
                 reasons.append(.darkMood)      // Both dark/heavy — defiant, bleak, raw
-            } else if avgValence > 0.65 {
-                reasons.append(.upbeatMood)    // Both bright/joyful
+            } else if avgValence > 0.72 && avgEnergy > 0.50 {
+                // "Upbeat" requires both brightness AND energy — bedroom R&B can be
+                // emotionally positive but sonically laid-back; that's "Same Mood", not "Upbeat".
+                reasons.append(.upbeatMood)    // Both bright AND energetic
             } else {
-                reasons.append(.mood)          // Mid-range emotional match
+                reasons.append(.mood)          // Warm, mellow, or mid-range emotional match
             }
         }
 
@@ -1703,16 +1738,20 @@ class RecommendationEngine: ObservableObject {
         if danceDiff > 0.12 && source.danceability < 0.60 && target.danceability > 0.65 {
             totalScore = max(0, totalScore - 0.06)
         }
-        // Cross-archetype penalty (c): upward energy gap.
+        // Cross-archetype penalty: upward energy gap.
         // When a recommended song has significantly more energy than the source, it's pulling
         // in a different emotional direction. e.g. HUMBLE. (aggressive, 0.66 energy) shouldn't
         // rank equally to cloud-rap (atmospheric, 0.59) when the source is mid-energy (0.50).
-        // Threshold 0.14 = just under one energy bucket width — avoids penalising natural variance.
-        // Multiplier 2.0 → a gap of 0.165 gives penalty ~0.05; cap at 0.10 (one full energy bucket).
-        let energyGap = target.energy - source.energy
-        if energyGap > 0.14 {
-            let gapPenalty = min(0.10, (energyGap - 0.14) * 2.0)
-            totalScore = max(0, totalScore - gapPenalty)
+        // Floor: skip when source.energy < 0.40. Very quiet sources (ambient, bedroom R&B,
+        // atmospheric darkwave) are outliers in their own genre — penalising every normal-energy
+        // track in that genre for being louder produces wrong results (After Dark 0.33 → all
+        // darkwave gets −0.10, killing genuinely similar matches).
+        if source.energy >= 0.40 {
+            let energyGap = target.energy - source.energy
+            if energyGap > 0.14 {
+                let gapPenalty = min(0.10, (energyGap - 0.14) * 2.0)
+                totalScore = max(0, totalScore - gapPenalty)
+            }
         }
 
         // BPM — disabled: arousal + danceability already capture tempo feel. Keeping the
@@ -1770,15 +1809,31 @@ class RecommendationEngine: ObservableObject {
         // Calibration: HF noise floor in trap gives falsely high spectral flatness.
         totalScore += (1.0 - abs(source.reverbSpace - target.reverbSpace)) * 0.00
 
+        // Normalize by used weight. When MFCC, arousal, or chroma entropy are
+        // unavailable (0.20 combined), raw scores are capped at ~0.80 even for a
+        // perfect match. Dividing by the weight actually earned restores the full
+        // 0–1 scale so songs that feel similar score like it.
+        let missedWeight = (source.arousal == nil || target.arousal == nil ? 0.10 : 0.0)
+                         + (source.mfccMean == nil || target.mfccMean == nil ? 0.08 : 0.0)
+                         + (source.chromaEntropy == nil || target.chromaEntropy == nil ? 0.02 : 0.0)
+        let usedWeight = 1.0 - missedWeight
+        if usedWeight > 0 && usedWeight < 1.0 {
+            totalScore = min(1.0, totalScore / usedWeight)
+        }
+
         // Confidence adjustment: tag-estimated features cluster near genre centroids,
         // so raw diff scores overstate precision (e.g. "trap" vs "trap" → 0.87 from
         // identical centroid values). Compress toward 0.65 proportional to how much
         // estimation was involved — preserves relative ordering, kills false perfects.
+        // When the SOURCE is measured (false, true), there's genuine signal in the
+        // comparison to the centroid — don't compress it; the normalization above already
+        // accounts for incomplete target data.
         let adjustedScore: Double
         switch (source.isEstimated, target.isEstimated) {
-        case (true, true):              adjustedScore = 0.65 + (totalScore - 0.65) * 0.50
-        case (true, false), (false, true): adjustedScore = 0.65 + (totalScore - 0.65) * 0.75
-        case (false, false):            adjustedScore = totalScore
+        case (true, true):   adjustedScore = 0.65 + (totalScore - 0.65) * 0.50
+        case (true, false):  adjustedScore = 0.65 + (totalScore - 0.65) * 0.75
+        case (false, true):  adjustedScore = totalScore   // real source vs centroid — trust the score
+        case (false, false): adjustedScore = totalScore
         }
 
         // For estimated features the first two slots are energy + mood — far more useful
@@ -2426,6 +2481,18 @@ class RecommendationEngine: ObservableObject {
         lastSourceFeatures = nil
         lastSeedFeatures = []
         lastGenres = []
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Feedback
+    // ──────────────────────────────────────────────
+
+    /// Updates the feedback state for a single recommendation.
+    /// Uses index-based reassignment because SimilarSong is a struct — direct property
+    /// mutation on an array element would create a copy and leave @Published unchanged.
+    func setFeedback(songID: String, state: FeedbackState?) {
+        guard let idx = recommendations.firstIndex(where: { $0.id == songID }) else { return }
+        recommendations[idx].feedbackState = state
     }
 }
 

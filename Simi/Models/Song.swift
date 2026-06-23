@@ -173,9 +173,14 @@ struct AudioFeatures: Codable, Sendable {
 
     // Human-readable helpers
 
-    /// Returns the stored BPM directly. RecommendationEngine.normalizeBPM() already applies
-    /// genre-aware half-time correction before storing, so display-time re-doubling is wrong.
-    var normalizedBPM: Double { bpm }
+    /// Returns the BPM for display and vibeSummary. Applies a display-time half-time
+    /// correction when librosa has detected double-time on a low-energy track — e.g. a
+    /// ~72 BPM bedroom R&B song reads as 143 because librosa locked onto the subdivisions.
+    /// Only fires for measured features (not estimated) with energy < 0.50 in the 130–155 range.
+    var normalizedBPM: Double {
+        if !isEstimated && energy < 0.50 && bpm > 130 && bpm <= 155 { return bpm / 2 }
+        return bpm
+    }
 
     var bpmFormatted: String { normalizedBPM > 0 ? "\(Int(normalizedBPM)) BPM" : "BPM unknown" }
     var keyName: String {
@@ -254,6 +259,11 @@ struct AudioFeatures: Codable, Sendable {
     }
 }
 
+// MARK: - FeedbackState
+enum FeedbackState: String, Codable {
+    case fits, close, miss
+}
+
 // MARK: - Genre
 // Genre + sub-genre pair — sourced from Last.fm tags or Spotify artist data
 struct Genre: Identifiable, Codable, Hashable {
@@ -283,6 +293,10 @@ struct SimilarSong: Identifiable, Codable {
 
     // Human-readable match explanation with specific dimensions
     var matchExplanation: MatchExplanation? = nil
+
+    // Feedback state — session-only, not persisted to Supabase.
+    // Set via engine.setFeedback(songID:state:) — never mutate directly (struct value copy).
+    var feedbackState: FeedbackState? = nil
 
     // Human-readable match label — emotional at high scores, numeric otherwise.
     // "Matching…" shows while enrichment is in flight (audioFeatures still nil).
