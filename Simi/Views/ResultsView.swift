@@ -48,6 +48,9 @@ struct ResultsView: View {
     @State private var exportShareItems: [Any] = []
     @State private var showExportSheet   = false
 
+    // Stagger reveal animation
+    @State private var cardAppeared: [Bool] = []
+
     // True only when Spotify's audio-features endpoint provided a real musical key.
     // Tag estimation and audio preview analysis never detect pitch — they always fall back
     // to key=0/mode=1 (C Major) as a placeholder. isKeyEstimated=false means Spotify measured it.
@@ -230,10 +233,23 @@ struct ResultsView: View {
             }
         }
         .onAppear { resetSliders(); filterSameKey = false }
-        .onChange(of: engine.recommendations.count) { _, _ in
+        .onChange(of: engine.recommendations.count) { _, count in
             if breadthBucket == 2 {
                 surpriseOrder = engine.recommendations.map { $0.id }.shuffled()
             }
+            guard count > 0, cardAppeared.isEmpty else { return }
+            cardAppeared = Array(repeating: false, count: count)
+            for i in 0..<count {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.08) {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        guard i < cardAppeared.count else { return }
+                        cardAppeared[i] = true
+                    }
+                }
+            }
+        }
+        .onChange(of: engine.isLoading) { _, loading in
+            if loading { cardAppeared = [] }
         }
         .navigationBarBackButtonHidden(true)
         .toolbar {
@@ -692,7 +708,16 @@ struct ResultsView: View {
 
     @ViewBuilder
     func listContent(proxy: ScrollViewProxy) -> some View {
-        if displayedRecommendations.isEmpty && breadthBucket == 0 {
+        if engine.isLoading && engine.recommendations.isEmpty {
+            // Skeleton cards while prefetchCandidateFeatures() runs
+            VStack(spacing: 12) {
+                ForEach(0..<4, id: \.self) { _ in
+                    SkeletonCard()
+                        .padding(.horizontal, 20)
+                }
+            }
+            .padding(.bottom, 24)
+        } else if displayedRecommendations.isEmpty && breadthBucket == 0 {
             closeMatchEmptyState
         } else if displayedRecommendations.isEmpty && breadthBucket == 2 {
             surpriseMeEmptyState
@@ -703,11 +728,13 @@ struct ResultsView: View {
                 Group { crossGenreBanner }
                     .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: crossGenreCount >= 2)
                 ForEach(Array(displayedRecommendations.enumerated()), id: \.element.id) { index, song in
+                    let appeared = cardAppeared.indices.contains(index) && cardAppeared[index]
                     SongCard(song: song, rank: index + 1, sourceSong: engine.sourceSong)
                         .id(song.id)
                         .padding(.horizontal, 20)
+                        .opacity(appeared ? 1 : 0)
+                        .offset(y: appeared ? 0 : 12)
                         .overlay(
-                            // Highlight ring when jumped to from the graph
                             RoundedRectangle(cornerRadius: 16)
                                 .stroke(Color.simiAccent, lineWidth: 2)
                                 .padding(.horizontal, 20)
@@ -774,6 +801,86 @@ struct ResultsView: View {
         .foregroundColor(.simiSubtext.opacity(0.65))
         .frame(maxWidth: .infinity)
         .accessibilityLabel("Music discovery powered by Last.fm, analysis by Simi")
+    }
+}
+
+// ──────────────────────────────────────────────
+// MARK: - SkeletonCard
+// Pulsing placeholder shown while candidates are being fetched + enriched.
+// Height mirrors SongCard: main row + platform row + FeedbackRow + chip row.
+// ──────────────────────────────────────────────
+
+struct SkeletonCard: View {
+    @State private var pulse = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+
+            // Main row — rank + art + title lines + score bar
+            HStack(spacing: 12) {
+                RoundedRectangle(cornerRadius: 4)
+                    .frame(width: 20, height: 12)
+                RoundedRectangle(cornerRadius: 10)
+                    .frame(width: 56, height: 56)
+                VStack(alignment: .leading, spacing: 6) {
+                    RoundedRectangle(cornerRadius: 4)
+                        .frame(height: 14)
+                    RoundedRectangle(cornerRadius: 4)
+                        .frame(width: 100, height: 11)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 6) {
+                    RoundedRectangle(cornerRadius: 4).frame(width: 48, height: 12)
+                    RoundedRectangle(cornerRadius: 2).frame(width: 44, height: 4)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            .padding(.bottom, 4)
+
+            // Platform links row — 4 icon placeholders
+            HStack(spacing: 0) {
+                Spacer().frame(width: 68)
+                ForEach(0..<4, id: \.self) { _ in
+                    RoundedRectangle(cornerRadius: 6)
+                        .frame(width: 24, height: 24)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 4)
+
+            // FeedbackRow skeleton — 3 pill placeholders (must match FeedbackRow height)
+            HStack(spacing: 8) {
+                ForEach(0..<3, id: \.self) { _ in
+                    Capsule().frame(width: 52, height: 28)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+
+            // Match chip placeholder
+            HStack(spacing: 6) {
+                Capsule().frame(width: 80, height: 22)
+                Capsule().frame(width: 64, height: 22)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 12)
+        }
+        .foregroundColor(Color.simiSurface)
+        .background(Color.simiCard)
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.simiBorder, lineWidth: 1))
+        .opacity(pulse ? 0.55 : 0.30)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
     }
 }
 
