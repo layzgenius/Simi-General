@@ -34,7 +34,7 @@ struct SimiApp: App {
     var body: some Scene {
         WindowGroup {
             ZStack {
-                HomeView()
+                HomeView(shouldFocusURL: $shouldFocusURLField)
                     .environmentObject(engine)
                     .preferredColorScheme(.dark)
                     .onChange(of: scenePhase) { _, phase in

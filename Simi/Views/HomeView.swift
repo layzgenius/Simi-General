@@ -6,6 +6,7 @@
 // Below the search field: recent search history with re-run buttons.
 
 import SwiftUI
+import Combine
 
 // ──────────────────────────────────────────────
 // MARK: - Search Mode
@@ -41,7 +42,25 @@ struct HomeView: View {
     @State private var navigateToResults = false
     @State private var showClearConfirm  = false
 
+    // Focus + cycling placeholder state
+    @FocusState private var urlFieldFocused: Bool
+    @State private var placeholderIndex = 0
+    private let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+
+    // Binding from SimiApp — set to true after onboarding dismissal to auto-focus URL field
+    var shouldFocusURL: Binding<Bool>
+
     private let maxSeeds = 5
+
+    // Cycling placeholder text for the URL input field
+    private var urlPlaceholder: String {
+        let options = [
+            "Paste a Spotify, Apple Music, or YouTube link…",
+            "Try: open.spotify.com/track/…",
+            "Any song link works — we'll handle the rest"
+        ]
+        return options[placeholderIndex % options.count]
+    }
 
     var body: some View {
         NavigationStack {
@@ -54,6 +73,9 @@ struct HomeView: View {
                         logoSection
 
                         modePicker
+
+                        chipsRow
+                            .padding(.horizontal, 24)
 
                         Group {
                             if searchMode == .url {
@@ -91,6 +113,22 @@ struct HomeView: View {
                 if song != nil {
                     navigateToResults = true
                 }
+            }
+            // Auto-focus URL field after onboarding dismissal
+            .onChange(of: shouldFocusURL.wrappedValue) { _, newValue in
+                if newValue {
+                    urlFieldFocused = true
+                    shouldFocusURL.wrappedValue = false
+                }
+            }
+            // Cycle placeholder text every 3s when URL field is empty and unfocused
+            .onReceive(timer) { _ in
+                guard pastedURLs[0].isEmpty && !urlFieldFocused else { return }
+                placeholderIndex = (placeholderIndex + 1) % 3
+            }
+            // Reset placeholder index when URL field is cleared
+            .onChange(of: pastedURLs[0]) { _, newValue in
+                if newValue.isEmpty { placeholderIndex = 0 }
             }
             .navigationDestination(isPresented: $navigateToResults) {
                 ResultsView()
@@ -154,6 +192,64 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .padding(.horizontal, 24)
         .accessibilityLabel("Search mode selector")
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Example Song Chips
+    // ──────────────────────────────────────────────
+
+    private var chipsRow: some View {
+        let songs: [(label: String, url: String, title: String, artist: String)] = [
+            ("Creep — Radiohead",
+             "https://open.spotify.com/track/70LcF31zb1H0PyJoS1Sx1r",
+             "Creep", "Radiohead"),
+            ("Blinding Lights — The Weeknd",
+             "https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b",
+             "Blinding Lights", "The Weeknd"),
+            ("Clair de Lune — Debussy",
+             "https://open.spotify.com/track/3dkGuBqchfMzRxNM2mVmNm",
+             "Clair de Lune", "Debussy"),
+            ("Redbone — Childish Gambino",
+             "https://open.spotify.com/track/0wXuerDYiBnERgIpbb3JBR",
+             "Redbone", "Childish Gambino"),
+            ("Let It Happen — Tame Impala",
+             "https://open.spotify.com/track/2X485T9Z5Ly0xyaghN73ed",
+             "Let It Happen", "Tame Impala")
+        ]
+
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Try one of these →")
+                .font(.simiMicro)
+                .foregroundColor(.simiSubtext)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(songs, id: \.label) { song in
+                        Button(action: {
+                            if searchMode == .url {
+                                pastedURLs[0] = song.url
+                                startSearch()
+                            } else {
+                                seeds[0].title = song.title
+                                seeds[0].artist = song.artist
+                            }
+                        }) {
+                            Text(song.label)
+                                .font(.simiMicro)
+                                .foregroundColor(.simiAccent)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .overlay(
+                                    Capsule()
+                                        .stroke(Color.simiAccent, lineWidth: 1)
+                                )
+                        }
+                        .accessibilityLabel("Try \(song.label)")
+                        .disabled(engine.isLoading)
+                    }
+                }
+            }
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -252,7 +348,7 @@ struct HomeView: View {
             TextField("", text: Binding(
                 get: { pastedURLs[index] },
                 set: { pastedURLs[index] = $0 }
-            ), prompt: Text("open.spotify.com/track/...")
+            ), prompt: Text(index == 0 ? urlPlaceholder : "open.spotify.com/track/…")
                 .foregroundColor(.simiSubtext.opacity(0.5)))
                 .font(Font.system(size: 14, design: .monospaced))
                 .foregroundColor(.simiText)
@@ -260,6 +356,7 @@ struct HomeView: View {
                 .autocorrectionDisabled()
                 .submitLabel(.search)
                 .onSubmit { startSearch() }
+                .focused($urlFieldFocused)
                 .accessibilityLabel(pastedURLs.count > 1 ? "Song link \(index + 1)" : "Song link")
 
             if pastedURLs[index].isEmpty {
@@ -411,7 +508,7 @@ struct HomeView: View {
                 TextField("", text: Binding(
                     get: { seeds[index].title },
                     set: { seeds[index].title = $0 }
-                ), prompt: Text("Song title")
+                ), prompt: Text("e.g. Clair de Lune")
                     .foregroundColor(.simiSubtext.opacity(0.5)))
                     .font(.simiHeadline)
                     .foregroundColor(.simiText)
@@ -465,7 +562,7 @@ struct HomeView: View {
                 TextField("", text: Binding(
                     get: { seeds[index].artist },
                     set: { seeds[index].artist = $0 }
-                ), prompt: Text("Artist (optional)")
+                ), prompt: Text("e.g. Debussy")
                     .foregroundColor(.simiSubtext.opacity(0.5)))
                     .font(.simiHeadline)
                     .foregroundColor(.simiText)
@@ -823,6 +920,7 @@ struct HistoryRow: View {
 }
 
 #Preview {
-    HomeView()
+    HomeView(shouldFocusURL: .constant(false))
         .environmentObject(RecommendationEngine())
+        .preferredColorScheme(.dark)
 }
