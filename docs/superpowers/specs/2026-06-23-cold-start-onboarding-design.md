@@ -39,11 +39,11 @@ These are complementary, not redundant: the walkthrough provides the *why*, the 
 
 ### Structure
 - Full-screen `Color.simiBackground.ignoresSafeArea()` background — matches app dark theme
-- `TabView(selection:)` with `.tabViewStyle(.page(indexDisplayMode: .always))` — native swipe, page dots
+- `TabView(selection: $selectedPage)` with `@State private var selectedPage = 0` — native swipe, page dots
+- `.tabViewStyle(.page(indexDisplayMode: selectedPage == 2 ? .never : .always))` — page dots visible on Cards 1–2, hidden on Card 3 where the CTA button replaces them
 - 3 `OnboardingCard` views inside the TabView
 - "Skip" button: top-right, `.simiSubtext` color, calls `onDismiss()` on any card
-- Page dots visible on Cards 1–2; hidden on Card 3 (replaced by CTA button)
-- "Start Discovering →" button on Card 3 only: filled teal, calls `onDismiss()`
+- "Start Discovering →" button on Card 3 only (`selectedPage == 2`): filled teal, calls `onDismiss()`
 - Entrance animation: `.transition(.opacity)` with `withAnimation(.easeInOut(duration: 0.3))` on the ZStack overlay
 - `accessibilityReduceMotion` respected — animation skipped when enabled
 
@@ -61,7 +61,7 @@ Each card is a `VStack(spacing: 24)` centered vertically:
 - Subtext: "Not a genre. Not an algorithm. A feeling. Simi finds songs that share the same emotional weight as the one you love."
 
 **Card 2 — How it works**
-- Visual: Static mockup of the URL input field with a Spotify link pasted in — a `RoundedRectangle` card showing `"open.spotify.com/track/…"` in `.simiSubtext`, matching the real input's styling
+- Visual: Static, non-interactive mockup of the URL input field — a decorative `RoundedRectangle` (not a `TextField`) showing `"open.spotify.com/track/…"` in `.simiSubtext`, styled to match the real input. Must not be tappable or focusable.
 - Headline: "Paste a song. That's it."
 - Subtext: "Drop any Spotify, Apple Music, or YouTube link. Simi analyzes the emotional fingerprint — energy, mood, texture — and finds its musical kin across every genre."
 
@@ -72,6 +72,16 @@ Each card is a `VStack(spacing: 24)` centered vertically:
 
 ### Dismissal
 `onDismiss()` is called by both Skip and the Card 3 CTA. In `SimiApp`, this sets `hasSeenOnboarding = true`, which removes the ZStack overlay. The `OnboardingView` is never shown again.
+
+After the overlay fades out, `HomeView` auto-focuses the URL input field (first responder) so the cursor is ready and the next step is obvious. Implemented via `@FocusState` on the URL `TextField` — set to focused inside the `onDismiss` closure after a short delay to let the fade animation complete:
+```swift
+// In SimiApp onDismiss closure:
+hasSeenOnboarding = true
+DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+    urlFieldFocused = true
+}
+```
+`urlFieldFocused` is a `@FocusState` bool passed down into `HomeView` or managed via `@AppStorage`-driven binding. Implementation may use an environment value or a published property on the engine — implementer's choice, but the behavior (auto-focus after fade) is required.
 
 ---
 
@@ -93,11 +103,12 @@ Each card is a `VStack(spacing: 24)` centered vertically:
 | Blinding Lights — The Weeknd | `https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b` | "Blinding Lights" / "The Weeknd" |
 | Clair de Lune — Debussy | `https://open.spotify.com/track/3dkGuBqchfMzRxNM2mVmNm` | "Clair de Lune" / "Debussy" |
 | Redbone — Childish Gambino | `https://open.spotify.com/track/0wXuerDYiBnERgIpbb3JBR` | "Redbone" / "Childish Gambino" |
-| Motion Picture Soundtrack — Radiohead | `https://open.spotify.com/track/1yrwQoPuqxONQ7E5hFEDml` | "Motion Picture Soundtrack" / "Radiohead" |
+| Let It Happen — Tame Impala | `https://open.spotify.com/track/2X485T9Z5Ly0xyaghN73ed` | "Let It Happen" / "Tame Impala" |
 
 **Chip tap behavior:**
 - URL mode: fills `pastedURLs[0]` with the Spotify URL and immediately calls `startSearch()` (same as tapping Find)
 - Text mode: fills `seeds[0].title` and `seeds[0].artist`, focuses the title field — does NOT auto-trigger search, letting the user confirm first
+- Chips are `.disabled(engine.isLoading)` during an active search — tapping mid-search has no effect
 
 **Chip appearance:** `.simiMicro` font, `.simiAccent` teal text, 1pt teal border, transparent background, padding `6×12`, `Capsule` shape — matches `FeedbackRow` pill style for visual consistency.
 
@@ -113,7 +124,14 @@ Each card is a `VStack(spacing: 24)` centered vertically:
 - Pauses (stays on current string) when the field is focused or non-empty
 - Resets to index 0 when the field is cleared
 
-**Implementation:** `@State private var placeholderIndex = 0` + a `Timer.publish(every: 3, on: .main, in: .common)` attached with `.onReceive`. The timer publisher is only active when `pastedURLs[0].isEmpty && !urlFieldFocused`.
+**Implementation:** `@State private var placeholderIndex = 0` + `Timer.publish(every: 3, on: .main, in: .common).autoconnect()` always running, with a guard inside `.onReceive` that skips incrementing when the field is focused or non-empty:
+```swift
+.onReceive(timer) { _ in
+    guard pastedURLs[0].isEmpty && !urlFieldFocused else { return }
+    placeholderIndex = (placeholderIndex + 1) % 3
+}
+```
+Do NOT conditionally connect/disconnect the publisher — always receive, conditionally increment.
 
 **Text mode fields:** Static placeholders only:
 - Title field: `"e.g. Clair de Lune"`
@@ -130,3 +148,4 @@ Each card is a `VStack(spacing: 24)` centered vertically:
 5. Cycling placeholder cycles on a 3-second timer, pauses when focused or non-empty, resets on clear
 6. `accessibilityReduceMotion` suppresses the overlay entrance animation
 7. No visual regression on `HomeView` for returning users (walkthrough gone, chips still present)
+8. Example chips are non-interactive (`.disabled`) while `engine.isLoading == true`
