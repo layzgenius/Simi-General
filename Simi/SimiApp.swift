@@ -15,6 +15,13 @@ struct SimiApp: App {
     @StateObject private var engine = RecommendationEngine()
     @Environment(\.scenePhase) private var scenePhase
 
+    /// Persisted across launches — false until the user completes or skips onboarding.
+    @AppStorage("hasSeenOnboarding") private var hasSeenOnboarding = false
+
+    /// Set to true when the user dismisses onboarding so HomeView can auto-focus
+    /// the URL field. Passed in via binding once Task 2 adds the parameter to HomeView.
+    @State private var shouldFocusURLField = false
+
     init() {
         // Set once at launch so previews play through the speaker even in silent mode.
         // Calling setCategory repeatedly (per-play) is redundant and triggers a system
@@ -26,16 +33,34 @@ struct SimiApp: App {
 
     var body: some Scene {
         WindowGroup {
-            HomeView()
-                .environmentObject(engine)
-                .preferredColorScheme(.dark)
-                .onChange(of: scenePhase) { _, phase in
-                    // Warm Railway on foreground so the first /batch-analyze after a cold
-                    // sleep doesn't burn the full 90s timeout. /health is ~50ms, costs nothing.
-                    if phase == .active {
-                        Task { _ = await SimiAudioService.shared.isReachable() }
+            ZStack {
+                HomeView()
+                    .environmentObject(engine)
+                    .preferredColorScheme(.dark)
+                    .onChange(of: scenePhase) { _, phase in
+                        // Warm Railway on foreground — cold starts take up to ~20s, so use
+                        // warmUp() (22s timeout) not isReachable() (3s) so the container is
+                        // actually alive by the time the user's first search hits Stage 2.
+                        if phase == .active {
+                            Task { _ = await SimiAudioService.shared.warmUp() }
+                        }
                     }
+
+                if !hasSeenOnboarding {
+                    OnboardingView(onDismiss: {
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            hasSeenOnboarding = true
+                        }
+                        // Trigger URL field focus after the overlay fades out.
+                        // Task 2 will wire shouldFocusURLField into HomeView.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                            shouldFocusURLField = true
+                        }
+                    })
+                    .transition(.opacity)
+                    .zIndex(1)
                 }
+            }
         }
     }
 }

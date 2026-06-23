@@ -8,7 +8,7 @@ import Foundation
 
 // MARK: - Song
 // Represents the song the user pastes in — the one they love
-struct Song: Identifiable, Codable {
+struct Song: Identifiable, Codable, Equatable {
     var id: String          // Unique ID from Spotify (e.g. "3n3Ppam7vgaVa1iaRUIOKE")
     var title: String       // Song name
     var artist: String      // Artist name
@@ -24,7 +24,7 @@ struct Song: Identifiable, Codable {
 // MARK: - AudioFeatures
 // Spotify gives us these numbers for every song.
 // They're the secret sauce behind matching songs that "feel" the same.
-struct AudioFeatures: Codable, Sendable {
+struct AudioFeatures: Codable, Sendable, Equatable {
     var bpm: Double         // Beats per minute — e.g. 120.4
     var energy: Double      // 0.0 (calm) to 1.0 (intense) — think lullaby vs. EDM drop
     var valence: Double     // 0.0 (sad/dark) to 1.0 (happy/upbeat)
