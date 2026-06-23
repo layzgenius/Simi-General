@@ -43,7 +43,8 @@ struct HomeView: View {
     @State private var showClearConfirm  = false
 
     // Focus + cycling placeholder state
-    @FocusState private var urlFieldFocused: Bool
+    private enum Field { case urlInput, titleInput, artistInput }
+    @FocusState private var focusedField: Field?
     @State private var placeholderIndex = 0
     private let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
@@ -117,13 +118,13 @@ struct HomeView: View {
             // Auto-focus URL field after onboarding dismissal
             .onChange(of: shouldFocusURL.wrappedValue) { _, newValue in
                 if newValue {
-                    urlFieldFocused = true
+                    focusedField = .urlInput
                     shouldFocusURL.wrappedValue = false
                 }
             }
             // Cycle placeholder text every 3s when URL field is empty and unfocused
             .onReceive(timer) { _ in
-                guard pastedURLs[0].isEmpty && !urlFieldFocused else { return }
+                guard pastedURLs[0].isEmpty && focusedField != .urlInput else { return }
                 placeholderIndex = (placeholderIndex + 1) % 3
             }
             // Reset placeholder index when URL field is cleared
@@ -232,7 +233,7 @@ struct HomeView: View {
                             } else {
                                 seeds[0].title = song.title
                                 seeds[0].artist = song.artist
-                                urlFieldFocused = true
+                                focusedField = .titleInput
                             }
                         }) {
                             Text(song.label)
@@ -357,7 +358,7 @@ struct HomeView: View {
                 .autocorrectionDisabled()
                 .submitLabel(.search)
                 .onSubmit { startSearch() }
-                .focused($urlFieldFocused)
+                .focused($focusedField, equals: .urlInput)
                 .accessibilityLabel(pastedURLs.count > 1 ? "Song link \(index + 1)" : "Song link")
 
             if pastedURLs[index].isEmpty {
@@ -516,6 +517,7 @@ struct HomeView: View {
                     .autocapitalization(.words)
                     .autocorrectionDisabled()
                     .submitLabel(.next)
+                    .focused($focusedField, equals: .titleInput)
                     .accessibilityLabel(seeds.count > 1 ? "Song title, seed \(index + 1)" : "Song title")
 
                 if !seeds[index].title.isEmpty {
