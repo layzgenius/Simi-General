@@ -657,8 +657,7 @@ struct HomeView: View {
             VStack(spacing: 8) {
                 ForEach(engine.history.entries.prefix(5)) { entry in
                     HistoryRow(entry: entry, manager: engine.history) {
-                        engine.activeSearchTask?.cancel()
-                        engine.activeSearchTask = Task {
+                        Task {
                             // Re-run via the original path — URL searches use the URL,
                             // text searches use title + artist. queryString preserves this.
                             let query = entry.queryString
@@ -690,8 +689,7 @@ struct HomeView: View {
 
     func startSearch() {
         guard isSearchReady else { return }
-        engine.activeSearchTask?.cancel()
-        engine.activeSearchTask = Task {
+        Task {
             switch searchMode {
             case .url:
                 let validURLs = pastedURLs.map { $0.trimmingCharacters(in: .whitespaces) }
