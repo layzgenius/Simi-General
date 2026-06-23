@@ -232,6 +232,7 @@ struct HomeView: View {
                             } else {
                                 seeds[0].title = song.title
                                 seeds[0].artist = song.artist
+                                urlFieldFocused = true
                             }
                         }) {
                             Text(song.label)
