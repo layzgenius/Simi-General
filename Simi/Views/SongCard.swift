@@ -65,6 +65,7 @@ struct SongCard: View {
     @State private var showShareSheet = false
     @Environment(\.accessibilityReduceMotion) var reduceMotion
     @ObservedObject private var previewPlayer = PreviewPlayer.shared
+    @EnvironmentObject private var engine: RecommendationEngine
 
     private var isPlaying: Bool { previewPlayer.playingSongID == song.id }
     private var hasPreview: Bool { song.previewURL != nil }
@@ -152,7 +153,7 @@ struct SongCard: View {
                          + song.matchReasons.prefix(2).map(\.rawValue).joined(separator: ", ")))
                 .accessibilityHint(isExpanded ? "Tap to collapse" : "Tap to see audio features")
 
-                // RIGHT: similarity % + bar + platform links
+                // RIGHT: similarity % + bar only (platform links moved below)
                 VStack(alignment: .trailing, spacing: 4) {
                     // Playing indicator replaces similarity label while previewing
                     if isPlaying {
@@ -166,85 +167,95 @@ struct SongCard: View {
                     SimilarityBar(score: song.similarityScore)
                         .frame(width: 44, height: 4)
                         .accessibilityHidden(true)
-
-                    HStack(spacing: 2) {
-                        // Spotify
-                        if let spotifyURL = URL(string: song.spotifyURL) {
-                            Link(destination: spotifyURL) {
-                                Image(systemName: "music.note.list")
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(.simiSpotifyGreen)
-                                    .frame(minWidth: 44, minHeight: 44)
-                                    .contentShape(Rectangle())
-                            }
-                            .accessibilityLabel("Open on Spotify")
-                            .contextMenu {
-                                Label("Open on Spotify", systemImage: "music.note.list")
-                            }
-                        }
-
-                        // Apple Music
-                        Link(destination: appleMusicURL(for: song)) {
-                            Image(systemName: "heart.fill")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundColor(.simiAppleMusicPink)
-                                .frame(minWidth: 44, minHeight: 44)
-                                .contentShape(Rectangle())
-                        }
-                        .accessibilityLabel("Search on Apple Music")
-                        .contextMenu {
-                            Label("Search on Apple Music", systemImage: "heart.fill")
-                        }
-
-                        // YouTube
-                        Link(destination: youtubeURL(for: song)) {
-                            Image(systemName: "play.rectangle.fill")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundColor(.simiYouTubeRed)
-                                .frame(minWidth: 44, minHeight: 44)
-                                .contentShape(Rectangle())
-                        }
-                        .accessibilityLabel("Search on YouTube")
-                        .contextMenu {
-                            Label("Search on YouTube", systemImage: "play.rectangle.fill")
-                        }
-
-                        // Share
-                        Button {
-                            Task { @MainActor in
-                                shareImage = nil
-                                let artwork = await ShareCardView.fetchArtwork(song.albumArt)
-                                let card = ShareCardView(
-                                    song: song,
-                                    sourceSong: sourceSong,
-                                    matchArtwork: artwork,
-                                    seedArtwork: nil
-                                )
-                                let renderer = ImageRenderer(content: card)
-                                renderer.scale = 3.0
-                                shareImage = renderer.uiImage
-                                showShareSheet = shareImage != nil
-                            }
-                        } label: {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundColor(.simiSubtext)
-                                .frame(minWidth: 44, minHeight: 44)
-                                .contentShape(Rectangle())
-                        }
-                        .accessibilityLabel("Share this match")
-                        .sheet(isPresented: $showShareSheet) {
-                            if let img = shareImage {
-                                ActivitySheetView(items: [img])
-                                    .presentationDetents([.medium, .large])
-                            }
-                        }
-                    }
                 }
             }
             .padding(.horizontal, 14)
             .padding(.top, 14)
-            .padding(.bottom, song.matchReasons.isEmpty && (song.matchExplanation?.genreBridgeLabel ?? "").isEmpty ? 14 : 8)
+            .padding(.bottom, 4)
+
+            // ── Platform links — own row so they don't crowd the title ──
+            HStack(spacing: 0) {
+                // Nudge icons to align under the title column (art 56pt + spacing 12pt)
+                Spacer().frame(width: 68)
+
+                // Spotify
+                if let spotifyURL = URL(string: song.spotifyURL) {
+                    Link(destination: spotifyURL) {
+                        Image(systemName: "music.note.list")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.simiSpotifyGreen)
+                            .frame(minWidth: 44, minHeight: 36)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Open on Spotify")
+                    .contextMenu {
+                        Label("Open on Spotify", systemImage: "music.note.list")
+                    }
+                }
+
+                // Apple Music
+                Link(destination: appleMusicURL(for: song)) {
+                    Image(systemName: "heart.fill")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.simiAppleMusicPink)
+                        .frame(minWidth: 44, minHeight: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Search on Apple Music")
+                .contextMenu {
+                    Label("Search on Apple Music", systemImage: "heart.fill")
+                }
+
+                // YouTube
+                Link(destination: youtubeURL(for: song)) {
+                    Image(systemName: "play.rectangle.fill")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.simiYouTubeRed)
+                        .frame(minWidth: 44, minHeight: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Search on YouTube")
+                .contextMenu {
+                    Label("Search on YouTube", systemImage: "play.rectangle.fill")
+                }
+
+                // Share
+                Button {
+                    Task { @MainActor in
+                        shareImage = nil
+                        let artwork = await ShareCardView.fetchArtwork(song.albumArt)
+                        let card = ShareCardView(
+                            song: song,
+                            sourceSong: sourceSong,
+                            matchArtwork: artwork,
+                            seedArtwork: nil
+                        )
+                        let renderer = ImageRenderer(content: card)
+                        renderer.scale = 3.0
+                        shareImage = renderer.uiImage
+                        showShareSheet = shareImage != nil
+                    }
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.simiSubtext)
+                        .frame(minWidth: 44, minHeight: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Share this match")
+                .sheet(isPresented: $showShareSheet) {
+                    if let img = shareImage {
+                        ActivitySheetView(items: [img])
+                            .presentationDetents([.medium, .large])
+                    }
+                }
+
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 0)
+
+            FeedbackRow(song: song)
 
             // ── Match reason chips — full-width row so they never get squished ──
             if !song.matchReasons.isEmpty {
@@ -306,7 +317,16 @@ struct SongCard: View {
                     : .opacity.combined(with: .move(edge: .top)))
             }
         }
+        .opacity(song.feedbackState == .miss ? 0.5 : 1.0)
+        .animation(.easeInOut(duration: 0.2), value: song.feedbackState)
         .background(Color.simiCard)
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(Color.simiAccent)
+                .frame(width: 3)
+                .opacity(song.feedbackState == .fits ? 1 : 0)
+                .animation(.easeInOut(duration: 0.2), value: song.feedbackState)
+        }
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.simiBorder, lineWidth: 1))
     }
@@ -408,6 +428,64 @@ struct SimilarityBar: View {
                 animatedScore = newScore
             }
         }
+    }
+}
+
+// ──────────────────────────────────────────────
+// MARK: - FeedbackRow
+// Three pill buttons: Fits / Close / Miss. Always visible below platform links.
+// Tapping the active pill returns to neutral (toggles off).
+// ──────────────────────────────────────────────
+
+struct FeedbackRow: View {
+    let song: SimilarSong
+    @EnvironmentObject private var engine: RecommendationEngine
+
+    private func pillColor(_ state: FeedbackState) -> Color {
+        switch state {
+        case .fits:  return .simiAccent
+        case .close: return Color.orange
+        case .miss:  return .simiSubtext
+        }
+    }
+
+    private func pillLabel(_ state: FeedbackState) -> String {
+        switch state {
+        case .fits:  return song.feedbackState == .fits  ? "Fits ✓"  : "Fits"
+        case .close: return song.feedbackState == .close ? "Close ~"  : "Close"
+        case .miss:  return song.feedbackState == .miss  ? "Miss ✗"  : "Miss"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach([FeedbackState.fits, .close, .miss], id: \.self) { state in
+                let isActive = song.feedbackState == state
+                Button {
+                    engine.setFeedback(songID: song.id, state: isActive ? nil : state)
+                } label: {
+                    Text(pillLabel(state))
+                        .font(.simiMicro)
+                        .foregroundColor(isActive ? .white : pillColor(state))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(
+                            isActive
+                                ? pillColor(state)
+                                : pillColor(state).opacity(0.08)
+                        )
+                        .clipShape(Capsule())
+                        .overlay(Capsule().stroke(pillColor(state), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .animation(.easeInOut(duration: 0.15), value: song.feedbackState)
+                .accessibilityLabel("Mark as \(state.rawValue)")
+                .accessibilityValue(isActive ? "selected" : "")
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
     }
 }
 
