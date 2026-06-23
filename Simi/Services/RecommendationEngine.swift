@@ -1062,31 +1062,51 @@ class RecommendationEngine: ObservableObject {
         var rows: [MatchExplanationRow] = []
 
         // Row 1: Emotional weight — valence (prefer DEAM-regressed value, consistent with computeSimilarity)
+        // Gate: threshold unchanged (0.20), but isEstimated check removed — estimated songs show
+        // softer descriptors instead of nothing.
         let srcValence = source.valenceEssentia ?? source.valence
         let tgtValence = target.valenceEssentia ?? target.valence
-        if !source.isEstimated && !target.isEstimated,
-           abs(srcValence - tgtValence) < 0.20 {
+        let isEitherEstimated = source.isEstimated || target.isEstimated
+        if abs(srcValence - tgtValence) < 0.20 {
             let avg = (srcValence + tgtValence) / 2
             let descriptor: String
-            switch avg {
-            case ..<0.35:        descriptor = "Same melancholic weight"
-            case 0.35..<0.50:    descriptor = "Same bittersweet edge"
-            case 0.50..<0.65:    descriptor = "Same balanced mood"
-            default:             descriptor = "Same bright energy"
+            if isEitherEstimated {
+                switch avg {
+                case ..<0.35:        descriptor = "Similar emotional feel"
+                case 0.35..<0.50:    descriptor = "Similar bittersweet range"
+                case 0.50..<0.65:    descriptor = "Similar balanced mood"
+                default:             descriptor = "Similar warmth"
+                }
+            } else {
+                switch avg {
+                case ..<0.35:        descriptor = "Same melancholic weight"
+                case 0.35..<0.50:    descriptor = "Same bittersweet edge"
+                case 0.50..<0.65:    descriptor = "Same balanced mood"
+                default:             descriptor = "Same bright energy"
+                }
             }
             rows.append(MatchExplanationRow(label: "Emotional weight", descriptor: descriptor))
         }
 
         // Row 2: Intensity — energy
-        if !source.isEstimated && !target.isEstimated,
-           abs(source.energy - target.energy) < 0.20 {
+        // isEstimated check removed — softer descriptors for estimated songs.
+        if abs(source.energy - target.energy) < 0.20 {
             let avg = (source.energy + target.energy) / 2
             let descriptor: String
-            switch avg {
-            case ..<0.35:        descriptor = "Equally restrained"
-            case 0.35..<0.55:    descriptor = "Equally measured"
-            case 0.55..<0.75:    descriptor = "Equally driven"
-            default:             descriptor = "Equally intense"
+            if isEitherEstimated {
+                switch avg {
+                case ..<0.35:        descriptor = "Roughly as restrained"
+                case 0.35..<0.55:    descriptor = "Roughly as measured"
+                case 0.55..<0.75:    descriptor = "Roughly as driven"
+                default:             descriptor = "Roughly as intense"
+                }
+            } else {
+                switch avg {
+                case ..<0.35:        descriptor = "Equally restrained"
+                case 0.35..<0.55:    descriptor = "Equally measured"
+                case 0.55..<0.75:    descriptor = "Equally driven"
+                default:             descriptor = "Equally intense"
+                }
             }
             rows.append(MatchExplanationRow(label: "Intensity", descriptor: descriptor))
         }
