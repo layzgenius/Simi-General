@@ -41,25 +41,31 @@ async let artistSimilarTask = fetchArtistSimilarCandidates(artist: song.artist)
 ```swift
 private func deriveAudioQueryTags(
     from features: AudioFeatures,
-    genreTags: [String] = []
+    genreTags: [Genre] = []
 ) -> [String]
 ```
 
+`Genre` is a struct with `main: String` and `sub: String?`. `fetchGenresWithFallback()` returns `[Genre]` — call sites pass `genres` (the awaited result of `genresTask`) directly, no mapping needed.
+
+**Top genre selector:** `genreTags.first?.sub ?? genreTags.first?.main`. `sub` is the more specific label (e.g., "Dream Pop" over "Indie Pop") — better for compound queries targeting a narrower niche.
+
 **Logic change:**
 - Current behavior: returns 1–2 bare mood tags (e.g., `["melancholic", "chill"]`), guarded by `!features.isEstimated`.
-- New behavior: if `genreTags` is non-empty, take the top genre tag and generate compound queries:
-  - `"\(moodTag) \(genre)"` (e.g., "late night soul", "melancholic indie")
+- New behavior: if `genreTags` is non-empty, derive the genre label via `genreTags.first?.sub ?? genreTags.first?.main` and generate compound queries:
+  - `"\(moodTag) \(genreLabel)"` (e.g., "late night dream pop", "melancholic soul")
   - One compound per mood tag, up to 2 compounds
 - Return up to 4 tags total: original bare tags + compounds
 - Guard unchanged: no tags returned when `features.isEstimated`
 
-**Example output for a niche soul track:**
+**Example output for a niche soul track (`genreTags.first?.sub` = "neo soul"):**
 - Before: `["late night", "melancholic"]`
-- After: `["late night", "melancholic", "late night soul", "melancholic soul"]`
+- After: `["late night", "melancholic", "late night neo soul", "melancholic neo soul"]`
 
 The compound tags reach a genre-specific slice of Last.fm's tag index, surfacing tracks that share both the mood and the genre — the exact space where niche discovery lives.
 
-**Call sites:** Both `findSimilarSongs` variants already call `deriveAudioQueryTags`. Update both call sites to pass the genre tags that are already fetched earlier in the function.
+**Call sites:** Both `findSimilarSongs` variants already call `deriveAudioQueryTags`. Update both call sites to pass `genres` (already awaited from `genresTask` in scope at that point).
+
+**Deduplication note:** Artist-similar candidates entering `expandedTracks` are deduplicated against the rest of the pool by `mergeTracks` (keyed on `title|artist`) before Spotify lookup. `mergeAndScore`'s `seen` set provides a second deduplication layer by Spotify ID. No double-scored tracks.
 
 ---
 
@@ -87,10 +93,11 @@ private func fetchArtistSimilarCandidates(artist: String) async -> [(title: Stri
 ```swift
 private func deriveAudioQueryTags(
     from features: AudioFeatures,
-    genreTags: [String] = []
+    genreTags: [Genre] = []
 ) -> [String]
 ```
-- `genreTags`: the raw genre strings from `fetchGenresWithFallback()` (already in scope at call sites)
+- `genreTags`: `[Genre]` from `fetchGenresWithFallback()` — call sites pass `genres` directly (no `.map` needed)
+- Top genre label: `genreTags.first?.sub ?? genreTags.first?.main`
 - Returns up to 4 tags (was 1–2): existing bare tags + compound genre+mood tags
 - No change to the `features.isEstimated` guard
 
