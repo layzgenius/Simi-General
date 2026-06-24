@@ -138,6 +138,28 @@ class RecommendationEngine: ObservableObject {
         return await listenBrainzService.fetchSimilarRecordings(mbid: mbid)
     }
 
+    /// Fetches top tracks from up to 8 artists similar to the given artist.
+    /// Always-on parallel source — not a fallback. Returns up to ~40 deduplicated (title, artist) pairs.
+    private func fetchArtistSimilarCandidates(artist: String) async -> [(title: String, artist: String)] {
+        let similarArtists = (try? await lastFMService.fetchSimilarArtists(artist: artist)) ?? []
+        guard !similarArtists.isEmpty else { return [] }
+        var tracks: [(title: String, artist: String)] = []
+        await withTaskGroup(of: [(title: String, artist: String)].self) { group in
+            for similarArtist in similarArtists.prefix(8) {
+                group.addTask {
+                    await self.lastFMService.fetchArtistTopTracks(artist: similarArtist)
+                }
+            }
+            for await artistTracks in group {
+                tracks += artistTracks
+            }
+        }
+        var seen = Set<String>()
+        return tracks.filter { t in
+            seen.insert("\(t.title)|\(t.artist)".lowercased()).inserted
+        }
+    }
+
     /// Looks up the source song's raw Last.fm tags using the Supabase cache first.
     /// In production, fetchGenresWithFallback has already written the tags to Supabase,
     /// so this is almost always a fast cache hit. In debug (cache disabled), it makes
@@ -251,6 +273,7 @@ class RecommendationEngine: ObservableObject {
             async let genresTask        = fetchGenresWithFallback(title: song.title, artist: song.artist)
             async let similarTracksTask = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
             async let lbTask            = fetchListenBrainzTracks(title: song.title, artist: song.artist)
+            async let artistSimilarTask = fetchArtistSimilarCandidates(artist: song.artist)
 
             // Genre-based tag candidates don't need audio features — start as soon as rawTags arrive.
             // Previously this waited for full feature analysis, adding ~1-2s to the critical path.
@@ -323,10 +346,11 @@ class RecommendationEngine: ObservableObject {
             }
 
             // Phase 2: await remaining candidates
-            let genres           = await genresTask
-            let spotifyRecs      = (try? await spotifyRecsTask) ?? []
-            let vectorCandidates = await vectorTask
-            let dclapCandidates  = await dclapTask
+            let genres               = await genresTask
+            let spotifyRecs          = (try? await spotifyRecsTask) ?? []
+            let vectorCandidates     = await vectorTask
+            let dclapCandidates      = await dclapTask
+            let artistSimilarCandidates = await artistSimilarTask
             self.detectedGenres  = genres
             self.lastGenres      = genres
 
@@ -337,7 +361,7 @@ class RecommendationEngine: ObservableObject {
                 primary: Self.mergeTracks(primary: lastFMTracks, secondary: tagCandidates),
                 secondary: Self.mergeTracks(
                     primary: Self.mergeTracks(primary: lbTracks, secondary: vectorCandidates),
-                    secondary: dclapCandidates
+                    secondary: Self.mergeTracks(primary: dclapCandidates, secondary: artistSimilarCandidates)
                 )
             )
 
@@ -471,6 +495,7 @@ class RecommendationEngine: ObservableObject {
             async let genresTask        = fetchGenresWithFallback(title: song.title, artist: song.artist)
             async let similarTracksTask = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
             async let lbTask            = fetchListenBrainzTracks(title: song.title, artist: song.artist)
+            async let artistSimilarTask = fetchArtistSimilarCandidates(artist: song.artist)
 
             // Genre-based tag candidates don't need features — start as soon as rawTags arrive.
             let earlyTags = await tagsEarlyTask
@@ -538,10 +563,11 @@ class RecommendationEngine: ObservableObject {
             }
 
             // Phase 2: await remaining candidates
-            let genres           = await genresTask
-            let spotifyRecs      = (try? await spotifyRecsTask) ?? []
-            let vectorCandidates = await vectorTask
-            let dclapCandidates2 = await dclapTask2
+            let genres               = await genresTask
+            let spotifyRecs          = (try? await spotifyRecsTask) ?? []
+            let vectorCandidates     = await vectorTask
+            let dclapCandidates2     = await dclapTask2
+            let artistSimilarCandidates = await artistSimilarTask
             self.detectedGenres  = genres
             self.lastGenres      = genres
 
@@ -552,7 +578,7 @@ class RecommendationEngine: ObservableObject {
                 primary: Self.mergeTracks(primary: lastFMTracks, secondary: tagCandidates),
                 secondary: Self.mergeTracks(
                     primary: Self.mergeTracks(primary: lbTracks, secondary: vectorCandidates),
-                    secondary: dclapCandidates2
+                    secondary: Self.mergeTracks(primary: dclapCandidates2, secondary: artistSimilarCandidates)
                 )
             )
 
