@@ -307,11 +307,12 @@ class RecommendationEngine: ObservableObject {
             async let vectorTask      = supabase.fetchSimilarByVector(embedding: SupabaseCacheService.buildEmbedding(from: sourceFeatures))
             async let dclapTask       = fetchVectorCandidates(embedding: sourceFeatures.dclapEmbedding ?? [])
 
+            let genres = await genresTask
             let highEnergyMarkers1 = ["metal", "hard rock", "punk", "thrash", "hardcore", "grunge"]
             let genreSaysLoud1 = earlyTags.contains { tag in highEnergyMarkers1.contains { tag.lowercased().contains($0) } }
             let audioTags = (genreSaysLoud1 && sourceFeatures.energy < 0.45)
                 ? []
-                : deriveAudioQueryTags(from: sourceFeatures).filter { !$0.isEmpty }
+                : deriveAudioQueryTags(from: sourceFeatures, genreTags: genres).filter { !$0.isEmpty }
             if !audioTags.isEmpty { simiLog("🎵 Audio-derived query tags: \(audioTags)") }
 
             // Supplementary fetch for audio-derived tags not already covered by earlyTags (~1-2 tags).
@@ -346,7 +347,6 @@ class RecommendationEngine: ObservableObject {
             }
 
             // Phase 2: await remaining candidates
-            let genres               = await genresTask
             let spotifyRecs          = (try? await spotifyRecsTask) ?? []
             let vectorCandidates     = await vectorTask
             let dclapCandidates      = await dclapTask
@@ -526,11 +526,12 @@ class RecommendationEngine: ObservableObject {
             async let vectorTask      = supabase.fetchSimilarByVector(embedding: SupabaseCacheService.buildEmbedding(from: sourceFeatures))
             async let dclapTask2      = fetchVectorCandidates(embedding: sourceFeatures.dclapEmbedding ?? [])
 
+            let genres = await genresTask
             let highEnergyMarkers2 = ["metal", "hard rock", "punk", "thrash", "hardcore", "grunge"]
             let genreSaysLoud2 = earlyTags.contains { tag in highEnergyMarkers2.contains { tag.lowercased().contains($0) } }
             let audioTags = (genreSaysLoud2 && sourceFeatures.energy < 0.45)
                 ? []
-                : deriveAudioQueryTags(from: sourceFeatures).filter { !$0.isEmpty }
+                : deriveAudioQueryTags(from: sourceFeatures, genreTags: genres).filter { !$0.isEmpty }
             if !audioTags.isEmpty { simiLog("🎵 Audio-derived query tags: \(audioTags)") }
 
             let audioOnlyTags = audioTags.filter { !earlyTags.contains($0) }
@@ -563,7 +564,6 @@ class RecommendationEngine: ObservableObject {
             }
 
             // Phase 2: await remaining candidates
-            let genres               = await genresTask
             let spotifyRecs          = (try? await spotifyRecsTask) ?? []
             let vectorCandidates     = await vectorTask
             let dclapCandidates2     = await dclapTask2
@@ -2131,71 +2131,87 @@ class RecommendationEngine: ObservableObject {
     /// rather than genre labels (e.g. "trap"), so candidate discovery targets vibe
     /// rather than co-listening patterns.
     ///
+    /// Generates compound tags by pairing mood tags with genre info (e.g. "late night neo soul"),
+    /// targeting niche catalogs that bare mood tags miss.
+    ///
     /// Only runs when features are real (isEstimated=false) — tag-estimated features
     /// default to energy 0.7/valence 0.48 for trap, which would always return "trap"
     /// candidates and defeat the purpose.
-    private func deriveAudioQueryTags(from features: AudioFeatures) -> [String] {
+    private func deriveAudioQueryTags(from features: AudioFeatures, genreTags: [Genre] = []) -> [String] {
         guard !features.isEstimated else { return [] }
 
         // Use VALENCE as the primary axis — it's derived from spectral brightness which
         // correctly captures dark/warm vs bright/intense emotional quality.
         // Audio RMS energy is NOT used here: it measures physical loudness, not emotional
         // intensity (e.g. Tiramisu has 0.82 RMS due to 808 bass but feels dreamy and dark).
-        let v = features.valence
+        let baseTags: [String] = {
+            let v = features.valence
 
-        if v < 0.30 {
-            // Major-key: low valence is a measurement artifact (slow tempo penalty, low spectral
-            // brightness) not an emotional one — a major-key ballad is never genuinely "sad/dark".
-            if features.mode == 1 {
-                if features.energy < 0.55 { return ["mellow"] }
-                if features.danceability > 0.40 { return ["groove"] }
-                return ["smooth"]
+            if v < 0.30 {
+                // Major-key: low valence is a measurement artifact (slow tempo penalty, low spectral
+                // brightness) not an emotional one — a major-key ballad is never genuinely "sad/dark".
+                if features.mode == 1 {
+                    if features.energy < 0.55 { return ["mellow"] }
+                    if features.danceability > 0.40 { return ["groove"] }
+                    return ["smooth"]
+                }
+                return ["sad", "dark"]                            // very dark: grief, heavy, bleak
             }
-            return ["sad", "dark"]                            // very dark: grief, heavy, bleak
-        }
-        // Major-key songs in the mid-dark valence range feel warm/mellow, not melancholic.
-        // Low valence in a major-key song is often a measurement artifact (slow tempo, low
-        // spectral brightness) rather than genuine sadness — e.g. DeBarge "I Like It":
-        // librosa reads energy=0.47, valence=0.45 but the song is a warm groovy soul track.
-        if v < 0.45 {
-            if features.mode == 1 {
-                if features.energy < 0.55 { return ["mellow"] }
-                if features.danceability > 0.40 { return ["groove"] }
-                return ["smooth"]
+            // Major-key songs in the mid-dark valence range feel warm/mellow, not melancholic.
+            // Low valence in a major-key song is often a measurement artifact (slow tempo, low
+            // spectral brightness) rather than genuine sadness — e.g. DeBarge "I Like It":
+            // librosa reads energy=0.47, valence=0.45 but the song is a warm groovy soul track.
+            if v < 0.45 {
+                if features.mode == 1 {
+                    if features.energy < 0.55 { return ["mellow"] }
+                    if features.danceability > 0.40 { return ["groove"] }
+                    return ["smooth"]
+                }
+                return ["late night", "melancholic"]              // dark-warm: After Hours
             }
-            return ["late night", "melancholic"]              // dark-warm: After Hours
-        }
-        if v < 0.55 {
-            if features.mode == 1 {
-                if features.energy < 0.55 { return ["mellow"] }
-                if features.danceability > 0.40 { return ["groove"] }
-                return ["smooth"]
+            if v < 0.55 {
+                if features.mode == 1 {
+                    if features.energy < 0.55 { return ["mellow"] }
+                    if features.danceability > 0.40 { return ["groove"] }
+                    return ["smooth"]
+                }
+                return ["melancholic"]                            // neutral-dark: introspective
             }
-            return ["melancholic"]                            // neutral-dark: introspective
-        }
-        if v < 0.65 {
-            // High energy + low danceability = smooth/melodic trap (Tiramisu archetype)
-            // Pulls R&B/melodic-trap candidates rather than bright indie/pop
-            if features.energy > 0.60 && features.danceability < 0.62 { return ["smooth", "late night"] }
-            return ["feel good"]                              // warm: genuinely danceable or low-energy
-        }
-        // v >= 0.65 — bright/warm spectrum. Gate on energy before calling it "upbeat":
-        // e.g. Redbone (energy=0.44, valence=0.72) is warm & smooth — NOT hype pop/dance.
-        if features.energy < 0.50 {
-            // "feel good" requires upbeat tempo AND major key.
-            // Minor key OR slow BPM → "late night" (Redbone: F minor, 86 BPM, valence=0.72)
-            if features.mode == 0 || features.bpm < 100 {
-                return ["late night"]
+            if v < 0.65 {
+                // High energy + low danceability = smooth/melodic trap (Tiramisu archetype)
+                // Pulls R&B/melodic-trap candidates rather than bright indie/pop
+                if features.energy > 0.60 && features.danceability < 0.62 { return ["smooth", "late night"] }
+                return ["feel good"]                              // warm: genuinely danceable or low-energy
             }
-            if features.danceability > 0.50 { return ["feel good", "groove"] }
-            return ["smooth", "feel good"]
+            // v >= 0.65 — bright/warm spectrum. Gate on energy before calling it "upbeat":
+            // e.g. Redbone (energy=0.44, valence=0.72) is warm & smooth — NOT hype pop/dance.
+            if features.energy < 0.50 {
+                // "feel good" requires upbeat tempo AND major key.
+                // Minor key OR slow BPM → "late night" (Redbone: F minor, 86 BPM, valence=0.72)
+                if features.mode == 0 || features.bpm < 100 {
+                    return ["late night"]
+                }
+                if features.danceability > 0.50 { return ["feel good", "groove"] }
+                return ["smooth", "feel good"]
+            }
+            if features.energy < 0.68 {
+                // Mid energy + bright = feel-good but not hype
+                if features.danceability > 0.65 { return ["feel good", "groove"] }
+                return ["feel good"]
+            }
+            return ["upbeat", "energetic"]                        // genuinely bright AND energetic: pop, dance
+        }()
+
+        // Append genre+mood compound queries (e.g. "late night neo soul", "melancholic dream pop").
+        // Compound tags target a genre-specific slice of Last.fm's tag index, reaching niche catalogs
+        // that bare mood tags miss. Sub-genre beats main (e.g. "dream pop" > "indie pop").
+        guard !baseTags.isEmpty,
+              let genreLabel = genreTags.first?.sub ?? genreTags.first?.main,
+              !genreLabel.isEmpty else {
+            return baseTags
         }
-        if features.energy < 0.68 {
-            // Mid energy + bright = feel-good but not hype
-            if features.danceability > 0.65 { return ["feel good", "groove"] }
-            return ["feel good"]
-        }
-        return ["upbeat", "energetic"]                        // genuinely bright AND energetic: pop, dance
+        let compounds = baseTags.prefix(2).map { "\($0) \(genreLabel)" }
+        return baseTags + compounds
     }
 
     // ──────────────────────────────────────────────
