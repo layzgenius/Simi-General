@@ -85,7 +85,11 @@ if index > 0 { ... }
 
 **AB features:** `acousticBrainzService.fetchFeatures(mbid:)` — non-throwing, returns `AudioFeatures?`. Returns nil if AB has no data for the MBID (all post-2022 tracks, and pre-2022 tracks not yet submitted to AB).
 
-**Partial fields:** AB provides energy, valence, danceability, acousticness, instrumentalness, BPM, key, mode. Fields not measured by AB (liveness, spectralWarmth, tonalClarity, vocalPresence, reverbSpace) default to `0.0`. AB-returned `AudioFeatures` has `isEstimated = false` — Stage 2 skips these candidates, freeing librosa slots for modern tracks.
+**`isEstimated` confirmed:** `AudioFeatures.isEstimated` defaults to `false` (Song.swift line 43: `var isEstimated: Bool = false`). `AcousticBrainzService.fetchFeatures()` does not pass `isEstimated:` to the `AudioFeatures` initializer, so AB-returned features are always `isEstimated = false`. No extra flag-setting needed.
+
+**Stage 2 selection confirmed:** Stage 2 candidate selection at line 1413–1417 guards `song.audioFeatures?.isEstimated != false`. AB-enriched candidates have `isEstimated = false` and are therefore excluded from `librosaTargets` automatically — they do not consume Stage 2 slots.
+
+**Partial fields:** AB provides energy, valence, danceability, acousticness, instrumentalness, BPM, key, mode. Fields not measured by AB (liveness, spectralWarmth, tonalClarity, vocalPresence, reverbSpace) use `AudioFeatures` struct defaults of `0.5` (neutral midpoint — Song.swift lines 53–56), not 0.0. Scoring impact is negligible: `computeSimilarity()` weights these fields at 0.00–0.01 (spectralWarmth: 0.00, tonalClarity: 0.01, vocalPresence: 0.00, reverbSpace: 0.00). The `buildMatchExplanation` Row 5 (sonic texture) is additionally gated on `!source.isEstimated && !target.isEstimated` — it only appears when both source and candidate have librosa features, so AB candidates with 0.5 defaults will not produce misleading sonic-texture rows unless the source song also has librosa features (in which case 0.5 is a reasonable neutral placeholder).
 
 **Relationship to existing disabled AB code (lines 965–971):** That commented-out block is in `fetchAudioFeaturesWithFallback()` (the source song path). Component 2 adds AB enrichment in `enrichWithABFeatures()` Stage 1 (the candidate path). These are independent paths — leave the lines 965–971 comment as-is.
 
@@ -109,7 +113,9 @@ let librosaTargets = recommendations
 
 No other changes. Stage 2's chunking (groups of 2, concurrent) and cancellation guards are unchanged.
 
-**Latency:** Worst case (10 slots all occupied, no AB hits): 5 chunks × ~2–3s = ~10–15s for Stage 2. This is the accepted quality trade-off for niche discovery, consistent with the Spec A latency acceptance for artist-similar fan-out. In practice, AB hits reduce Stage 2 demand for pre-2022 tracks, and Deezer provides preview URLs for tracks that previously had none — actual slot utilization will often be lower than 10.
+**Latency:** Worst case (10 slots all occupied, no AB hits): 5 chunks × ~2–3s = ~10–15s for Stage 2. Combined with Stage 1 (~6–8s), total cold-search latency could reach 16–23s. This is the accepted quality trade-off for niche discovery. In practice, AB hits reduce Stage 2 demand for pre-2022 tracks, and Deezer provides preview URLs for tracks that previously had none — actual slot utilization will often be lower than 10.
+
+**Loading UX prerequisite:** Spec B should not land without visible search progress already in place (skeletons, pulsing dots, on-brand wait messages). A 20s search with a frozen screen is unusable. If the Session Quality Redesign loading UX is not yet shipped, treat it as a blocking dependency for Spec B.
 
 ---
 
@@ -153,17 +159,19 @@ func fetchPreviewURL(title: String, artist: String) async -> String?
 - SourceKit false positives at lines 33–52 are expected and ignorable; all Xcode builds succeed 0 errors/0 warnings
 - `RecommendationEngine` is `@MainActor class` — new AB block inside `withTaskGroup.addTask` is fine (same pattern as existing async calls there)
 - Each `async let` can only be awaited once — not applicable here (no `async let` added)
-- AB features have `isEstimated = false` by default from `AcousticBrainzService.fetchFeatures` — verify this in implementation
+- `isEstimated = false` on AB features is confirmed from the struct default — no explicit flag-setting needed in the AB block
+- Implement the Deezer fallback as a single `??`-chained `await` expression (as shown in the code block above), not a multi-step `if-let` block
 
 ---
 
 ## Success Criteria
 
 1. Pre-2022 niche tracks with AB data receive `isEstimated = false` features from Stage 1 without a librosa call
-2. Modern niche tracks without iTunes previews but with Deezer previews receive preview URLs and qualify for Stage 2
-3. Stage 2 runs up to 10 librosa enrichments per search
-4. Build: 0 errors, 0 warnings (SourceKit false positives excluded)
-5. No regression: mainstream track searches return same quality or better (all three changes are additive — AB hits improve pre-2022 tracks, Deezer fills gaps, Stage 2 expansion only benefits when more slots are available)
+2. An AB-enriched candidate (`isEstimated = false`) does not appear in the Stage 2 `librosaTargets` array — confirmed by Stage 2's `isEstimated != false` guard at line 1415
+3. Modern niche tracks without iTunes previews but with Deezer previews receive preview URLs and qualify for Stage 2
+4. Stage 2 runs up to 10 librosa enrichments per search
+5. Build: 0 errors, 0 warnings (SourceKit false positives excluded)
+6. No regression: mainstream track searches return same quality or better (all three changes are additive — AB hits improve pre-2022 tracks, Deezer fills gaps, Stage 2 expansion only benefits when more slots are available)
 
 ---
 
@@ -171,5 +179,5 @@ func fetchPreviewURL(title: String, artist: String) async -> String?
 
 - Proactive DCLAP catalog building (Spec C)
 - Changing the 0.62 similarity threshold in `enrichWithABFeatures`
-- Supabase write-back for AB features (could be added later; not in scope here)
+- Supabase write-back for AB features — every search for the same pre-2022 candidate repeats MBID lookup + AB fetch; track as a future optimization (cache AB results to Supabase on first hit, same as librosa at line 1469)
 - Rate-limit stagger for AB/MBID lookups (both services handle their own error paths)
