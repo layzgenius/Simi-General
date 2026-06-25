@@ -1498,7 +1498,10 @@ class RecommendationEngine: ObservableObject {
         let updates: [(Int, String)] = await withTaskGroup(of: (Int, String?).self) { group in
             for item in needsURL {
                 group.addTask {
-                    let url = await self.itunesService.fetchPreviewURL(title: item.title, artist: item.artist)
+                    var url = await self.itunesService.fetchPreviewURL(title: item.title, artist: item.artist)
+                    if url == nil {
+                        url = await self.deezerService.fetchPreviewURL(title: item.title, artist: item.artist)
+                    }
                     return (item.index, url)
                 }
             }
