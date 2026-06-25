@@ -16,7 +16,7 @@
 - SourceKit false positives at lines 33–52 of `RecommendationEngine.swift` ("Cannot find type X in scope") are expected, always present, and ignorable — build still succeeds with 0 real errors / 0 warnings
 - `RecommendationEngine` is `@MainActor class` — all new code runs inside existing `withTaskGroup.addTask` closures, which is correct
 - `AcousticBrainzService.fetchFeatures(mbid:)` returns `AudioFeatures` with `isEstimated = false` by default (confirmed: `AudioFeatures.isEstimated: Bool = false` in `Song.swift` line 43) — no explicit flag-setting needed in the AB block
-- Deezer fallback must be a single `??`-chained `await` expression — not a multi-step `if-let` block
+- Deezer fallback uses `var url = await iTunes...; if url == nil { url = await Deezer... }` — Swift's `??` operator uses `@autoclosure` which does not support `async`, so `await X ?? (await Y)` does not compile
 - All commits go in the inner Swift repo at `Simi/` (not the outer docs repo at `Simi App/`)
 - Build command: `cd "/Users/skips/Documents/Claude/Projects/Simi App/Simi" && xcodebuild build -project Simi.xcodeproj -scheme Simi -destination 'platform=iOS Simulator,name=iPhone 16' 2>&1 | tail -5`
 - Expected build output: `** BUILD SUCCEEDED **`
@@ -46,7 +46,7 @@ Read `Simi/Simi/Services/RecommendationEngine.swift` lines 1498–1510. Confirm 
 ```
 If you see this, proceed. If the code differs, stop and report before making any change.
 
-- [ ] **Step 2: Add the Deezer fallback chain at lines 1501–1502**
+- [ ] **Step 2: Add the Deezer fallback at lines 1501–1502**
 
 Replace lines 1501–1502:
 ```swift
@@ -55,12 +55,14 @@ Replace lines 1501–1502:
 ```
 With:
 ```swift
-                    let url = await self.itunesService.fetchPreviewURL(title: item.title, artist: item.artist)
-                        ?? (await self.deezerService.fetchPreviewURL(title: item.title, artist: item.artist))
+                    var url = await self.itunesService.fetchPreviewURL(title: item.title, artist: item.artist)
+                    if url == nil {
+                        url = await self.deezerService.fetchPreviewURL(title: item.title, artist: item.artist)
+                    }
                     return (item.index, url)
 ```
 
-The `??` chain fires the Deezer call only when iTunes returns `nil`. `deezerService` is already declared at line 48 — no new property needed.
+Note: `await X ?? (await Y)` does not compile in Swift — `??` uses `@autoclosure` which cannot contain `await`. The `var url + if url == nil` pattern is the correct Swift idiom with identical short-circuit semantics. `deezerService` is already declared at line 48 — no new property needed.
 
 - [ ] **Step 3: Build and verify**
 

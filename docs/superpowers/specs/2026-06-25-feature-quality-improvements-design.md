@@ -37,10 +37,14 @@ return (item.index, url)
 
 **New behavior:**
 ```swift
-let url = await self.itunesService.fetchPreviewURL(title: item.title, artist: item.artist)
-    ?? (await self.deezerService.fetchPreviewURL(title: item.title, artist: item.artist))
+var url = await self.itunesService.fetchPreviewURL(title: item.title, artist: item.artist)
+if url == nil {
+    url = await self.deezerService.fetchPreviewURL(title: item.title, artist: item.artist)
+}
 return (item.index, url)
 ```
+
+**Why not `??`:** Swift's `??` operator takes its right-hand operand as `@autoclosure`, which does not propagate the `async` context. Writing `await X ?? (await Y)` produces a compiler error: `'async' call in an autoclosure that does not support concurrency`. The `var url + if url == nil` pattern is the correct Swift idiom for chaining two async optional-returning calls with short-circuit semantics.
 
 `deezerService` is already an instance property at line 48 (`private let deezerService = DeezerService()`). `fetchPreviewURL(title:artist:)` is non-throwing and returns `String?`. The Deezer call fires only on iTunes miss — zero overhead for candidates iTunes covers.
 
