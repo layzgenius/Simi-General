@@ -1417,7 +1417,7 @@ class RecommendationEngine: ObservableObject {
         }
 
         let librosaTargets = recommendations
-            .prefix(5)
+            .prefix(10)
             .enumerated()
             .compactMap { (i, song) -> (index: Int, url: String)? in
                 guard let url = song.previewURL,
