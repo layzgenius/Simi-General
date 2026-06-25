@@ -48,7 +48,7 @@ class RecommendationEngine: ObservableObject {
     private let deezerService       = DeezerService()
     private let musicBrainzService  = MusicBrainzService()
     private let listenBrainzService = ListenBrainzService()
-    // acousticBrainzService removed — AB deprecated 2022, disabled in fetchAudioFeaturesWithFallback
+    private let acousticBrainzService = AcousticBrainzService()
     private let itunesService       = iTunesService()
     private let getSongBPMService   = GetSongBPMService()
     private let simiAudioService    = SimiAudioService.shared
@@ -1307,7 +1307,16 @@ class RecommendationEngine: ObservableObject {
                         return (index, cached)
                     }
 
-                    // ── Priority 2: tag estimation ──
+                    // ── Priority 2: AcousticBrainz (pre-2022 real measurements) ──
+                    // MBID lookup short-circuits on miss for modern tracks (one fast indexed GET).
+                    // AB fetch only fires on MBID hit. Returns isEstimated=false by default.
+                    if let mbid = await self.listenBrainzService.resolveACRMBID(title: song.title, artist: song.artist),
+                       let abFeatures = await self.acousticBrainzService.fetchFeatures(mbid: mbid) {
+                        simiLog("✅ AcousticBrainz features: \"\(song.title)\"")
+                        return (index, abFeatures)
+                    }
+
+                    // ── Priority 3: tag estimation ──
                     // Stagger requests to respect Last.fm rate limits.
                     // Capped at index 15 (300ms max) — was unbounded × 20ms (760ms for song 38).
                     if index > 0 {
