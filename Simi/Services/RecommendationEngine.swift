@@ -1294,9 +1294,9 @@ class RecommendationEngine: ObservableObject {
         // Fill preview URLs so the audio player can play songs.
         await fillMissingPreviewURLs()
 
-        var tagUpdates: [(index: Int, features: AudioFeatures)] = []
+        var tagUpdates: [(index: Int, features: AudioFeatures, genre: Genre?)] = []
 
-        await withTaskGroup(of: (Int, AudioFeatures?).self) { group in
+        await withTaskGroup(of: (Int, AudioFeatures?, Genre?).self) { group in
             for (index, song) in snapshot.enumerated() {
                 group.addTask {
                     // ── Priority 1: Supabase feature cache ──
@@ -1304,7 +1304,7 @@ class RecommendationEngine: ObservableObject {
                     // entirely for them. No stagger needed — cache hit is a single indexed read.
                     if let cached = await self.supabase.lookupFeatures(title: song.title, artist: song.artist) {
                         simiLog("✅ Supabase cache hit (enrichment): \"\(song.title)\"")
-                        return (index, cached)
+                        return (index, cached, nil)
                     }
 
                     // ── Priority 2: AcousticBrainz (pre-2022 real measurements) ──
@@ -1313,7 +1313,7 @@ class RecommendationEngine: ObservableObject {
                     if let mbid = await self.listenBrainzService.resolveACRMBID(title: song.title, artist: song.artist),
                        let abFeatures = await self.acousticBrainzService.fetchFeatures(mbid: mbid) {
                         simiLog("✅ AcousticBrainz features: \"\(song.title)\"")
-                        return (index, abFeatures)
+                        return (index, abFeatures, nil)
                     }
 
                     // ── Priority 3: tag estimation ──
@@ -1327,9 +1327,13 @@ class RecommendationEngine: ObservableObject {
                         title: song.title, artist: song.artist
                     )
                     guard var estimated = await self.estimateFeaturesFromTags(tags) else {
-                        return (index, nil)
+                        return (index, nil, nil)
                     }
                     simiLog("🏷️ Tag-estimated features for \"\(song.title)\": \(tags.prefix(3).joined(separator: ", "))")
+
+                    // Derive this candidate's own genre from its Last.fm tags so the
+                    // genre family penalty in computeSimilarity has real target data.
+                    let targetGenre = await self.genresFromRawTags(tags).first
 
                     // Fetch musical key from GetSongBPM — makes the Same Key filter work.
                     // Capped to top 20 songs: protects the 500 req/day quota and keeps
@@ -1361,13 +1365,13 @@ class RecommendationEngine: ObservableObject {
                         simiLog("🎵 Key from GetSongBPM: \(keyLabel) \(modeName) for \"\(song.title)\"")
                     }
 
-                    return (index, estimated)
+                    return (index, estimated, targetGenre)
                 }
             }
 
-            for await (index, features) in group {
+            for await (index, features, genre) in group {
                 guard let features = features else { continue }
-                tagUpdates.append((index: index, features: features))
+                tagUpdates.append((index: index, features: features, genre: genre))
             }
         }
 
@@ -1375,9 +1379,15 @@ class RecommendationEngine: ObservableObject {
         var enrichedCount = 0
         for update in tagUpdates {
             guard update.index < recommendations.count else { continue }
+            // Store the candidate's own genre derived from its Last.fm tags so the genre
+            // penalty has real target data and the UI shows the correct genre label.
+            if let tg = update.genre {
+                recommendations[update.index].genre = tg
+            }
+            let targetGenre = recommendations[update.index].genre
             let (score, reasons) = seedFeatures.count > 1
-                ? computeSimilarityMultiSeed(seeds: seedFeatures, target: update.features, genres: genres)
-                : computeSimilarity(source: sourceFeatures, target: update.features, genres: genres)
+                ? computeSimilarityMultiSeed(seeds: seedFeatures, target: update.features, genres: genres, targetGenre: targetGenre)
+                : computeSimilarity(source: sourceFeatures, target: update.features, genres: genres, targetGenre: targetGenre)
             recommendations[update.index].audioFeatures   = update.features
             recommendations[update.index].similarityScore = score
             recommendations[update.index].matchReasons    = reasons
@@ -1386,7 +1396,7 @@ class RecommendationEngine: ObservableObject {
                 source: explanationSource,
                 target: update.features,
                 sourceGenres: genres,
-                targetGenre: recommendations[update.index].genre
+                targetGenre: targetGenre
             )
             enrichedCount += 1
         }
@@ -1459,9 +1469,10 @@ class RecommendationEngine: ObservableObject {
             for (idx, features) in batchResults {
                 guard let features, idx < recommendations.count else { continue }
                 let song = recommendations[idx]
+                let targetGenre = recommendations[idx].genre
                 let (score, reasons) = seedFeatures.count > 1
-                    ? computeSimilarityMultiSeed(seeds: seedFeatures, target: features, genres: genres)
-                    : computeSimilarity(source: sourceFeatures, target: features, genres: genres)
+                    ? computeSimilarityMultiSeed(seeds: seedFeatures, target: features, genres: genres, targetGenre: targetGenre)
+                    : computeSimilarity(source: sourceFeatures, target: features, genres: genres, targetGenre: targetGenre)
                 recommendations[idx].audioFeatures   = features
                 recommendations[idx].similarityScore = score
                 recommendations[idx].matchReasons    = reasons
@@ -1835,10 +1846,48 @@ class RecommendationEngine: ObservableObject {
     // Danceability still carries weight because it separates slow jams from club tracks even
     // when both have warm valence — the critical failure mode within warm-valence genres like R&B.
     // BPM tolerance widened to ±60 so songs at very different tempos can match on emotional feel.
+    // Maps a genre name to a broad family bucket used for cross-genre penalty.
+    private func genreFamily(_ genreName: String) -> String {
+        let g = genreName.lowercased()
+        if g.contains("hip") || g.contains("hop") || g.contains("rap") || g.contains("trap") || g.contains("drill") || g.contains("grime") { return "hiphop" }
+        if g.contains("r&b") || g.contains("rnb") || g.contains("soul") || g.contains("funk") { return "rnb" }
+        if g.contains("rock") || g.contains("indie") || g.contains("alternative") || g.contains("punk") || g.contains("grunge") || g.contains("shoegaze") || g.contains("emo") { return "rock" }
+        if g.contains("metal") || g.contains("hardcore") || g.contains("screamo") { return "metal" }
+        if g.contains("electronic") || g.contains("edm") || g.contains("house") || g.contains("techno") || g.contains("ambient") || g.contains("dubstep") || g.contains("trance") { return "electronic" }
+        if g.contains("jazz") || g.contains("blues") { return "jazz" }
+        if g.contains("classical") || g.contains("orchestral") || g.contains("opera") { return "classical" }
+        if g.contains("country") || g.contains("folk") || g.contains("bluegrass") || g.contains("americana") { return "country" }
+        if g.contains("latin") || g.contains("reggaeton") || g.contains("salsa") { return "latin" }
+        if g.contains("pop") { return "pop" }
+        return "other"
+    }
+
+    // Cross-genre penalty: 0 for same/adjacent families, 0.18 for distant ones.
+    // Applied after all feature scoring so it can push an audio-similar cross-genre
+    // candidate below a slightly-lower-scoring same-genre candidate.
+    private func genrePenalty(sourceGenres: [Genre], targetGenre: Genre) -> Double {
+        let targetFamily = genreFamily(targetGenre.main)
+        guard targetFamily != "other" && targetFamily != "unknown" else { return 0 }
+        let sourceFamilies = Set(sourceGenres.map { genreFamily($0.main) })
+        guard !sourceFamilies.contains("other") else { return 0 }
+        if sourceFamilies.contains(targetFamily) { return 0 }
+        // Pairs that are culturally/sonically adjacent — small friction only
+        let adjacent: Set<Set<String>> = [
+            ["hiphop", "rnb"], ["hiphop", "pop"], ["rnb", "pop"],
+            ["pop", "electronic"], ["rock", "metal"], ["rock", "pop"],
+            ["country", "folk"],
+        ]
+        for family in sourceFamilies {
+            if adjacent.contains([family, targetFamily]) { return 0.06 }
+        }
+        return 0.18  // distant families: indie rock ≠ trap, classical ≠ hip-hop, etc.
+    }
+
     private func computeSimilarity(
         source: AudioFeatures,
         target: AudioFeatures?,
-        genres: [Genre]
+        genres: [Genre],
+        targetGenre: Genre? = nil
     ) -> (Double, [MatchReason]) {
         guard let target = target else {
             return (0.5, [.genre])
@@ -2052,6 +2101,18 @@ class RecommendationEngine: ObservableObject {
             totalScore = min(1.0, totalScore / usedWeight)
         }
 
+        // Genre family penalty — fires when we know the target's actual genre and it
+        // belongs to a different sonic family from the source (e.g. indie rock vs trap).
+        // Applied after feature scoring so it overrides audio similarities that are
+        // coincidental rather than stylistic.
+        if let tg = targetGenre, !genres.isEmpty {
+            let penalty = genrePenalty(sourceGenres: genres, targetGenre: tg)
+            if penalty > 0 {
+                simiLog("🚫 Genre penalty \(String(format: "%.2f", penalty)): \(genres.first?.main ?? "?") → \(tg.main)")
+                totalScore = max(0, totalScore - penalty)
+            }
+        }
+
         // Confidence adjustment: tag-estimated features cluster near genre centroids,
         // so raw diff scores overstate precision (e.g. "trap" vs "trap" → 0.87 from
         // identical centroid values). Compress toward 0.65 proportional to how much
@@ -2096,18 +2157,19 @@ class RecommendationEngine: ObservableObject {
     private func computeSimilarityMultiSeed(
         seeds: [AudioFeatures],
         target: AudioFeatures?,
-        genres: [Genre]
+        genres: [Genre],
+        targetGenre: Genre? = nil
     ) -> (Double, [MatchReason]) {
         guard !seeds.isEmpty else { return (0.5, [.genre]) }
         guard seeds.count > 1 else {
-            return computeSimilarity(source: seeds[0], target: target, genres: genres)
+            return computeSimilarity(source: seeds[0], target: target, genres: genres, targetGenre: targetGenre)
         }
 
         var totalScore = 0.0
         var reasonFrequency: [MatchReason: Int] = [:]
 
         for seed in seeds {
-            let (score, reasons) = computeSimilarity(source: seed, target: target, genres: genres)
+            let (score, reasons) = computeSimilarity(source: seed, target: target, genres: genres, targetGenre: targetGenre)
             totalScore += score
             for reason in reasons {
                 reasonFrequency[reason, default: 0] += 1
