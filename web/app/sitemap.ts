@@ -4,14 +4,18 @@ import { createClient } from "@/lib/supabase"
 export const revalidate = 3600
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
-  const supabase = createClient()
+  let songs: { spotify_id: string }[] = []
 
-  const { data: songs = [] } = await supabase
-    .from("analyzed_songs")
-    .select("spotify_id")
-    .limit(5000)
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+    const supabase = createClient()
+    const { data } = await supabase
+      .from("analyzed_songs")
+      .select("spotify_id")
+      .limit(5000)
+    songs = data ?? []
+  }
 
-  const songUrls: MetadataRoute.Sitemap = (songs ?? []).map((s: { spotify_id: string }) => ({
+  const songUrls: MetadataRoute.Sitemap = songs.map((s: { spotify_id: string }) => ({
     url: `https://simi.app/song/${s.spotify_id}`,
     lastModified: new Date(),
     changeFrequency: "weekly" as const,
