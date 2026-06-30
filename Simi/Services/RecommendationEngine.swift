@@ -1408,10 +1408,10 @@ class RecommendationEngine: ObservableObject {
         let coverageRatio = Double(enrichedCount) / Double(max(1, snapshot.count))
         if coverageRatio >= 0.3 {
             let before = recommendations.count
-            recommendations = recommendations.filter { $0.similarityScore >= 0.62 }
+            recommendations = recommendations.filter { $0.similarityScore >= 0.65 }
             let removed = before - recommendations.count
             if removed > 0 {
-                simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold 0.62)")
+                simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold 0.65)")
             }
         }
 
@@ -1425,7 +1425,7 @@ class RecommendationEngine: ObservableObject {
         }
 
         let librosaTargets = recommendations
-            .prefix(10)
+            .prefix(13)
             .enumerated()
             .compactMap { (i, song) -> (index: Int, url: String)? in
                 guard let url = song.previewURL,
@@ -1490,7 +1490,11 @@ class RecommendationEngine: ObservableObject {
         }
 
         if librosaSucceeded > 0 {
-            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded (positions frozen)")
+            // Re-sort after librosa upgrades scores — measured features can change rankings
+            // significantly vs. tag estimates. Without this, a Stage-2 song that jumps to
+            // 0.93 ("Identical vibe") can sit at position #7 below 70% estimated songs.
+            recommendations.sort { $0.similarityScore > $1.similarityScore }
+            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded, list re-sorted")
         } else {
             simiLog("⚠️ Librosa Stage 2: 0/\(librosaTargets.count) — Railway may be cold or busy")
         }
