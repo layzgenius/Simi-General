@@ -154,7 +154,8 @@ class ExplainResponse(BaseModel):
 
 _SUPABASE_URL  = os.environ.get("SUPABASE_URL", "")
 _SUPABASE_KEY  = os.environ.get("SUPABASE_ANON_KEY", "")
-_LASTFM_KEY    = os.environ.get("LASTFM_API_KEY", "")
+_LASTFM_PROXY_URL = "https://simi-token-proxy.lazyscholarph.workers.dev/lastfm"
+_LASTFM_PROXY_KEY = "0db4b8d62e7b427fed685e73309d33d9473429b54f6854aed1287d3b2c2762a5"
 
 
 async def _supabase_upsert_vector(spotify_id: str, title: str, artist: str, features: AudioFeatures) -> bool:
@@ -201,23 +202,23 @@ async def _warm_artist_catalog(artist: str, skip_title: str) -> None:
     Fires after /analyze returns — never blocks the response.
     No-ops when LASTFM_API_KEY or SUPABASE_URL is absent.
     """
-    if not _LASTFM_KEY or not _SUPABASE_URL or not _SUPABASE_KEY:
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
         return
 
     import httpx as _httpx
 
-    # 1. Fetch top tracks from Last.fm (free, no auth beyond API key)
+    # 1. Fetch top tracks via the Cloudflare Worker proxy (key lives there)
     try:
         async with _httpx.AsyncClient(timeout=8.0) as client:
             r = await client.get(
-                "https://ws.audioscrobbler.com/2.0/",
+                _LASTFM_PROXY_URL,
                 params={
-                    "method":  "artist.getTopTracks",
-                    "artist":  artist,
-                    "api_key": _LASTFM_KEY,
-                    "format":  "json",
-                    "limit":   "5",
+                    "method": "artist.getTopTracks",
+                    "artist": artist,
+                    "format": "json",
+                    "limit":  "5",
                 },
+                headers={"X-Proxy-Key": _LASTFM_PROXY_KEY},
             )
             r.raise_for_status()
             tracks = r.json().get("toptracks", {}).get("track", [])
