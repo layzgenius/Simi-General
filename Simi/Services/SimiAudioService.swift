@@ -33,7 +33,7 @@ class SimiAudioService {
     /// downloading here eliminates the main source of /analyze latency (server-side
     /// CDN fetch taking 5-30s). Returns nil on any failure — caller falls through
     /// to local PreviewAudioAnalyzer + tag estimation.
-    func analyzePreview(url: String) async -> AudioFeatures? {
+    func analyzePreview(url: String, artist: String = "", title: String = "") async -> AudioFeatures? {
         // 1. Download audio on-device (~1-3s from iTunes CDN)
         guard let audioURL = URL(string: url),
               let (audioData, audioResponse) = try? await URLSession.shared.data(from: audioURL),
@@ -42,7 +42,15 @@ class SimiAudioService {
         }
 
         // 2. POST bytes to Railway as multipart/form-data (~1-3s upload + librosa)
-        guard let endpoint = URL(string: "\(baseURL)/analyze-bytes") else { return nil }
+        // Pass artist/title so server fires cascade prefetch for the artist's catalog.
+        var components = URLComponents(string: "\(baseURL)/analyze-bytes")!
+        if !artist.isEmpty {
+            components.queryItems = [
+                URLQueryItem(name: "artist", value: artist),
+                URLQueryItem(name: "title", value: title),
+            ]
+        }
+        guard let endpoint = components.url else { return nil }
 
         let suffix = url.lowercased().contains(".m4a") ? "m4a" : "mp3"
         let mimeType = suffix == "m4a" ? "audio/mp4" : "audio/mpeg"

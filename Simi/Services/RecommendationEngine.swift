@@ -953,7 +953,7 @@ class RecommendationEngine: ObservableObject {
         //    acousticness, instrumentalness, liveness, loudness, key, mode via FFT/chroma/MFCC).
         //    Falls through silently when Railway is unreachable so tag estimation takes over.
         if let previewURL {
-            if let pyFeatures = await simiAudioService.analyzePreview(url: previewURL) {
+            if let pyFeatures = await simiAudioService.analyzePreview(url: previewURL, artist: song.artist, title: song.title) {
                 simiLog("✅ Python audio analyzer: \(song.title) — \(Int(pyFeatures.bpm))BPM energy=\(String(format: "%.2f", pyFeatures.energy)) valence=\(String(format: "%.2f", pyFeatures.valence))")
                 Task { await supabase.storeFeatures(title: song.title, artist: song.artist, features: pyFeatures, source: "librosa") }
                 return pyFeatures
