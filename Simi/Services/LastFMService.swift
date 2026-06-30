@@ -377,6 +377,7 @@ class LastFMService {
             // Hip-hop specific — general to specific
             "boom bap", "cloud rap", "cloud trap", "psychedelic trap", "dark trap",
             "melodic trap", "melodic rap", "emo trap", "emo rap", "rage rap",
+            "pop rap", "luxury rap",
             "trap", "drill", "uk drill", "phonk", "grime", "punk rap",
             "alternative hip hop", "alternative rap", "experimental hip hop",
             // Acoustic / singer-songwriter

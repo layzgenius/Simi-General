@@ -2269,6 +2269,26 @@ class RecommendationEngine: ObservableObject {
                 if features.danceability > 0.65 { return ["feel good", "groove"] }
                 return ["feel good"]
             }
+            // Hip-hop genre routing: route by subgenre feel rather than bare "upbeat"/"energetic",
+            // which produce cross-genre noise on Last.fm. This injects melodic-rap / pop-rap
+            // candidates (Aston Martin Music, Devil In A New Dress) that the social graph misses.
+            let genreMain = genreTags.first?.main.lowercased() ?? ""
+            let isHipHop = genreMain.contains("hip") || genreMain.contains("hop") ||
+                           genreMain.contains("rap") || genreMain.contains("trap")
+            if isHipHop {
+                let v = features.valence
+                let d = features.danceability
+                if v >= 0.65 && d < 0.68 {
+                    // Bright, polished, mid-danceability: pop rap / luxury rap (Fancy, Aston Martin Music)
+                    return ["pop rap", "melodic rap"]
+                } else if v >= 0.65 {
+                    // Bright + very danceable: party rap / feel-good rap
+                    return ["melodic rap", "feel good"]
+                } else {
+                    // High energy but not as bright: trap-leaning but still hype
+                    return ["melodic trap", "energetic"]
+                }
+            }
             return ["upbeat", "energetic"]                        // genuinely bright AND energetic: pop, dance
         }()
 
