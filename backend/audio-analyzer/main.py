@@ -343,11 +343,17 @@ async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks,
 
 
 @app.post("/analyze-bytes", response_model=AudioFeatures)
-async def analyze_bytes_endpoint(file: UploadFile = File(...)) -> AudioFeatures:
+async def analyze_bytes_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    artist: str = "",
+    title: str = "",
+) -> AudioFeatures:
     """
     Analyzes pre-downloaded audio bytes POSTed as multipart/form-data.
     iOS downloads the preview URL on-device (fast CDN routing) and sends
     the raw bytes here — eliminates server-side CDN download latency.
+    Pass artist + title query params to trigger cascade prefetch of artist's catalog.
     """
     audio_bytes = await file.read()
     filename = file.filename or ""
@@ -357,7 +363,7 @@ async def analyze_bytes_endpoint(file: UploadFile = File(...)) -> AudioFeatures:
     if features is None:
         raise HTTPException(status_code=422, detail="Audio analysis failed")
 
-    return AudioFeatures(
+    result = AudioFeatures(
         bpm=features.bpm,
         energy=features.energy,
         valence=features.valence,
@@ -388,6 +394,11 @@ async def analyze_bytes_endpoint(file: UploadFile = File(...)) -> AudioFeatures:
         valenceEssentia=features.valence_essentia,
         dclapEmbedding=features.dclap_embedding,
     )
+
+    if artist:
+        background_tasks.add_task(_warm_artist_catalog, artist, title)
+
+    return result
 
 
 @app.post("/batch-analyze")
