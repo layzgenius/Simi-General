@@ -277,6 +277,21 @@ struct SongCard: View {
                 .accessibilityHidden(true)
                 .allowsHitTesting(false)
             }
+            // ── Match explanation tagline (collapsed-only teaser) ──
+            if !isExpanded,
+               let explanation = song.matchExplanation,
+               !explanation.rows.isEmpty {
+                Text(explanation.rows.prefix(2).map(\.descriptor).joined(separator: " · "))
+                    .font(.simiMicro)
+                    .foregroundColor(.simiSubtext)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10)
+                    .transition(.opacity)
+                    .accessibilityHidden(true)
+            }
 
             // ── Genre bridge ──
             if let bridge = song.matchExplanation?.genreBridgeLabel, !bridge.isEmpty {
