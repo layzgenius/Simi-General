@@ -4,9 +4,8 @@
 // Client for the Railway-hosted librosa audio analysis microservice.
 // Source: backend/audio-analyzer/ — deployed to simi-audio-analyzer-production.up.railway.app
 //
-// This is the primary audio feature source. /analyze downloads a 30-second preview
-// and returns full measured BPM, energy, valence, danceability, acousticness,
-// instrumentalness, liveness, loudness, key, and mode via FFT/chroma/MFCC.
+// Primary audio feature source. iOS downloads the preview on-device, then POSTs
+// the raw bytes to /analyze-bytes — faster than having Railway fetch from Apple CDN.
 // Falls through silently when Railway is unreachable — tag estimation takes over.
 
 import Foundation
@@ -21,7 +20,7 @@ class SimiAudioService {
 
     private init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 25.0   // librosa analysis takes ~3–8s
+        config.timeoutIntervalForRequest = 45.0   // download + upload + librosa can reach ~30s
         session = URLSession(configuration: config)
     }
 
@@ -29,19 +28,37 @@ class SimiAudioService {
     // MARK: - /analyze
     // ──────────────────────────────────────────────
 
-    /// Downloads the preview URL and extracts full audio features via librosa.
-    /// Returns nil if the service is unreachable or analysis fails — the caller
-    /// should fall through to the existing tag estimation path.
+    /// Downloads the preview URL on-device then POSTs the raw bytes to /analyze-bytes.
+    /// iOS has faster CDN routing to Apple/iTunes servers than Railway does, so
+    /// downloading here eliminates the main source of /analyze latency (server-side
+    /// CDN fetch taking 5-30s). Returns nil on any failure — caller falls through
+    /// to local PreviewAudioAnalyzer + tag estimation.
     func analyzePreview(url: String) async -> AudioFeatures? {
-        guard let endpoint = URL(string: "\(baseURL)/analyze") else { return nil }
+        // 1. Download audio on-device (~1-3s from iTunes CDN)
+        guard let audioURL = URL(string: url),
+              let (audioData, audioResponse) = try? await URLSession.shared.data(from: audioURL),
+              (audioResponse as? HTTPURLResponse)?.statusCode == 200 else {
+            return nil
+        }
 
-        let body = ["previewUrl": url]
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        // 2. POST bytes to Railway as multipart/form-data (~1-3s upload + librosa)
+        guard let endpoint = URL(string: "\(baseURL)/analyze-bytes") else { return nil }
+
+        let suffix = url.lowercased().contains(".m4a") ? "m4a" : "mp3"
+        let mimeType = suffix == "m4a" ? "audio/mp4" : "audio/mpeg"
+        let boundary = "simi-\(UUID().uuidString)"
+
+        var body = Data()
+        body.appendString("--\(boundary)\r\n")
+        body.appendString("Content-Disposition: form-data; name=\"file\"; filename=\"audio.\(suffix)\"\r\n")
+        body.appendString("Content-Type: \(mimeType)\r\n\r\n")
+        body.append(audioData)
+        body.appendString("\r\n--\(boundary)--\r\n")
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = bodyData
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
 
         guard let (data, response) = try? await session.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200 else {
@@ -68,7 +85,7 @@ class SimiAudioService {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 90.0   // 12 songs × ~7s worst-case with semaphore
+        request.timeoutInterval = 90.0   // Railway downloading + librosa on 5-20 tracks
         request.httpBody = bodyData
 
         guard let (data, response) = try? await session.data(for: request),
@@ -140,5 +157,23 @@ class SimiAudioService {
         request.timeoutInterval = 3.0
         guard let (_, response) = try? await session.data(for: request) else { return false }
         return (response as? HTTPURLResponse)?.statusCode == 200
+    }
+
+    /// Warms up the Railway container and returns whether it responded in time.
+    /// Call this at enrichment start (concurrent with tag estimation) so cold-start
+    /// time overlaps with Stage 1. Returns false if Railway doesn't respond within
+    /// the deadline — caller should skip batch-analyze rather than immediately timeout.
+    func warmUp() async -> Bool {
+        guard let url = URL(string: "\(baseURL)/health") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 22.0   // Railway cold starts can take up to ~20s
+        guard let (_, response) = try? await session.data(for: request) else { return false }
+        return (response as? HTTPURLResponse)?.statusCode == 200
+    }
+}
+
+private extension Data {
+    mutating func appendString(_ string: String) {
+        if let data = string.data(using: .utf8) { append(data) }
     }
 }
