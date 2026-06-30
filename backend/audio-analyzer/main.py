@@ -27,7 +27,7 @@ import asyncio
 import os
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from audio_analyzer import analyze_from_url, analyze_from_bytes, init_essentia, init_dclap, get_dclap_embedding
@@ -152,8 +152,9 @@ class ExplainResponse(BaseModel):
 # Supabase helper — optional, only wired when env vars are present
 # ─────────────────────────────────────────────
 
-_SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-_SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+_SUPABASE_URL  = os.environ.get("SUPABASE_URL", "")
+_SUPABASE_KEY  = os.environ.get("SUPABASE_ANON_KEY", "")
+_LASTFM_KEY    = os.environ.get("LASTFM_API_KEY", "")
 
 
 async def _supabase_upsert_vector(spotify_id: str, title: str, artist: str, features: AudioFeatures) -> bool:
@@ -190,21 +191,122 @@ async def _supabase_upsert_vector(spotify_id: str, title: str, artist: str, feat
 
 
 # ─────────────────────────────────────────────
+# Cascade prefetch — warms artist catalog after a successful analysis
+# ─────────────────────────────────────────────
+
+async def _warm_artist_catalog(artist: str, skip_title: str) -> None:
+    """
+    Background task: fetch the artist's top tracks from Last.fm, resolve
+    iTunes preview URLs, and analyze any not already in Supabase.
+    Fires after /analyze returns — never blocks the response.
+    No-ops when LASTFM_API_KEY or SUPABASE_URL is absent.
+    """
+    if not _LASTFM_KEY or not _SUPABASE_URL or not _SUPABASE_KEY:
+        return
+
+    import httpx as _httpx
+
+    # 1. Fetch top tracks from Last.fm (free, no auth beyond API key)
+    try:
+        async with _httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(
+                "https://ws.audioscrobbler.com/2.0/",
+                params={
+                    "method":  "artist.getTopTracks",
+                    "artist":  artist,
+                    "api_key": _LASTFM_KEY,
+                    "format":  "json",
+                    "limit":   "5",
+                },
+            )
+            r.raise_for_status()
+            tracks = r.json().get("toptracks", {}).get("track", [])
+    except Exception as e:
+        print(f"⚠️  Last.fm top tracks failed for {artist!r}: {e}")
+        return
+
+    for track in tracks:
+        title = track.get("name", "")
+        if not title or title.lower() == skip_title.lower():
+            continue
+
+        # 2. Check Supabase — skip if already cached
+        try:
+            async with _httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(
+                    f"{_SUPABASE_URL}/rest/v1/analyzed_songs",
+                    params={"title": f"eq.{title}", "artist": f"eq.{artist}", "select": "title", "limit": "1"},
+                    headers={"apikey": _SUPABASE_KEY, "Authorization": f"Bearer {_SUPABASE_KEY}"},
+                )
+                if r.json():
+                    continue  # already cached
+        except Exception:
+            continue
+
+        # 3. Resolve iTunes preview URL
+        try:
+            async with _httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.get(
+                    "https://itunes.apple.com/search",
+                    params={"term": f"{title} {artist}", "media": "music", "limit": "1"},
+                )
+                items = r.json().get("results", [])
+                preview_url = items[0].get("previewUrl") if items else None
+        except Exception:
+            preview_url = None
+
+        if not preview_url:
+            continue
+
+        # 4. Analyze and results are stored by the caller — we just compute
+        try:
+            from audio_analyzer import analyze_from_url as _analyze
+            features = await _analyze(preview_url)
+            if features is None:
+                continue
+            # Store in Supabase (no spotify_id available here — use title+artist key)
+            from similarity_engine import build_embedding
+            emb = build_embedding(features.__dict__)
+            emb_str = "[" + ",".join(f"{v:.6f}" for v in emb) + "]"
+            payload = {"title": title, "artist": artist, "embedding": emb_str,
+                       "features": features.__dict__}
+            async with _httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{_SUPABASE_URL}/rest/v1/analyzed_songs",
+                    json=payload,
+                    headers={
+                        "apikey": _SUPABASE_KEY,
+                        "Authorization": f"Bearer {_SUPABASE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "resolution=merge-duplicates",
+                    },
+                )
+            print(f"✅ Prefetch cached: {title} by {artist}")
+        except Exception as e:
+            print(f"⚠️  Prefetch failed for {title!r}: {e}")
+
+
+# ─────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────
 
 @app.post("/analyze", response_model=AudioFeatures)
-async def analyze(req: AnalyzeRequest) -> AudioFeatures:
+async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks,
+                  artist: str = "", title: str = "") -> AudioFeatures:
     """
-    Downloads the 30-second preview and extracts full audio features via librosa.
+    Downloads the first 15 seconds of the preview and extracts full audio features.
     Returns immediately with measured BPM, energy, valence, danceability,
     acousticness, instrumentalness, liveness, loudness, key, and mode.
     isEstimated=false (real FFT/chroma/MFCC analysis — not a tag guess),
     isKeyEstimated=false (Krumhansl-Schmuckler pitch class detection is real signal).
+    Pass artist + title query params to trigger cascade prefetch of artist's catalog.
     """
     features = await analyze_from_url(req.previewUrl)
     if features is None:
         raise HTTPException(status_code=422, detail="Audio analysis failed — check the URL and ensure ffmpeg is installed for M4A support")
+
+    if artist:
+        background_tasks.add_task(_warm_artist_catalog, artist, title)
 
     return AudioFeatures(
         bpm=features.bpm,

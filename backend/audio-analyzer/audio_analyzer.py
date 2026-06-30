@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import threading
 import urllib.request
 import warnings
 import numpy as np
@@ -584,19 +585,27 @@ def _extract_extended(y: np.ndarray, sr: int,
 
 async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
     """
-    Download an iTunes (or any) 30-second audio preview and extract
+    Download the first 15 seconds of an iTunes/Deezer preview and extract
     a full AudioFeatures struct compatible with Simi's iOS models.
+    Uses HTTP Range requests to halve download volume (~240KB vs ~480KB).
     Download is async; CPU-bound librosa work runs in a thread pool executor
     so the event loop is never blocked.
     """
+    # 128kbps MP3: ~16KB/s → 15s ≈ 240KB. Range is a hint; some CDNs round up.
+    _PARTIAL_BYTES = 240_000
     try:
         async with httpx.AsyncClient(
             timeout=15.0,
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Range": f"bytes=0-{_PARTIAL_BYTES}",
+            },
         ) as client:
             resp = await client.get(preview_url)
-            resp.raise_for_status()
+            # 206 Partial Content = range request honoured; 200 = full file (CDN ignored Range)
+            if resp.status_code not in (200, 206):
+                resp.raise_for_status()
             audio_bytes = resp.content
     except Exception as e:
         print(f"❌ Download failed for {preview_url!r}: {e}")
