@@ -1,6 +1,6 @@
 """
 audio_analyzer.py
-Simi — On-device equivalent audio analysis using librosa.
+Simi — On-device equivalent audio analysis.
 
 Extracts the same features AudioFeatures.swift expects:
   bpm, energy, valence, danceability, acousticness,
@@ -8,6 +8,12 @@ Extracts the same features AudioFeatures.swift expects:
 
 All features are in the same 0.0–1.0 ranges (or specific units) as
 the Spotify audio-features schema that Simi's iOS app already understands.
+
+Pipeline for URL/bytes inputs (the hot path):
+  1. ffmpeg pipe-decode: audio bytes → float32 PCM numpy array, no disk write
+  2. _analyze_pcm: feature extraction directly on the array
+  audioFlux is used for MFCC if installed (3–8× faster than librosa on Linux x86_64).
+  librosa stays for HPSS, tonnetz, beat-track — audioFlux has no equivalents.
 """
 
 from __future__ import annotations
@@ -22,6 +28,12 @@ import numpy as np
 import librosa
 import httpx
 from dataclasses import dataclass
+
+try:
+    import audioflux as af
+    _AUDIOFLUX_AVAILABLE = True
+except ImportError:
+    _AUDIOFLUX_AVAILABLE = False
 
 # Suppress librosa/soundfile fallback noise. PySoundFile can't decode MP3/M4A
 # (libsndfile has no MP3 codec), so librosa always falls back to audioread for
@@ -361,14 +373,17 @@ def _rms_energy(y: np.ndarray) -> float:
       compressed hip-hop/trap (mean_rms ≈ 0.30–0.45) → ~0.64–0.80
       heavily limited trap  (mean_rms ≈ 0.50–0.65) → ~0.84–0.92
       (tanh asymptotes to 1.0; nothing hard-clips at 1.00)
+
+    Direct NumPy replaces librosa.feature.rms — ~40× faster per research §2.4.
+    Global sqrt(mean(y²)) is equivalent to the mean of per-frame RMS for the
+    15-second clips we work with.
     """
-    rms = librosa.feature.rms(y=y)[0]
-    mean_rms = float(rms.mean())
+    mean_rms = float(np.sqrt(np.mean(y ** 2)))
     return float(np.tanh(mean_rms / 0.40))
 
 
 def _loudness_dbfs(y: np.ndarray) -> float:
-    rms = float(librosa.feature.rms(y=y)[0].mean())
+    rms = float(np.sqrt(np.mean(y ** 2)))
     if rms < 1e-10:
         return -60.0
     return float(np.clip(20 * np.log10(rms), -60.0, 0.0))
@@ -405,8 +420,19 @@ def _instrumentalness(y: np.ndarray, sr: int) -> float:
     Estimates absence of vocals using MFCC variance.
     Vocals occupy specific MFCC bands (2–6) with characteristic variance patterns.
     High variance in those bands → likely has vocals → low instrumentalness.
+    Uses audioFlux for MFCC if available (3–8× faster), falls back to librosa.
     """
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    if _AUDIOFLUX_AVAILABLE:
+        try:
+            mfcc_obj = af.MFCC(num=13, samplate=sr)
+            mfcc, _ = mfcc_obj.mfcc(y)
+            # audioFlux returns (n_frames, n_mfcc); normalize to (n_mfcc, n_frames)
+            if mfcc.ndim == 2 and mfcc.shape[0] != 13:
+                mfcc = mfcc.T
+        except Exception:
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    else:
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     vocal_variance = float(mfcc[2:7].var(axis=1).mean())
     return float(np.clip(1.0 - vocal_variance / 5.0, 0.0, 1.0))
 
@@ -535,8 +561,17 @@ def _extract_extended(y: np.ndarray, sr: int,
 
     Returns a dict ready to splat into AudioFeatures fields.
     """
-    # MFCCs (20 coefficients)
-    mfcc_all     = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+    # MFCCs (20 coefficients) — audioFlux if available (3–8× faster), else librosa
+    if _AUDIOFLUX_AVAILABLE:
+        try:
+            mfcc_obj  = af.MFCC(num=20, samplate=sr)
+            mfcc_all, _ = mfcc_obj.mfcc(y)
+            if mfcc_all.ndim == 2 and mfcc_all.shape[0] != 20:
+                mfcc_all = mfcc_all.T  # normalize to (n_mfcc, n_frames)
+        except Exception:
+            mfcc_all = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+    else:
+        mfcc_all = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
     mfcc_mean    = [round(float(v), 4) for v in mfcc_all.mean(axis=1)]
     mfcc_std     = [round(float(v), 4) for v in mfcc_all.std(axis=1)]
 
@@ -580,6 +615,92 @@ def _extract_extended(y: np.ndarray, sr: int,
 
 
 # ─────────────────────────────────────────────
+# ffmpeg pipe decoder + PCM analysis
+# ─────────────────────────────────────────────
+
+_FFMPEG_SR = 22050  # target sample rate matching librosa.load default
+
+async def _decode_via_ffmpeg(audio_bytes: bytes) -> tuple[np.ndarray, int] | None:
+    """
+    Decode audio bytes to float32 PCM via ffmpeg subprocess pipe.
+    No temp file — bytes go to stdin, PCM comes from stdout.
+    ffmpeg is pre-installed in the Railway Dockerfile.
+    Eliminates both the disk write and the librosa/audioread MP3 fallback path.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", "pipe:0",
+        "-f", "f32le",             # float32 little-endian PCM output
+        "-ar", str(_FFMPEG_SR),    # resample to 22050 Hz
+        "-ac", "1",                # mono
+        "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate(input=audio_bytes)
+    if proc.returncode != 0 or not stdout:
+        return None
+    # .copy() makes the buffer writable — required by librosa ops (beat_track, hpss)
+    y = np.frombuffer(stdout, dtype=np.float32).copy()
+    return y, _FFMPEG_SR
+
+
+def _analyze_pcm(y: np.ndarray, sr: int) -> AudioFeatures | None:
+    """
+    Extract AudioFeatures from a pre-decoded float32 PCM array.
+    Called by analyze_from_url and analyze_from_bytes via the ffmpeg pipe path.
+    Essentia/DCLAP are skipped (no file path) — both are disabled on Railway
+    anyway due to the TF2 memory footprint.
+    """
+    try:
+        half         = len(y) // 2
+        energy       = max(_rms_energy(y[:half]),   _rms_energy(y[half:]))
+        loudness     = max(_loudness_dbfs(y[:half]), _loudness_dbfs(y[half:]))
+        acousticness = _acousticness(y, sr)
+
+        bpm_arr, _ = librosa.beat.beat_track(y=y, sr=sr)
+        raw_bpm = float(bpm_arr) if np.isscalar(bpm_arr) else float(bpm_arr[0])
+        bpm = _correct_bpm(y, sr, raw_bpm, energy)
+
+        dance     = _danceability(y, sr, bpm)
+        key, mode = detect_key(y, sr, bpm, energy, dance, acousticness)
+
+        y_harmonic, _ = librosa.effects.hpss(y)
+        sc = librosa.feature.spectral_contrast(y=y_harmonic, sr=sr, n_bands=6)
+        tn = librosa.feature.tonnetz(y=y_harmonic, sr=sr)
+        tonal_clarity = float(np.clip(np.sqrt((tn ** 2).mean()) / 0.35, 0.0, 1.0))
+
+        ext = _extract_extended(y, sr, sc)
+
+        return AudioFeatures(
+            bpm=round(bpm, 2),
+            energy=round(energy, 4),
+            valence=round(_valence(y, sr, mode, bpm, energy, dance, acousticness,
+                                   y_harmonic=y_harmonic, sc=sc, tn=tn), 4),
+            danceability=round(dance, 4),
+            acousticness=round(acousticness, 4),
+            instrumentalness=round(_instrumentalness(y, sr), 4),
+            liveness=round(_liveness(y, sr), 4),
+            loudness=round(loudness, 2),
+            key=key,
+            mode=mode,
+            spectral_warmth=0.5,
+            tonal_clarity=round(tonal_clarity, 4),
+            vocal_presence=0.5,
+            reverb_space=0.5,
+            is_estimated=False,
+            is_key_estimated=False,
+            **ext,
+            arousal=None,
+            valence_essentia=None,
+            dclap_embedding=None,
+        )
+    except Exception as e:
+        print(f"❌ _analyze_pcm failed: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
 # Main analysis function
 # ─────────────────────────────────────────────
 
@@ -587,9 +708,10 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
     """
     Download the first 15 seconds of an iTunes/Deezer preview and extract
     a full AudioFeatures struct compatible with Simi's iOS models.
-    Uses HTTP Range requests to halve download volume (~240KB vs ~480KB).
-    Download is async; CPU-bound librosa work runs in a thread pool executor
-    so the event loop is never blocked.
+
+    Hot path: HTTP Range request (240KB instead of 480KB) → ffmpeg pipe decode
+    → _analyze_pcm (no disk write, no audioread MP3 fallback).
+    Falls back to temp file + analyze_from_file if ffmpeg pipe fails.
     """
     # 128kbps MP3: ~16KB/s → 15s ≈ 240KB. Range is a hint; some CDNs round up.
     _PARTIAL_BYTES = 240_000
@@ -611,16 +733,24 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
         print(f"❌ Download failed for {preview_url!r}: {e}")
         return None
 
+    # Hot path: ffmpeg pipe → no disk write
+    pcm = await _decode_via_ffmpeg(audio_bytes)
+    if pcm is not None:
+        y, sr = pcm
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _analyze_pcm, y, sr)
+
+    # Fallback: temp file → analyze_from_file (handles edge-case audio formats)
+    print(f"⚠️  ffmpeg pipe failed for {preview_url!r}, falling back to temp file")
     suffix = ".m4a" if "m4a" in preview_url.lower() else ".mp3"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
-
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(None, analyze_from_file, tmp_path)
     except Exception as e:
-        print(f"❌ analyze_from_url executor failed: {e}")
+        print(f"❌ analyze_from_url fallback failed: {e}")
         return None
     finally:
         try:
@@ -633,18 +763,27 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
     """
     Analyze pre-downloaded audio bytes — skips the CDN download step.
     iOS downloads the preview on-device and POSTs raw bytes here via /analyze-bytes.
-    Saves to a temp file and runs analyze_from_file in the default thread pool
-    executor so the event loop is never blocked.
+
+    Hot path: ffmpeg pipe decode → _analyze_pcm (no disk write).
+    Falls back to temp file + analyze_from_file if ffmpeg pipe fails.
     """
+    # Hot path: ffmpeg pipe → no disk write
+    pcm = await _decode_via_ffmpeg(audio_bytes)
+    if pcm is not None:
+        y, sr = pcm
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _analyze_pcm, y, sr)
+
+    # Fallback: temp file (handles edge-case audio formats ffmpeg can't pipe)
+    print("⚠️  ffmpeg pipe failed for bytes input, falling back to temp file")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
-
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(None, analyze_from_file, tmp_path)
     except Exception as e:
-        print(f"❌ analyze_from_bytes failed: {e}")
+        print(f"❌ analyze_from_bytes fallback failed: {e}")
         return None
     finally:
         try:

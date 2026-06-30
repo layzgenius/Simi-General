@@ -7,3 +7,4 @@ soundfile>=0.12.1
 audioread>=3.0.1
 onnxruntime==1.19.2
 python-multipart>=0.0.9
+audioflux>=0.1.8
