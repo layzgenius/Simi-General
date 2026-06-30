@@ -1403,8 +1403,6 @@ class RecommendationEngine: ObservableObject {
             if removed > 0 {
                 simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold 0.62)")
             }
-            // Re-sort after quality filter so the highest-scoring songs surface to the top.
-            recommendations.sort { $0.similarityScore > $1.similarityScore }
         }
 
         simiLog("✅ Tag enrichment done: \(enrichedCount)/\(snapshot.count) songs got features")
@@ -1481,9 +1479,7 @@ class RecommendationEngine: ObservableObject {
         }
 
         if librosaSucceeded > 0 {
-            // Re-sort after librosa upgrades so measured-feature winners surface to the top.
-            recommendations.sort { $0.similarityScore > $1.similarityScore }
-            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded, re-sorted")
+            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded (positions frozen)")
         } else {
             simiLog("⚠️ Librosa Stage 2: 0/\(librosaTargets.count) — Railway may be cold or busy")
         }
