@@ -225,15 +225,15 @@ struct VibeGraphView: View {
 
     @ViewBuilder
     func gridLines(width: CGFloat, height: CGFloat) -> some View {
-        // Horizontal line at energy = 0.7 (matches vibeSummary "Intense" threshold)
-        let energyY = (height - padding) - 0.7 * (height - padding * 2)
+        // Horizontal line at energy = 0.65 — matches vibeSummary's "high kinetic" zone entry point
+        let energyY = (height - padding) - 0.65 * (height - padding * 2)
         Path { path in
             path.move(to: CGPoint(x: padding, y: energyY))
             path.addLine(to: CGPoint(x: width - padding, y: energyY))
         }
         .stroke(Color.simiBorder, style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
 
-        // Vertical line at valence = 0.55 (matches vibeSummary high-energy valence threshold)
+        // Vertical line at valence = 0.55 (mid-kinetic positive/dark split; high-kinetic split is 0.45)
         let valenceX = padding + 0.55 * (width - padding * 2)
         Path { path in
             path.move(to: CGPoint(x: valenceX, y: padding))
@@ -244,34 +244,37 @@ struct VibeGraphView: View {
 
     @ViewBuilder
     func quadrantLabels(width: CGFloat, height: CGFloat) -> some View {
-        // Grid lines sit at valence=0.55 (x) and energy=0.7 (y).
-        // Quadrant label positions are the midpoints of each quadrant region.
-        let vx = padding + 0.55 * (width - padding * 2)   // vertical divider x
-        let ey = (height - padding) - 0.7 * (height - padding * 2) // horizontal divider y
+        // Grid lines are approximate guides at valence=0.55 (x) and energy=0.7 (y).
+        // vibeSummary uses a composite kinetic score (energy×0.4 + dance×0.35 + bpm×0.25)
+        // so label boundaries don't map 1:1 to the graph axes — the quadrant text is
+        // directional, not exact. e.g. HUMBLE. (energy=0.61) plots below the line but
+        // gets "Hype & Hard" because its danceability + BPM push its kinetic score high.
+        let vx = padding + 0.55 * (width - padding * 2)
+        let ey = (height - padding) - 0.65 * (height - padding * 2)
 
-        // Top-right: Energetic & Upbeat  (valence > 0.55, energy > 0.7)
+        // Top-right: high energy + positive → Energetic & Upbeat
         Text("Energetic\n& Upbeat")
             .font(.system(size: 9, weight: .medium))
             .foregroundColor(.simiGreen.opacity(0.6))
             .multilineTextAlignment(.center)
             .position(x: (vx + width - padding) / 2, y: (padding + ey) / 2)
 
-        // Top-left: Intense & Dark  (valence < 0.55, energy > 0.7)
+        // Top-left: high energy + dark → Intense & Dark or Hype & Hard (if highly danceable)
         Text("Intense\n& Dark")
             .font(.system(size: 9, weight: .medium))
             .foregroundColor(.simiError.opacity(0.5))
             .multilineTextAlignment(.center)
             .position(x: (padding + vx) / 2, y: (padding + ey) / 2)
 
-        // Bottom-right: Warm & Groovy / Chill & Happy  (valence > 0.55, energy < 0.7)
+        // Bottom-right: lower energy + positive → Warm & Groovy / Smooth & Mellow / Chill & Happy
         Text("Warm &\nChill")
             .font(.system(size: 9, weight: .medium))
             .foregroundColor(.simiAccent.opacity(0.5))
             .multilineTextAlignment(.center)
             .position(x: (vx + width - padding) / 2, y: (ey + height - padding) / 2)
 
-        // Bottom-left: Melancholic & Calm / Moody & Driving  (valence < 0.55, energy < 0.7)
-        Text("Melancholic\n& Calm")
+        // Bottom-left: lower energy + dark → Moody & Driving / Melancholic & Calm
+        Text("Moody &\nDark")
             .font(.system(size: 9, weight: .medium))
             .foregroundColor(.simiPrimary.opacity(0.5))
             .multilineTextAlignment(.center)
@@ -339,16 +342,29 @@ struct VibeGraphView: View {
 
     let padding: CGFloat = 24
 
+    /// Stable ±jitter for tag-estimated dots so overlapping songs visually separate.
+    /// Seeded from song ID characters — deterministic across renders, no randomness.
+    /// Only applied to estimated dots; measured (librosa) dots plot at exact position.
+    private func jitter(for song: SimilarSong) -> (CGFloat, CGFloat) {
+        guard song.audioFeatures?.isEstimated == true else { return (0, 0) }
+        let h = song.id.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
+        let dx = CGFloat(abs(h) % 51 - 25)          // ±25 pt horizontal
+        let dy = CGFloat(abs(h >> 8) % 51 - 25)     // ±25 pt vertical, different bits
+        return (dx, dy)
+    }
+
     /// X position — plotted by valence (only called for songs with real features)
     func dotX(_ song: SimilarSong, in width: CGFloat) -> CGFloat {
         let valence = song.audioFeatures?.valence ?? 0.5
-        return padding + CGFloat(valence) * (width - padding * 2)
+        let (dx, _) = jitter(for: song)
+        return padding + CGFloat(valence) * (width - padding * 2) + dx
     }
 
     /// Y position — plotted by energy, inverted (high energy = top of chart)
     func dotY(_ song: SimilarSong, in height: CGFloat) -> CGFloat {
         let energy = song.audioFeatures?.energy ?? 0.5
-        return (height - padding) - CGFloat(energy) * (height - padding * 2)
+        let (_, dy) = jitter(for: song)
+        return (height - padding) - CGFloat(energy) * (height - padding * 2) + dy
     }
 
     /// X position for source song features (same axes as recommendation dots)
