@@ -1,3 +1,27 @@
+# ── Stage 1: Convert DEAM .pb → ONNX ─────────────────────────────────────────
+# Isolated TF 2.12 environment. Only artifact that survives: /models/deam.onnx
+# ──────────────────────────────────────────────────────────────────────────────
+FROM python:3.10-slim AS deam-converter
+
+RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
+
+# TF 2.12 is the last release with numpy<1.24 support — needed for essentia's .pb format.
+# tf2onnx and onnxruntime are only here for conversion + validation; not in the runtime image.
+RUN pip install --no-cache-dir \
+      'numpy==1.23.5' \
+      'tensorflow-cpu==2.12.0' \
+      'tf2onnx>=1.14' \
+      'onnxruntime'
+
+RUN mkdir -p /models && \
+    wget -q -O /models/deam-msd-musicnn-2.pb \
+      https://essentia.upf.edu/models/classification-heads/deam/deam-msd-musicnn-2.pb
+
+COPY convert_deam.py /convert_deam.py
+RUN python /convert_deam.py
+
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM python:3.10-slim
 
 RUN apt-get update && apt-get install -y \
@@ -11,27 +35,22 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# essentia-tensorflow: wheels exist for Python 3.10 but not 3.11.
-# Brings TF2 as a dependency — musicnn uses this TF, no separate tensorflow-cpu needed.
-RUN pip install --no-cache-dir \
-      --extra-index-url https://essentia.upf.edu/python-extras/ \
-      'essentia-tensorflow==2.1b6.dev1110'
+# tensorflow-cpu: required by musicnn at import time
+RUN pip install --no-cache-dir tensorflow-cpu
 
-# musicnn: install without deps — uses the TF2 that essentia-tensorflow installed above.
+# musicnn: install without deps — uses tensorflow-cpu above
 RUN pip install --no-cache-dir musicnn==0.1.0 --no-deps
 
-# Bake all models into the image at build time.
-# They survive container restarts (no download on cold start) and only
-# re-download when this Dockerfile layer changes.
+# Bake models into image at build time — no download on cold start.
+# DCLAP ONNX (512-dim) baked here; DEAM ONNX copied from Stage 1 below.
 RUN mkdir -p /app/models && \
-    wget -q -O /app/models/msd-musicnn-1.pb \
-      https://essentia.upf.edu/models/feature-extractors/musicnn/msd-musicnn-1.pb && \
-    wget -q -O /app/models/deam-msd-musicnn-2.pb \
-      https://essentia.upf.edu/models/classification-heads/deam/deam-msd-musicnn-2.pb && \
     wget -q -O /app/models/model_epoch_36.onnx \
       https://github.com/NeptuneHub/AudioMuse-AI-DCLAP/releases/download/v1/model_epoch_36.onnx && \
     wget -q -O /app/models/model_epoch_36.onnx.data \
       https://github.com/NeptuneHub/AudioMuse-AI-DCLAP/releases/download/v1/model_epoch_36.onnx.data
+
+# DEAM ONNX converted in Stage 1 — no TF needed at runtime
+COPY --from=deam-converter /models/deam.onnx /app/models/deam.onnx
 
 COPY . .
 

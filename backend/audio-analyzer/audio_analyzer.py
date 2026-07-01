@@ -268,6 +268,72 @@ def get_dclap_embedding(audio_path: str) -> list[float] | None:
 
 
 # ─────────────────────────────────────────────
+# DEAM arousal/valence via ONNX (TF-free at runtime)
+# Converted from deam-msd-musicnn-2.pb in Docker Stage 1.
+# Pipeline: audio → MSD_musicnn (musicnn pkg) → 200-dim → DEAM ONNX → arousal, valence
+# MSD_musicnn matches the training data for deam-msd-musicnn-2, so predictions are valid.
+# ─────────────────────────────────────────────
+
+_DEAM_ONNX_PATH       = "/app/models/deam.onnx"
+_deam_onnx_available: bool = False
+_deam_onnx_lock             = threading.Lock()
+_deam_onnx_session          = None
+
+
+def init_deam_onnx() -> None:
+    global _deam_onnx_available, _deam_onnx_session
+    with _deam_onnx_lock:
+        if _deam_onnx_available:
+            return
+        if not os.path.exists(_DEAM_ONNX_PATH):
+            print(f"⚠️  DEAM ONNX not found at {_DEAM_ONNX_PATH} — arousal/valence disabled")
+            return
+        try:
+            import onnxruntime as ort
+            _deam_onnx_session = ort.InferenceSession(
+                _DEAM_ONNX_PATH,
+                providers=["CPUExecutionProvider"],
+            )
+            _deam_onnx_available = True
+            print("✅ DEAM ONNX ready (arousal/valence — MSD-MusiCNN pipeline)")
+        except Exception as e:
+            print(f"⚠️  DEAM ONNX load failed: {e}")
+
+
+def get_deam_arousal_valence(audio_path: str) -> tuple[float, float] | None:
+    """
+    Compute arousal and valence for an audio file using the MSD-MusiCNN → DEAM pipeline.
+
+    Steps:
+      1. Run musicnn MSD_musicnn extractor → per-frame 200-dim embeddings (timbral)
+      2. Feed all frames through the DEAM ONNX head → (n_frames, 2) predictions
+      3. Average across frames; normalize from DEAM's 1–9 scale to [0, 1]
+
+    MSD_musicnn is distinct from the MTT_musicnn used for recommendation embeddings —
+    the DEAM head was trained specifically on MSD activations.
+    """
+    if not _deam_onnx_available or not _musicnn_embed_available:
+        return None
+    try:
+        from musicnn.extractor import extractor
+        _, _, features = extractor(audio_path, model="MSD_musicnn", extract_features=True)
+        timbral = features.get("timbral")
+        if timbral is None or len(timbral) == 0:
+            return None
+        embeddings = np.array(timbral, dtype=np.float32)   # (n_frames, 200)
+        input_name = _deam_onnx_session.get_inputs()[0].name
+        predictions = _deam_onnx_session.run(None, {input_name: embeddings})[0]  # (n_frames, 2)
+        mean_pred = np.mean(predictions, axis=0)
+        # DEAM outputs on 1–9 Russell scale; normalise to [0, 1]
+        arousal = float(np.clip((mean_pred[0] - 1.0) / 8.0, 0.0, 1.0))
+        valence = float(np.clip((mean_pred[1] - 1.0) / 8.0, 0.0, 1.0))
+        return arousal, valence
+    except Exception as e:
+        print(f"⚠️  DEAM prediction failed: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
 # MusiCNN — 200-dim timbral embeddings for recommendation-quality ANN
 # Trained on Last.fm tag prediction via the musicnn package.
 # Best-performing audio embedding for music recommendation (RecSys '24 benchmark
@@ -809,7 +875,7 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
         y, sr = pcm
         loop = asyncio.get_running_loop()
         features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
-        if features is not None and (_musicnn_embed_available or _essentia_available):
+        if features is not None and (_musicnn_embed_available or _deam_onnx_available):
             url_suffix = ".m4a" if "m4a" in preview_url.lower() else ".mp3"
             with tempfile.NamedTemporaryFile(suffix=url_suffix, delete=False) as tmp:
                 tmp.write(audio_bytes)
@@ -818,13 +884,13 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
                 tasks = []
                 if _musicnn_embed_available:
                     tasks.append(loop.run_in_executor(None, get_musicnn_embedding, tmp_path))
-                if _essentia_available:
-                    tasks.append(loop.run_in_executor(None, extract_arousal_valence, tmp_path))
+                if _deam_onnx_available:
+                    tasks.append(loop.run_in_executor(None, get_deam_arousal_valence, tmp_path))
                 results = await asyncio.gather(*tasks)
                 idx = 0
                 if _musicnn_embed_available:
                     features.musicnn_embedding = results[idx]; idx += 1
-                if _essentia_available:
+                if _deam_onnx_available:
                     av = results[idx]
                     if av:
                         features.arousal = round(av[0], 4)

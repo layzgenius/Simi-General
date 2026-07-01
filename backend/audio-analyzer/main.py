@@ -32,8 +32,9 @@ from pydantic import BaseModel, Field
 
 from audio_analyzer import (
     analyze_from_url, analyze_from_bytes,
-    init_essentia, init_dclap, get_dclap_embedding,
+    init_dclap, get_dclap_embedding,
     init_musicnn_embedding, get_musicnn_embedding,
+    init_deam_onnx,
 )
 from similarity_engine import compute_similarity, AudioFeaturesDict, build_embedding, build_explanation, Genre
 
@@ -47,7 +48,7 @@ async def on_startup() -> None:
     # HF CPU Basic has 16GB RAM — TF2's 400-600MB footprint is fine here.
     threading.Thread(target=init_dclap, daemon=True).start()
     threading.Thread(target=init_musicnn_embedding, daemon=True).start()
-    threading.Thread(target=init_essentia, daemon=True).start()
+    threading.Thread(target=init_deam_onnx, daemon=True).start()
 
 
 # ─────────────────────────────────────────────
@@ -761,12 +762,12 @@ async def musicnn_vector_search(req: MusicnnVectorSearchRequest) -> VectorSearch
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    from audio_analyzer import _essentia_available, _dclap_available, _musicnn_embed_available
+    from audio_analyzer import _dclap_available, _musicnn_embed_available, _deam_onnx_available
     vector_catalog = "supabase_configured" if (_SUPABASE_URL and _SUPABASE_KEY) else "supabase_not_configured"
     return {
         "status": "ok",
         "vector_catalog": vector_catalog,
-        "essentia": "ready" if _essentia_available else "unavailable",
         "dclap": "ready" if _dclap_available else "unavailable",
         "musicnn": "ready" if _musicnn_embed_available else "unavailable",
+        "deam": "ready" if _deam_onnx_available else "unavailable",
     }
