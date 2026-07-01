@@ -11,6 +11,6 @@ jobs:
     steps:
       - name: Ping health endpoint
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://YOUR_HF_USERNAME-simi-audio-analyzer.hf.space/health)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://layzskolah-simi-audio-analyzer.hf.space/health)
           echo "Health status: $STATUS"
           [ "$STATUS" = "200" ] || exit 1
