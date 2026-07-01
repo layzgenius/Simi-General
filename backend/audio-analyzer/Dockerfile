@@ -10,6 +10,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir tensorflow-cpu
+RUN pip install --no-cache-dir musicnn==0.1.0 --no-deps
 RUN pip install --no-cache-dir \
       --extra-index-url https://essentia.upf.edu/python-extras/ \
       'essentia-tensorflow==2.1b6.dev1110' || \

@@ -22,7 +22,7 @@ import time
 import urllib.request
 import urllib.parse
 
-RAILWAY_URL = "https://simi-audio-analyzer-production.up.railway.app/analyze"
+RAILWAY_URL = "https://layzskolah-simi-audio-analyzer.hf.space/analyze"
 ITUNES_URL  = "https://itunes.apple.com/search"
 
 # How close to a threshold counts as a ⚠️  WARN instead of a hard ❌ FAIL.
