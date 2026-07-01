@@ -17,7 +17,9 @@ RUN pip install --no-cache-dir \
 
 COPY . .
 
-# Download models at startup so Railway's build network doesn't block them.
+EXPOSE 7860
+
+# Download models at startup — models dir is ephemeral on HF Spaces, recreated each boot.
 CMD ["sh", "-c", "\
   mkdir -p /app/models && \
   if [ ! -f /app/models/msd-musicnn-1.pb ]; then \
@@ -36,4 +38,4 @@ CMD ["sh", "-c", "\
     wget -q -O /app/models/model_epoch_36.onnx.data \
       https://github.com/NeptuneHub/AudioMuse-AI-DCLAP/releases/download/v1/model_epoch_36.onnx.data || true; \
   fi && \
-  uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+  uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]
