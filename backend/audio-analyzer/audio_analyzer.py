@@ -305,22 +305,38 @@ def get_deam_arousal_valence(audio_path: str) -> tuple[float, float] | None:
     Compute arousal and valence for an audio file using the MSD-MusiCNN → DEAM pipeline.
 
     Steps:
-      1. Run musicnn MSD_musicnn extractor → per-frame 200-dim embeddings (timbral)
+      1. Run musicnn extractor → per-frame 200-dim embeddings
+         Tries MSD_musicnn first (DEAM was trained on MSD activations).
+         Falls back to MTT_musicnn if MSD model files aren't bundled in the package.
+         Checks 'timbral' key first, then 'penultimate' as fallback.
       2. Feed all frames through the DEAM ONNX head → (n_frames, 2) predictions
       3. Average across frames; normalize from DEAM's 1–9 scale to [0, 1]
-
-    MSD_musicnn is distinct from the MTT_musicnn used for recommendation embeddings —
-    the DEAM head was trained specifically on MSD activations.
     """
     if not _deam_onnx_available or not _musicnn_embed_available:
         return None
     try:
         from musicnn.extractor import extractor
-        _, _, features = extractor(audio_path, model="MSD_musicnn", extract_features=True)
-        timbral = features.get("timbral")
-        if timbral is None or len(timbral) == 0:
+
+        embeddings = None
+        for model_name in ("MSD_musicnn", "MTT_musicnn"):
+            try:
+                _, _, feats = extractor(audio_path, model=model_name, extract_features=True)
+                for key in ("timbral", "penultimate"):
+                    arr = feats.get(key)
+                    if arr is not None and len(arr) > 0:
+                        candidate = np.array(arr, dtype=np.float32)
+                        if candidate.ndim == 2 and candidate.shape[1] == 200:
+                            embeddings = candidate
+                            break
+                if embeddings is not None:
+                    break
+            except Exception as e:
+                print(f"⚠️  DEAM: {model_name} extractor failed ({e}), trying fallback")
+
+        if embeddings is None:
+            print("⚠️  DEAM: no 200-dim embeddings available from musicnn")
             return None
-        embeddings = np.array(timbral, dtype=np.float32)   # (n_frames, 200)
+
         input_name = _deam_onnx_session.get_inputs()[0].name
         predictions = _deam_onnx_session.run(None, {input_name: embeddings})[0]  # (n_frames, 2)
         mean_pred = np.mean(predictions, axis=0)
@@ -875,19 +891,23 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
         y, sr = pcm
         loop = asyncio.get_running_loop()
         features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
-        if features is not None and (_musicnn_embed_available or _deam_onnx_available):
+        if features is not None and (_dclap_available or _musicnn_embed_available or _deam_onnx_available):
             url_suffix = ".m4a" if "m4a" in preview_url.lower() else ".mp3"
             with tempfile.NamedTemporaryFile(suffix=url_suffix, delete=False) as tmp:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
             try:
                 tasks = []
+                if _dclap_available:
+                    tasks.append(loop.run_in_executor(None, get_dclap_embedding, tmp_path))
                 if _musicnn_embed_available:
                     tasks.append(loop.run_in_executor(None, get_musicnn_embedding, tmp_path))
                 if _deam_onnx_available:
                     tasks.append(loop.run_in_executor(None, get_deam_arousal_valence, tmp_path))
                 results = await asyncio.gather(*tasks)
                 idx = 0
+                if _dclap_available:
+                    features.dclap_embedding = results[idx]; idx += 1
                 if _musicnn_embed_available:
                     features.musicnn_embedding = results[idx]; idx += 1
                 if _deam_onnx_available:
