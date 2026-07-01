@@ -1,5 +1,7 @@
-# ── Stage 1: Convert DEAM .pb → ONNX ─────────────────────────────────────────
-# Isolated TF 2.12 environment. Only artifact that survives: /models/deam.onnx
+# ── Stage 1: Convert Essentia .pb models → ONNX ───────────────────────────────
+# Isolated TF 2.12 environment. Artifacts that survive to Stage 2:
+#   /models/msd-musicnn.onnx  — backbone: mel patches → 200-dim embeddings
+#   /models/deam.onnx         — head: 200-dim embeddings → arousal, valence
 # ──────────────────────────────────────────────────────────────────────────────
 FROM python:3.10-slim AS deam-converter
 
@@ -14,8 +16,13 @@ RUN pip install --no-cache-dir \
       'onnxruntime'
 
 RUN mkdir -p /models && \
+    wget -q -O /models/msd-musicnn-1.pb \
+      https://essentia.upf.edu/models/feature-extractors/msd-musicnn/msd-musicnn-1.pb && \
     wget -q -O /models/deam-msd-musicnn-2.pb \
       https://essentia.upf.edu/models/classification-heads/deam/deam-msd-musicnn-2.pb
+
+COPY convert_msdmusicnn.py /convert_msdmusicnn.py
+RUN python /convert_msdmusicnn.py
 
 COPY convert_deam.py /convert_deam.py
 RUN python /convert_deam.py
@@ -52,7 +59,8 @@ RUN mkdir -p /app/models && \
     wget -q -O /app/models/model_epoch_36.onnx.data \
       https://github.com/NeptuneHub/AudioMuse-AI-DCLAP/releases/download/v1/model_epoch_36.onnx.data
 
-# DEAM ONNX converted in Stage 1 — no TF needed at runtime
+# Both ONNX models converted in Stage 1 — no TF needed at runtime
+COPY --from=deam-converter /models/msd-musicnn.onnx /app/models/msd-musicnn.onnx
 COPY --from=deam-converter /models/deam.onnx /app/models/deam.onnx
 
 COPY . .

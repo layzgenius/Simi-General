@@ -268,16 +268,47 @@ def get_dclap_embedding(audio_path: str) -> list[float] | None:
 
 
 # ─────────────────────────────────────────────
-# DEAM arousal/valence via ONNX (TF-free at runtime)
-# Converted from deam-msd-musicnn-2.pb in Docker Stage 1.
-# Pipeline: audio → MSD_musicnn (musicnn pkg) → 200-dim → DEAM ONNX → arousal, valence
-# MSD_musicnn matches the training data for deam-msd-musicnn-2, so predictions are valid.
+# DEAM arousal/valence via ONNX (fully TF-free at runtime)
+#
+# Two-stage pipeline, both models converted from Essentia .pb in Docker Stage 1:
+#   1. msd-musicnn.onnx  — mel patches → 200-dim embeddings (Essentia-compatible)
+#   2. deam.onnx         — 200-dim embeddings → arousal, valence (1–9 scale)
+#
+# Preprocessing matches Essentia's TensorflowPredictMusiCNN exactly:
+#   16kHz mono → mel spectrogram (96 bands, n_fft=512, hop=256)
+#   → log10(10000 × mel + 1) → 187-frame patches at 93-frame stride
 # ─────────────────────────────────────────────
 
-_DEAM_ONNX_PATH       = "/app/models/deam.onnx"
-_deam_onnx_available: bool = False
-_deam_onnx_lock             = threading.Lock()
-_deam_onnx_session          = None
+_MSD_MUSICNN_ONNX_PATH = "/app/models/msd-musicnn.onnx"
+_DEAM_ONNX_PATH        = "/app/models/deam.onnx"
+
+_msd_musicnn_available: bool = False
+_deam_onnx_available:   bool = False
+_msd_musicnn_lock            = threading.Lock()
+_deam_onnx_lock              = threading.Lock()
+_msd_musicnn_session         = None
+_deam_onnx_session           = None
+
+
+def init_msd_musicnn_onnx() -> None:
+    global _msd_musicnn_available, _msd_musicnn_session
+    with _msd_musicnn_lock:
+        if _msd_musicnn_available:
+            return
+        if not os.path.exists(_MSD_MUSICNN_ONNX_PATH):
+            print(f"⚠️  MSD-MusiCNN ONNX not found at {_MSD_MUSICNN_ONNX_PATH}")
+            return
+        try:
+            import onnxruntime as ort
+            _msd_musicnn_session = ort.InferenceSession(
+                _MSD_MUSICNN_ONNX_PATH,
+                providers=["CPUExecutionProvider"],
+            )
+            _msd_musicnn_available = True
+            inp = _msd_musicnn_session.get_inputs()[0]
+            print(f"✅ MSD-MusiCNN ONNX ready  input={inp.name} shape={inp.shape}")
+        except Exception as e:
+            print(f"⚠️  MSD-MusiCNN ONNX load failed: {e}")
 
 
 def init_deam_onnx() -> None:
@@ -295,51 +326,77 @@ def init_deam_onnx() -> None:
                 providers=["CPUExecutionProvider"],
             )
             _deam_onnx_available = True
-            print("✅ DEAM ONNX ready (arousal/valence — MSD-MusiCNN pipeline)")
+            print("✅ DEAM ONNX ready (arousal/valence head)")
         except Exception as e:
             print(f"⚠️  DEAM ONNX load failed: {e}")
 
 
+_MEL_SR        = 16000
+_MEL_N_FFT     = 512
+_MEL_HOP       = 256
+_MEL_N_MELS    = 96
+_PATCH_FRAMES  = 187   # ~3 s at 16kHz / 256 hop
+_PATCH_HOP     = 93    # 50 % overlap
+
+
+def _compute_mel_patches(audio_path: str) -> np.ndarray | None:
+    """
+    Replicate Essentia's TensorflowPredictMusiCNN preprocessing:
+      load 16kHz mono → mel spectrogram (96 bands) → log10(10000×mel+1)
+      → 187-frame patches at 93-frame stride → (n_patches, 187, 96) float32
+
+    If the ONNX model expects a channel dim it will be added by the caller.
+    """
+    try:
+        y, _ = librosa.load(audio_path, sr=_MEL_SR, mono=True)
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=_MEL_SR,
+            n_fft=_MEL_N_FFT, hop_length=_MEL_HOP, n_mels=_MEL_N_MELS,
+        )
+        log_mel = np.log10(10000.0 * mel + 1.0)   # (96, n_frames)
+
+        patches = []
+        for start in range(0, log_mel.shape[1] - _PATCH_FRAMES + 1, _PATCH_HOP):
+            patch = log_mel[:, start : start + _PATCH_FRAMES].T   # (187, 96)
+            patches.append(patch)
+
+        if not patches:
+            return None
+        return np.array(patches, dtype=np.float32)   # (n_patches, 187, 96)
+    except Exception as e:
+        print(f"⚠️  mel patch computation failed: {e}")
+        return None
+
+
 def get_deam_arousal_valence(audio_path: str) -> tuple[float, float] | None:
     """
-    Compute arousal and valence for an audio file using the MSD-MusiCNN → DEAM pipeline.
+    Compute arousal and valence using Essentia's DEAM pipeline — fully ONNX, no TF.
 
-    Steps:
-      1. Run musicnn extractor → per-frame 200-dim embeddings
-         Tries MSD_musicnn first (DEAM was trained on MSD activations).
-         Falls back to MTT_musicnn if MSD model files aren't bundled in the package.
-         Checks 'timbral' key first, then 'penultimate' as fallback.
-      2. Feed all frames through the DEAM ONNX head → (n_frames, 2) predictions
-      3. Average across frames; normalize from DEAM's 1–9 scale to [0, 1]
+      audio → mel patches → msd-musicnn ONNX → 200-dim embeddings
+            → DEAM ONNX → (n_patches, 2) → mean → normalise 1–9 → [0, 1]
     """
-    if not _deam_onnx_available or not _musicnn_embed_available:
+    if not _msd_musicnn_available or not _deam_onnx_available:
         return None
     try:
-        from musicnn.extractor import extractor
-
-        embeddings = None
-        for model_name in ("MSD_musicnn", "MTT_musicnn"):
-            try:
-                _, _, feats = extractor(audio_path, model=model_name, extract_features=True)
-                for key in ("timbral", "penultimate"):
-                    arr = feats.get(key)
-                    if arr is not None and len(arr) > 0:
-                        candidate = np.array(arr, dtype=np.float32)
-                        if candidate.ndim == 2 and candidate.shape[1] == 200:
-                            embeddings = candidate
-                            break
-                if embeddings is not None:
-                    break
-            except Exception as e:
-                print(f"⚠️  DEAM: {model_name} extractor failed ({e}), trying fallback")
-
-        if embeddings is None:
-            print("⚠️  DEAM: no 200-dim embeddings available from musicnn")
+        patches = _compute_mel_patches(audio_path)
+        if patches is None:
             return None
 
-        input_name = _deam_onnx_session.get_inputs()[0].name
-        predictions = _deam_onnx_session.run(None, {input_name: embeddings})[0]  # (n_frames, 2)
-        mean_pred = np.mean(predictions, axis=0)
+        # Adapt to whatever shape the ONNX model was compiled with
+        inp_info  = _msd_musicnn_session.get_inputs()[0]
+        inp_name  = inp_info.name
+        inp_shape = inp_info.shape   # e.g. [None, 187, 96] or [None, 187, 96, 1]
+
+        feed = patches
+        if len(inp_shape) == 4:
+            feed = patches[:, :, :, np.newaxis]   # add channel dim
+
+        embeddings = _msd_musicnn_session.run(None, {inp_name: feed})[0]   # (n_patches, 200)
+
+        deam_inp  = _deam_onnx_session.get_inputs()[0].name
+        preds     = _deam_onnx_session.run(None, {deam_inp: embeddings})[0]  # (n_patches, 2)
+        mean_pred = np.mean(preds, axis=0)
+
         # DEAM outputs on 1–9 Russell scale; normalise to [0, 1]
         arousal = float(np.clip((mean_pred[0] - 1.0) / 8.0, 0.0, 1.0))
         valence = float(np.clip((mean_pred[1] - 1.0) / 8.0, 0.0, 1.0))
