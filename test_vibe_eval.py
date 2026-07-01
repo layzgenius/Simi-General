@@ -255,8 +255,8 @@ def fetch_preview_url(title: str, artist: str) -> str | None:
     return None
 
 
-def analyze_via_railway(preview_url: str, timeout: int = 55) -> dict | None:
-    """POSTs previewUrl to Railway /analyze and returns the parsed JSON dict."""
+def analyze_via_backend(preview_url: str, timeout: int = 55) -> dict | None:
+    """POSTs previewUrl to the HF Space /analyze endpoint and returns the parsed JSON dict."""
     payload = json.dumps({"previewUrl": preview_url}).encode()
     req = urllib.request.Request(
         RAILWAY_URL,
@@ -304,7 +304,7 @@ def run_test(test: dict, idx: int, total: int) -> tuple[int, int, int]:
     # ── Railway /analyze ────────────────────────────────────────────
     print(f"  → Sending to Railway /analyze  (allow up to 55s)…")
     t0 = time.time()
-    features = analyze_via_railway(preview_url)
+    features = analyze_via_backend(preview_url)
     elapsed = time.time() - t0
 
     if features is None:
