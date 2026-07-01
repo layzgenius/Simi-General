@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir \
 
 RUN mkdir -p /models && \
     wget -q -O /models/msd-musicnn-1.pb \
-      https://essentia.upf.edu/models/feature-extractors/msd-musicnn/msd-musicnn-1.pb && \
+      https://essentia.upf.edu/models/feature-extractors/musicnn/msd-musicnn-1.pb && \
     wget -q -O /models/deam-msd-musicnn-2.pb \
       https://essentia.upf.edu/models/classification-heads/deam/deam-msd-musicnn-2.pb
 
