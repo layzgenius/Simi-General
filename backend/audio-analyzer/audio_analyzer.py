@@ -935,7 +935,7 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
         y, sr = pcm
         loop = asyncio.get_running_loop()
         features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
-        if features is not None and (_musicnn_embed_available or _essentia_available):
+        if features is not None and (_musicnn_embed_available or _deam_onnx_available):
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
@@ -943,13 +943,13 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
                 tasks = []
                 if _musicnn_embed_available:
                     tasks.append(loop.run_in_executor(None, get_musicnn_embedding, tmp_path))
-                if _essentia_available:
-                    tasks.append(loop.run_in_executor(None, extract_arousal_valence, tmp_path))
+                if _deam_onnx_available:
+                    tasks.append(loop.run_in_executor(None, get_deam_arousal_valence, tmp_path))
                 results = await asyncio.gather(*tasks)
                 idx = 0
                 if _musicnn_embed_available:
                     features.musicnn_embedding = results[idx]; idx += 1
-                if _essentia_available:
+                if _deam_onnx_available:
                     av = results[idx]
                     if av:
                         features.arousal = round(av[0], 4)

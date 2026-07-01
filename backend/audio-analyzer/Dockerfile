@@ -35,8 +35,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# tensorflow-cpu: required by musicnn at import time
-RUN pip install --no-cache-dir tensorflow-cpu
+# Pin to 2.15.1: last release before keras 3 was split out.
+# musicnn 0.1.0 uses `from tensorflow.keras import backend as K` which
+# breaks in TF 2.16+ unless standalone keras is also installed.
+# 2.15.1 supports numpy >= 1.23.5, < 2.0, so numpy 1.26 is fine.
+RUN pip install --no-cache-dir 'tensorflow-cpu==2.15.1'
 
 # musicnn: install without deps — uses tensorflow-cpu above
 RUN pip install --no-cache-dir musicnn==0.1.0 --no-deps
