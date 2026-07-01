@@ -30,7 +30,11 @@ from typing import Optional
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from audio_analyzer import analyze_from_url, analyze_from_bytes, init_essentia, init_dclap, get_dclap_embedding
+from audio_analyzer import (
+    analyze_from_url, analyze_from_bytes,
+    init_essentia, init_dclap, get_dclap_embedding,
+    init_musicnn_embedding, get_musicnn_embedding,
+)
 from similarity_engine import compute_similarity, AudioFeaturesDict, build_embedding, build_explanation, Genre
 
 app = FastAPI(title="Simi Audio Analyzer", version="1.0.0")
@@ -44,6 +48,7 @@ async def on_startup() -> None:
     # on Railway's container limits. Essentia features stay disabled until
     # we profile actual memory headroom.
     threading.Thread(target=init_dclap, daemon=True).start()
+    threading.Thread(target=init_musicnn_embedding, daemon=True).start()
     # Note: no self-ping keepalive needed — Railway's own load balancer health
     # probes (100.64.0.x) satisfy the inactivity timer. Self-pinging localhost
     # burns CPU credits without helping.
@@ -84,8 +89,10 @@ class AudioFeatures(BaseModel):
     # Essentia DEAM
     arousal:               float | None = None
     valenceEssentia:       float | None = None
-    # DCLAP neural embedding
+    # DCLAP neural embedding (512-dim)
     dclapEmbedding:        list[float] | None = None
+    # MusiCNN timbral embedding (200-dim, Last.fm-supervised, best for recommendation ANN)
+    musicnnEmbedding:      list[float] | None = None
 
     def to_dict(self) -> AudioFeaturesDict:
         return self.model_dump()   # type: ignore[return-value]
@@ -339,6 +346,7 @@ async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks,
         arousal=features.arousal,
         valenceEssentia=features.valence_essentia,
         dclapEmbedding=features.dclap_embedding,
+        musicnnEmbedding=features.musicnn_embedding,
     )
 
 
@@ -393,6 +401,7 @@ async def analyze_bytes_endpoint(
         arousal=features.arousal,
         valenceEssentia=features.valence_essentia,
         dclapEmbedding=features.dclap_embedding,
+        musicnnEmbedding=features.musicnn_embedding,
     )
 
     if artist:
@@ -446,6 +455,7 @@ async def batch_analyze(req: BatchAnalyzeRequest) -> dict:
                 arousal=features.arousal,
                 valenceEssentia=features.valence_essentia,
                 dclapEmbedding=features.dclap_embedding,
+                musicnnEmbedding=features.musicnn_embedding,
             )
 
     results = await asyncio.gather(*[limited_analyze(url) for url in req.urls[:20]])
@@ -562,11 +572,12 @@ class VectorSearchResponse(BaseModel):
 async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesResponse:
     """
     Background catalog builder: downloads preview audio for each candidate,
-    computes a DCLAP embedding, and upserts it into Supabase track_embeddings.
+    computes DCLAP (512-dim) and MusiCNN (200-dim) embeddings, and upserts
+    both into Supabase track_embeddings.
     Fire-and-forget from iOS — errors are logged but do not affect the caller.
-    No-ops when DCLAP or Supabase is unavailable.
+    No-ops when DCLAP or Supabase is unavailable. MusiCNN is stored when available.
     """
-    from audio_analyzer import _dclap_available
+    from audio_analyzer import _dclap_available, _musicnn_embed_available
     if not _dclap_available or not _SUPABASE_URL or not _SUPABASE_KEY:
         return EmbedCandidatesResponse(embedded=0)
 
@@ -597,26 +608,37 @@ async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesRespon
 
             try:
                 loop = asyncio.get_event_loop()
-                emb = await loop.run_in_executor(None, get_dclap_embedding, tmp_path)
+                # Run DCLAP and MusiCNN concurrently — both read the same temp file
+                if _musicnn_embed_available:
+                    dclap_emb, musicnn_emb = await asyncio.gather(
+                        loop.run_in_executor(None, get_dclap_embedding, tmp_path),
+                        loop.run_in_executor(None, get_musicnn_embedding, tmp_path),
+                    )
+                else:
+                    dclap_emb = await loop.run_in_executor(None, get_dclap_embedding, tmp_path)
+                    musicnn_emb = None
             finally:
                 try:
                     _os.unlink(tmp_path)
                 except OSError:
                     pass
 
-            if emb is None:
+            if dclap_emb is None:
                 return False
 
-            emb_str = "[" + ",".join(f"{v:.6f}" for v in emb) + "]"
+            emb_str = "[" + ",".join(f"{v:.6f}" for v in dclap_emb) + "]"
             payload = {
-                "spotify_id":   item.spotifyId,
-                "title":        item.title,
-                "artist":       item.artist,
-                "embedding":    emb_str,
-                "arousal":      item.arousal,
-                "valence_deam": item.valenceDeam,
-                "bpm":          item.bpm,
+                "spotify_id":        item.spotifyId,
+                "title":             item.title,
+                "artist":            item.artist,
+                "embedding":         emb_str,
+                "arousal":           item.arousal,
+                "valence_deam":      item.valenceDeam,
+                "bpm":               item.bpm,
             }
+            if musicnn_emb is not None:
+                payload["musicnn_embedding"] = "[" + ",".join(f"{v:.6f}" for v in musicnn_emb) + "]"
+
             headers = {
                 "Authorization": f"Bearer {_SUPABASE_KEY}",
                 "apikey":         _SUPABASE_KEY,
@@ -687,13 +709,68 @@ async def vector_search(req: VectorSearchRequest) -> VectorSearchResponse:
     return VectorSearchResponse(results=results)
 
 
+class MusicnnVectorSearchRequest(BaseModel):
+    embedding:  list[float]   # 200-dim MusiCNN query vector
+    matchCount: int = 20
+
+
+@app.post("/musicnn-vector-search", response_model=VectorSearchResponse)
+async def musicnn_vector_search(req: MusicnnVectorSearchRequest) -> VectorSearchResponse:
+    """
+    Nearest-neighbour search over track_embeddings.musicnn_embedding via
+    the find_similar_tracks_musicnn Supabase RPC (200-dim cosine similarity).
+    Returns up to matchCount candidates sorted by similarity descending.
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        return VectorSearchResponse(results=[])
+
+    emb_str = "[" + ",".join(f"{v:.6f}" for v in req.embedding) + "]"
+    headers = {
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "apikey":         _SUPABASE_KEY,
+        "Content-Type":   "application/json",
+    }
+    payload = {
+        "query_embedding": emb_str,
+        "match_count":     req.matchCount,
+    }
+    import httpx as _httpx
+    try:
+        async with _httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                f"{_SUPABASE_URL}/rest/v1/rpc/find_similar_tracks_musicnn",
+                json=payload,
+                headers=headers,
+            )
+            r.raise_for_status()
+            rows = r.json()
+    except Exception as e:
+        print(f"⚠️  musicnn-vector-search Supabase call failed: {e}")
+        return VectorSearchResponse(results=[])
+
+    results = [
+        VectorSearchResult(
+            spotifyId=row["spotify_id"],
+            title=row["title"],
+            artist=row["artist"],
+            similarity=float(row["similarity"]),
+            arousal=row.get("arousal"),
+            valenceDeam=row.get("valence_deam"),
+            bpm=row.get("bpm"),
+        )
+        for row in (rows or [])
+    ]
+    return VectorSearchResponse(results=results)
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
-    from audio_analyzer import _essentia_available, _dclap_available
+    from audio_analyzer import _essentia_available, _dclap_available, _musicnn_embed_available
     vector_catalog = "supabase_configured" if (_SUPABASE_URL and _SUPABASE_KEY) else "supabase_not_configured"
     return {
         "status": "ok",
         "vector_catalog": vector_catalog,
         "essentia": "ready" if _essentia_available else "unavailable",
         "dclap": "ready" if _dclap_available else "unavailable",
+        "musicnn": "ready" if _musicnn_embed_available else "unavailable",
     }

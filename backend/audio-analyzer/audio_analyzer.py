@@ -86,6 +86,10 @@ class AudioFeatures:
     valence_essentia:        float | None = None  # DEAM valence [0,1]
     # DCLAP neural embedding (None when onnxruntime unavailable)
     dclap_embedding:         list | None = None   # 512-dim L2-normalised float32 vector
+    # MusiCNN timbral embedding (None when musicnn unavailable)
+    # 200-dim, L2-normalised. Trained on Last.fm tag prediction; outperforms DCLAP for
+    # recommendation retrieval (Tamm & Aljanaki, RecSys '24).
+    musicnn_embedding:       list | None = None
 
 
 # ─────────────────────────────────────────────
@@ -260,6 +264,71 @@ def get_dclap_embedding(audio_path: str) -> list[float] | None:
         return [round(float(v), 6) for v in normalised]
     except Exception as e:
         print(f"⚠️  DCLAP embedding failed: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# MusiCNN — 200-dim timbral embeddings for recommendation-quality ANN
+# Trained on Last.fm tag prediction via the musicnn package.
+# Best-performing audio embedding for music recommendation (RecSys '24 benchmark
+# across 6 models: MusiCNN > MERT > EncodecMAE > DCLAP family > MusicFM > Jukebox).
+# The key advantage: supervised on crowd-sourced listener perception tags, so the
+# embedding space directly encodes the distinctions listeners draw — genre boundaries,
+# mood associations, energy levels — rather than acoustic reconstruction fidelity.
+# ─────────────────────────────────────────────
+
+_musicnn_embed_available: bool = False
+_musicnn_embed_lock             = threading.Lock()
+
+
+def init_musicnn_embedding() -> None:
+    """
+    Call once at app startup. Probes the musicnn import and sets the availability flag.
+    The musicnn package bundles model weights (~20 MB) — no external download needed.
+    Falls through silently if musicnn isn't installed or TF initialisation fails.
+    """
+    global _musicnn_embed_available
+    with _musicnn_embed_lock:
+        if _musicnn_embed_available:
+            return
+        try:
+            from musicnn.extractor import extractor as _probe  # noqa: F401
+            _musicnn_embed_available = True
+            print("✅ MusiCNN embeddings ready (200-dim, Last.fm-supervised)")
+        except ImportError:
+            print("⚠️  musicnn not installed — MusiCNN embeddings disabled")
+        except Exception as e:
+            print(f"⚠️  MusiCNN init failed: {e}")
+
+
+def get_musicnn_embedding(audio_path: str) -> list[float] | None:
+    """
+    Compute a 200-dim MusiCNN timbral embedding for an audio file.
+
+    Uses the MTT_musicnn model (MagnaTagATune, Last.fm-supervised tags).
+    Runs the full musicnn extractor, extracts the penultimate-layer activations
+    (200 units × n_frames), averages across frames, and L2-normalises the result.
+
+    Returns a list of 200 floats or None on any failure.
+    """
+    if not _musicnn_embed_available:
+        return None
+    try:
+        from musicnn.extractor import extractor
+        # extract_features=True returns per-frame activations from intermediate layers.
+        # 'timbral' → penultimate layer, shape (n_frames, 200).
+        _, _, features = extractor(audio_path, model='MTT_musicnn', extract_features=True)
+        timbral = features.get('timbral')
+        if timbral is None or len(timbral) == 0:
+            return None
+        mean_emb = np.mean(timbral, axis=0).astype(np.float32)
+        norm = np.linalg.norm(mean_emb)
+        if norm < 1e-8:
+            return None
+        normalised = mean_emb / norm
+        return [round(float(v), 6) for v in normalised]
+    except Exception as e:
+        print(f"⚠️  MusiCNN embedding failed: {e}")
         return None
 
 
@@ -694,6 +763,7 @@ def _analyze_pcm(y: np.ndarray, sr: int) -> AudioFeatures | None:
             arousal=None,
             valence_essentia=None,
             dclap_embedding=None,
+            musicnn_embedding=None,
         )
     except Exception as e:
         print(f"❌ _analyze_pcm failed: {e}")
@@ -738,7 +808,22 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
     if pcm is not None:
         y, sr = pcm
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _analyze_pcm, y, sr)
+        features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
+        if features is not None and _musicnn_embed_available:
+            url_suffix = ".m4a" if "m4a" in preview_url.lower() else ".mp3"
+            with tempfile.NamedTemporaryFile(suffix=url_suffix, delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            try:
+                features.musicnn_embedding = await loop.run_in_executor(
+                    None, get_musicnn_embedding, tmp_path
+                )
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        return features
 
     # Fallback: temp file → analyze_from_file (handles edge-case audio formats)
     print(f"⚠️  ffmpeg pipe failed for {preview_url!r}, falling back to temp file")
@@ -772,7 +857,21 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
     if pcm is not None:
         y, sr = pcm
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _analyze_pcm, y, sr)
+        features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
+        if features is not None and _musicnn_embed_available:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            try:
+                features.musicnn_embedding = await loop.run_in_executor(
+                    None, get_musicnn_embedding, tmp_path
+                )
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        return features
 
     # Fallback: temp file (handles edge-case audio formats ffmpeg can't pipe)
     print("⚠️  ffmpeg pipe failed for bytes input, falling back to temp file")
@@ -822,9 +921,10 @@ def analyze_from_file(path: str) -> AudioFeatures | None:
 
     ext = _extract_extended(y, sr, sc)
 
-    # Essentia + DCLAP both available for local files — pass the original path
-    av        = extract_arousal_valence(path)
-    dclap_emb = get_dclap_embedding(path)
+    # Essentia + DCLAP + MusiCNN all available for local files — pass the original path
+    av          = extract_arousal_valence(path)
+    dclap_emb   = get_dclap_embedding(path)
+    musicnn_emb = get_musicnn_embedding(path)
     arousal_val = round(av[0], 4) if av else None
     val_ess_val = round(av[1], 4) if av else None
 
@@ -850,4 +950,5 @@ def analyze_from_file(path: str) -> AudioFeatures | None:
         arousal=arousal_val,
         valence_essentia=val_ess_val,
         dclap_embedding=dclap_emb,
+        musicnn_embedding=musicnn_emb,
     )
