@@ -43,15 +43,11 @@ app = FastAPI(title="Simi Audio Analyzer", version="1.0.0")
 @app.on_event("startup")
 async def on_startup() -> None:
     import threading
-    # DCLAP: warm in background so it's ready before first real request.
-    # Essentia/TF2 is NOT started here — 400-600MB TF2 footprint risks OOM
-    # on Railway's container limits. Essentia features stay disabled until
-    # we profile actual memory headroom.
+    # All three models warm in parallel background threads.
+    # HF CPU Basic has 16GB RAM — TF2's 400-600MB footprint is fine here.
     threading.Thread(target=init_dclap, daemon=True).start()
     threading.Thread(target=init_musicnn_embedding, daemon=True).start()
-    # Note: no self-ping keepalive needed — Railway's own load balancer health
-    # probes (100.64.0.x) satisfy the inactivity timer. Self-pinging localhost
-    # burns CPU credits without helping.
+    threading.Thread(target=init_essentia, daemon=True).start()
 
 
 # ─────────────────────────────────────────────

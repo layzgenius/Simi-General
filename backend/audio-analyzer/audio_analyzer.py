@@ -809,15 +809,26 @@ async def analyze_from_url(preview_url: str) -> AudioFeatures | None:
         y, sr = pcm
         loop = asyncio.get_running_loop()
         features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
-        if features is not None and _musicnn_embed_available:
+        if features is not None and (_musicnn_embed_available or _essentia_available):
             url_suffix = ".m4a" if "m4a" in preview_url.lower() else ".mp3"
             with tempfile.NamedTemporaryFile(suffix=url_suffix, delete=False) as tmp:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
             try:
-                features.musicnn_embedding = await loop.run_in_executor(
-                    None, get_musicnn_embedding, tmp_path
-                )
+                tasks = []
+                if _musicnn_embed_available:
+                    tasks.append(loop.run_in_executor(None, get_musicnn_embedding, tmp_path))
+                if _essentia_available:
+                    tasks.append(loop.run_in_executor(None, extract_arousal_valence, tmp_path))
+                results = await asyncio.gather(*tasks)
+                idx = 0
+                if _musicnn_embed_available:
+                    features.musicnn_embedding = results[idx]; idx += 1
+                if _essentia_available:
+                    av = results[idx]
+                    if av:
+                        features.arousal = round(av[0], 4)
+                        features.valence_essentia = round(av[1], 4)
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -858,14 +869,25 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
         y, sr = pcm
         loop = asyncio.get_running_loop()
         features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
-        if features is not None and _musicnn_embed_available:
+        if features is not None and (_musicnn_embed_available or _essentia_available):
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
             try:
-                features.musicnn_embedding = await loop.run_in_executor(
-                    None, get_musicnn_embedding, tmp_path
-                )
+                tasks = []
+                if _musicnn_embed_available:
+                    tasks.append(loop.run_in_executor(None, get_musicnn_embedding, tmp_path))
+                if _essentia_available:
+                    tasks.append(loop.run_in_executor(None, extract_arousal_valence, tmp_path))
+                results = await asyncio.gather(*tasks)
+                idx = 0
+                if _musicnn_embed_available:
+                    features.musicnn_embedding = results[idx]; idx += 1
+                if _essentia_available:
+                    av = results[idx]
+                    if av:
+                        features.arousal = round(av[0], 4)
+                        features.valence_essentia = round(av[1], 4)
             finally:
                 try:
                     os.unlink(tmp_path)
