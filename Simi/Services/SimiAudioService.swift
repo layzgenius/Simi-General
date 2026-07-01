@@ -1,12 +1,12 @@
 // SimiAudioService.swift
 // Simi — Music Discovery App
 //
-// Client for the Railway-hosted librosa audio analysis microservice.
-// Source: backend/audio-analyzer/ — deployed to simi-audio-analyzer-production.up.railway.app
+// Client for the Hugging Face Spaces-hosted librosa audio analysis microservice.
+// Source: backend/audio-analyzer/ — deployed to layzskolah-simi-audio-analyzer.hf.space
 //
 // Primary audio feature source. iOS downloads the preview on-device, then POSTs
-// the raw bytes to /analyze-bytes — faster than having Railway fetch from Apple CDN.
-// Falls through silently when Railway is unreachable — tag estimation takes over.
+// the raw bytes to /analyze-bytes — faster than having the server fetch from Apple CDN.
+// Falls through silently when the service is unreachable — tag estimation takes over.
 
 import Foundation
 
@@ -14,7 +14,7 @@ class SimiAudioService {
 
     static let shared = SimiAudioService()
 
-    private let baseURL = "https://simi-audio-analyzer-production.up.railway.app"
+    private let baseURL = "https://layzskolah-simi-audio-analyzer.hf.space"
 
     private let session: URLSession
 
