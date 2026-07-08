@@ -98,6 +98,7 @@ class AudioFeatures(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     previewUrl: str
+    spotifyId:  str = ""   # when provided, enables Supabase cache lookup + storage
 
 
 class BatchAnalyzeRequest(BaseModel):
@@ -161,6 +162,58 @@ _SUPABASE_URL  = os.environ.get("SUPABASE_URL", "")
 _SUPABASE_KEY  = os.environ.get("SUPABASE_ANON_KEY", "")
 _LASTFM_PROXY_URL = "https://simi-token-proxy.lazyscholarph.workers.dev/lastfm"
 _LASTFM_PROXY_KEY = "0db4b8d62e7b427fed685e73309d33d9473429b54f6854aed1287d3b2c2762a5"
+
+
+async def _supabase_lookup_features(spotify_id: str) -> AudioFeatures | None:
+    """Check analyzed_songs cache for a previously enriched result. ~50-100ms on hit."""
+    if not _SUPABASE_URL or not _SUPABASE_KEY or not spotify_id:
+        return None
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(
+                f"{_SUPABASE_URL}/rest/v1/analyzed_songs",
+                params={"spotify_id": f"eq.{spotify_id}", "select": "features", "limit": "1"},
+                headers={"apikey": _SUPABASE_KEY, "Authorization": f"Bearer {_SUPABASE_KEY}"},
+            )
+            rows = r.json()
+            if rows and isinstance(rows, list) and rows[0].get("features"):
+                return AudioFeatures(**rows[0]["features"])
+    except Exception:
+        pass
+    return None
+
+
+async def _supabase_store_features(spotify_id: str, title: str, artist: str, features: AudioFeatures) -> None:
+    """Background task: store freshly analyzed features so the next call is instant."""
+    if not _SUPABASE_URL or not _SUPABASE_KEY or not spotify_id:
+        return
+    import httpx
+    emb = build_embedding(features.to_dict())
+    emb_str = "[" + ",".join(f"{v:.6f}" for v in emb) + "]"
+    payload = {
+        "spotify_id": spotify_id,
+        "title":      title,
+        "artist":     artist,
+        "embedding":  emb_str,
+        "features":   features.model_dump(),
+    }
+    headers = {
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "apikey":         _SUPABASE_KEY,
+        "Content-Type":   "application/json",
+        "Prefer":         "resolution=merge-duplicates",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{_SUPABASE_URL}/rest/v1/analyzed_songs",
+                params={"on_conflict": "spotify_id"},
+                json=payload,
+                headers=headers,
+            )
+    except Exception:
+        pass
 
 
 async def _supabase_upsert_vector(spotify_id: str, title: str, artist: str, features: AudioFeatures) -> bool:
@@ -307,12 +360,37 @@ async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks,
     isKeyEstimated=false (Krumhansl-Schmuckler pitch class detection is real signal).
     Pass artist + title query params to trigger cascade prefetch of artist's catalog.
     """
+    # Cache hit — return enriched features instantly (~50-100ms)
+    if req.spotifyId:
+        cached = await _supabase_lookup_features(req.spotifyId)
+        if cached is not None:
+            return cached
+
     features = await analyze_from_url(req.previewUrl)
     if features is None:
         raise HTTPException(status_code=422, detail="Audio analysis failed — check the URL and ensure ffmpeg is installed for M4A support")
 
     if artist:
         background_tasks.add_task(_warm_artist_catalog, artist, title)
+
+    # Cache miss — store enriched result so next call is instant
+    if req.spotifyId:
+        background_tasks.add_task(_supabase_store_features, req.spotifyId, title, artist, AudioFeatures(
+            bpm=features.bpm, energy=features.energy, valence=features.valence,
+            danceability=features.danceability, acousticness=features.acousticness,
+            instrumentalness=features.instrumentalness, liveness=features.liveness,
+            loudness=features.loudness, key=features.key, mode=features.mode,
+            isEstimated=features.is_estimated, isKeyEstimated=features.is_key_estimated,
+            spectralWarmth=features.spectral_warmth, tonalClarity=features.tonal_clarity,
+            vocalPresence=features.vocal_presence, reverbSpace=features.reverb_space,
+            mfccMean=features.mfcc_mean, mfccStd=features.mfcc_std,
+            spectralContrast=features.spectral_contrast_bands, chroma=features.chroma_cqt_mean,
+            chromaEntropy=features.chroma_entropy, zcr=features.zcr_mean,
+            rolloff=features.rolloff_norm, onsetMean=features.onset_mean,
+            onsetStd=features.onset_std, grooveRatio=features.groove_ratio,
+            arousal=features.arousal, valenceEssentia=features.valence_essentia,
+            dclapEmbedding=features.dclap_embedding, musicnnEmbedding=features.musicnn_embedding,
+        ))
 
     return AudioFeatures(
         bpm=features.bpm,
@@ -352,6 +430,7 @@ async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks,
 async def analyze_bytes_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    spotify_id: str = "",
     artist: str = "",
     title: str = "",
 ) -> AudioFeatures:
@@ -359,8 +438,15 @@ async def analyze_bytes_endpoint(
     Analyzes pre-downloaded audio bytes POSTed as multipart/form-data.
     iOS downloads the preview URL on-device (fast CDN routing) and sends
     the raw bytes here — eliminates server-side CDN download latency.
+    Pass spotify_id to enable Supabase cache lookup (instant on repeat plays).
     Pass artist + title query params to trigger cascade prefetch of artist's catalog.
     """
+    # Cache hit — return enriched features instantly
+    if spotify_id:
+        cached = await _supabase_lookup_features(spotify_id)
+        if cached is not None:
+            return cached
+
     audio_bytes = await file.read()
     filename = file.filename or ""
     suffix = ".m4a" if filename.endswith(".m4a") else ".mp3"
@@ -404,6 +490,10 @@ async def analyze_bytes_endpoint(
 
     if artist:
         background_tasks.add_task(_warm_artist_catalog, artist, title)
+
+    # Cache miss — store so next call is instant
+    if spotify_id:
+        background_tasks.add_task(_supabase_store_features, spotify_id, title, artist, result)
 
     return result
 

@@ -454,10 +454,11 @@ def get_musicnn_embedding(audio_path: str) -> list[float] | None:
         return None
     try:
         from musicnn.extractor import extractor
-        # extract_features=True returns per-frame activations from intermediate layers.
-        # 'timbral' → penultimate layer, shape (n_frames, 200).
+        # extract_features=True returns a dict of intermediate layer activations.
+        # 'penultimate' → 200-dim fully-connected layer before tag predictions.
+        # 'timbral' is a temporal pooling of earlier CNN layers — wrong key, gives 408-dim.
         _, _, features = extractor(audio_path, model='MTT_musicnn', extract_features=True)
-        timbral = features.get('timbral')
+        timbral = features.get('penultimate')
         if timbral is None or len(timbral) == 0:
             return None
         mean_emb = np.mean(timbral, axis=0).astype(np.float32)
@@ -1012,18 +1013,22 @@ async def analyze_from_bytes(audio_bytes: bytes, suffix: str) -> AudioFeatures |
         y, sr = pcm
         loop = asyncio.get_running_loop()
         features = await loop.run_in_executor(None, _analyze_pcm, y, sr)
-        if features is not None and (_musicnn_embed_available or _deam_onnx_available):
+        if features is not None and (_dclap_available or _musicnn_embed_available or _deam_onnx_available):
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(audio_bytes)
                 tmp_path = tmp.name
             try:
                 tasks = []
+                if _dclap_available:
+                    tasks.append(loop.run_in_executor(None, get_dclap_embedding, tmp_path))
                 if _musicnn_embed_available:
                     tasks.append(loop.run_in_executor(None, get_musicnn_embedding, tmp_path))
                 if _deam_onnx_available:
                     tasks.append(loop.run_in_executor(None, get_deam_arousal_valence, tmp_path))
                 results = await asyncio.gather(*tasks)
                 idx = 0
+                if _dclap_available:
+                    features.dclap_embedding = results[idx]; idx += 1
                 if _musicnn_embed_available:
                     features.musicnn_embedding = results[idx]; idx += 1
                 if _deam_onnx_available:
