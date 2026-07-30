@@ -24,7 +24,14 @@ Start:
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import os
+import sqlite3
+import tarfile
+import threading
+import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
@@ -40,6 +47,207 @@ from similarity_engine import compute_similarity, AudioFeaturesDict, build_embed
 
 app = FastAPI(title="Simi Audio Analyzer", version="1.0.0")
 
+# ─────────────────────────────────────────────
+# AcousticBrainz SQLite — loaded once at startup, queried per /ab-lookup request.
+# Populated offline by import_acousticbrainz.py from the July 2022 frozen dump.
+# The DB is optional: if the file doesn't exist the endpoint returns 404 gracefully.
+# ─────────────────────────────────────────────
+_AB_DB_PATH  = Path("data/acousticbrainz.db")
+_ab_conn: sqlite3.Connection | None = None
+
+
+def _init_ab_db() -> None:
+    global _ab_conn
+    if not _AB_DB_PATH.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(_AB_DB_PATH), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA query_only=1")
+        _ab_conn = conn
+        count = conn.execute("SELECT COUNT(*) FROM acousticbrainz").fetchone()[0]
+        print(f"[AB] SQLite ready — {count:,} tracks at {_AB_DB_PATH}")
+    except Exception as e:
+        print(f"[AB] SQLite init failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# AcousticBrainz background importer
+# Streams archives from MetaBrainz directly — no local download needed.
+# ─────────────────────────────────────────────
+
+_AB_ARCHIVE_URL = (
+    "https://data.metabrainz.org/pub/musicbrainz/acousticbrainz/dumps/"
+    "acousticbrainz-lowlevel-json-20220623/"
+    "acousticbrainz-lowlevel-json-20220623-{n}.tar.zst"
+)
+_AB_TOTAL_ARCHIVES = 30
+
+_AB_KEY_MAP = {
+    "C": 0, "C#": 1, "Db": 1,
+    "D": 2, "D#": 3, "Eb": 3,
+    "E": 4,
+    "F": 5, "F#": 6, "Gb": 6,
+    "G": 7, "G#": 8, "Ab": 8,
+    "A": 9, "A#": 10, "Bb": 10,
+    "B": 11,
+}
+
+_import_state: dict = {
+    "running":        False,
+    "archive_index":  0,
+    "rows_written":   0,
+    "rows_skipped":   0,
+    "error":          None,
+    "started_at":     None,
+    "finished_at":    None,
+    "current_url":    None,
+}
+
+
+class _HttpxStreamReader(io.RawIOBase):
+    """Wraps a synchronous httpx streaming response as a file-like object for zstd."""
+    def __init__(self, response: "httpx.Response") -> None:
+        self._iter = response.iter_bytes(chunk_size=65536)
+        self._buf  = b""
+
+    def read(self, n: int = -1) -> bytes:
+        if n == -1:
+            return b"".join(self._iter)
+        while len(self._buf) < n:
+            try:
+                self._buf += next(self._iter)
+            except StopIteration:
+                break
+        chunk, self._buf = self._buf[:n], self._buf[n:]
+        return chunk
+
+    def readable(self) -> bool:
+        return True
+
+
+def _ab_mbid_from_path(name: str) -> str | None:
+    stem = Path(name).stem
+    parts = stem.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return stem or None
+
+
+def _ab_init_sqlite(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS acousticbrainz (
+            mbid         TEXT PRIMARY KEY,
+            bpm          REAL NOT NULL,
+            key          INTEGER NOT NULL,
+            mode         INTEGER NOT NULL,
+            energy       REAL NOT NULL,
+            danceability REAL NOT NULL
+        )
+    """)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.commit()
+    return conn
+
+
+def _run_ab_import(start_from: int = 0) -> None:
+    """Stream all AB archives from MetaBrainz and write to local SQLite. Background thread."""
+    global _ab_conn
+    import httpx
+    try:
+        import zstandard as zstd
+    except ImportError:
+        _import_state["error"] = "zstandard not installed — add it to requirements.txt"
+        _import_state["running"] = False
+        return
+
+    _import_state.update({"running": True, "error": None, "started_at": time.time(), "finished_at": None})
+    conn = _ab_init_sqlite(_AB_DB_PATH)
+    BATCH = 5000
+
+    try:
+        for n in range(start_from, _AB_TOTAL_ARCHIVES):
+            url = _AB_ARCHIVE_URL.format(n=n)
+            _import_state["archive_index"] = n
+            _import_state["current_url"]   = url
+            print(f"[AB] Archive {n+1}/{_AB_TOTAL_ARCHIVES}: {url}")
+            batch: list[tuple] = []
+
+            with httpx.stream("GET", url, follow_redirects=True,
+                              timeout=httpx.Timeout(60, read=900)) as resp:
+                resp.raise_for_status()
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(_HttpxStreamReader(resp)) as zst:
+                    with tarfile.open(fileobj=io.BufferedReader(zst), mode="r|") as tf:
+                        for member in tf:
+                            if not member.name.endswith(".json"):
+                                continue
+                            mbid = _ab_mbid_from_path(member.name)
+                            if not mbid:
+                                continue
+                            try:
+                                f = tf.extractfile(member)
+                                if f is None:
+                                    continue
+                                ab = json.load(f)
+                                bpm          = float(ab["rhythm"]["bpm"])
+                                key_name     = ab["tonal"]["key_key"]
+                                key_scale    = ab["tonal"]["key_scale"]
+                                energy       = float(ab["lowlevel"]["average_loudness"])
+                                danceability = float(ab["rhythm"]["danceability"])
+                            except Exception:
+                                _import_state["rows_skipped"] += 1
+                                continue
+
+                            key = _AB_KEY_MAP.get(key_name)
+                            if key is None:
+                                _import_state["rows_skipped"] += 1
+                                continue
+
+                            batch.append((
+                                mbid,
+                                round(bpm, 2),
+                                key,
+                                1 if key_scale == "major" else 0,
+                                round(max(0.0, min(energy, 1.0)), 4),
+                                round(min(danceability / 3.0, 1.0), 4),
+                            ))
+
+                            if len(batch) >= BATCH:
+                                conn.executemany(
+                                    "INSERT OR REPLACE INTO acousticbrainz"
+                                    "(mbid,bpm,key,mode,energy,danceability) VALUES(?,?,?,?,?,?)",
+                                    batch,
+                                )
+                                conn.commit()
+                                _import_state["rows_written"] += len(batch)
+                                batch.clear()
+
+            if batch:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO acousticbrainz"
+                    "(mbid,bpm,key,mode,energy,danceability) VALUES(?,?,?,?,?,?)",
+                    batch,
+                )
+                conn.commit()
+                _import_state["rows_written"] += len(batch)
+
+            print(f"[AB] Archive {n+1} done — {_import_state['rows_written']:,} total rows")
+
+        _import_state["finished_at"] = time.time()
+        print(f"[AB] Import complete — {_import_state['rows_written']:,} rows")
+
+    except Exception as e:
+        _import_state["error"] = str(e)
+        print(f"[AB] Import error: {e}")
+    finally:
+        _import_state["running"] = False
+        conn.close()
+        _init_ab_db()   # reload read-only connection so /ab-lookup sees the new data
+
 
 @app.on_event("startup")
 async def on_startup() -> None:
@@ -50,6 +258,7 @@ async def on_startup() -> None:
     threading.Thread(target=init_musicnn_embedding, daemon=True).start()
     threading.Thread(target=init_msd_musicnn_onnx, daemon=True).start()
     threading.Thread(target=init_deam_onnx, daemon=True).start()
+    threading.Thread(target=_init_ab_db, daemon=True).start()
 
 
 # ─────────────────────────────────────────────
@@ -158,8 +367,9 @@ class ExplainResponse(BaseModel):
 # Supabase helper — optional, only wired when env vars are present
 # ─────────────────────────────────────────────
 
-_SUPABASE_URL  = os.environ.get("SUPABASE_URL", "")
-_SUPABASE_KEY  = os.environ.get("SUPABASE_ANON_KEY", "")
+_SUPABASE_URL          = os.environ.get("SUPABASE_URL", "")
+_SUPABASE_KEY          = os.environ.get("SUPABASE_ANON_KEY", "")
+_SUPABASE_SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 _LASTFM_PROXY_URL = "https://simi-token-proxy.lazyscholarph.workers.dev/lastfm"
 _LASTFM_PROXY_KEY = "0db4b8d62e7b427fed685e73309d33d9473429b54f6854aed1287d3b2c2762a5"
 
@@ -178,7 +388,11 @@ async def _supabase_lookup_features(spotify_id: str) -> AudioFeatures | None:
             )
             rows = r.json()
             if rows and isinstance(rows, list) and rows[0].get("features"):
-                return AudioFeatures(**rows[0]["features"])
+                cached = AudioFeatures(**rows[0]["features"])
+                # Stale if neural embeddings are absent — re-analyze with current model
+                if cached.dclapEmbedding is None:
+                    return None
+                return cached
     except Exception:
         pass
     return None
@@ -727,9 +941,10 @@ async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesRespon
             if musicnn_emb is not None:
                 payload["musicnn_embedding"] = "[" + ",".join(f"{v:.6f}" for v in musicnn_emb) + "]"
 
+            write_key = _SUPABASE_SERVICE_KEY or _SUPABASE_KEY
             headers = {
-                "Authorization": f"Bearer {_SUPABASE_KEY}",
-                "apikey":         _SUPABASE_KEY,
+                "Authorization": f"Bearer {write_key}",
+                "apikey":         write_key,
                 "Content-Type":   "application/json",
                 "Prefer":         "resolution=merge-duplicates",
             }
@@ -745,7 +960,7 @@ async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesRespon
             except Exception:
                 return False
 
-    results = await asyncio.gather(*[embed_one(c) for c in req.candidates[:20]])
+    results = await asyncio.gather(*[embed_one(c) for c in req.candidates[:25]])
     return EmbedCandidatesResponse(embedded=sum(results))
 
 
@@ -755,13 +970,14 @@ async def vector_search(req: VectorSearchRequest) -> VectorSearchResponse:
     Nearest-neighbour search over track_embeddings via Supabase find_similar_tracks RPC.
     Returns up to matchCount candidates sorted by cosine similarity descending.
     """
-    if not _SUPABASE_URL or not _SUPABASE_KEY:
+    _key = _SUPABASE_KEY or _SUPABASE_SERVICE_KEY
+    if not _SUPABASE_URL or not _key:
         return VectorSearchResponse(results=[])
 
     emb_str = "[" + ",".join(f"{v:.6f}" for v in req.embedding) + "]"
     headers = {
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "apikey":         _SUPABASE_KEY,
+        "Authorization": f"Bearer {_key}",
+        "apikey":         _key,
         "Content-Type":   "application/json",
     }
     payload = {
@@ -809,13 +1025,14 @@ async def musicnn_vector_search(req: MusicnnVectorSearchRequest) -> VectorSearch
     the find_similar_tracks_musicnn Supabase RPC (200-dim cosine similarity).
     Returns up to matchCount candidates sorted by similarity descending.
     """
-    if not _SUPABASE_URL or not _SUPABASE_KEY:
+    _key = _SUPABASE_KEY or _SUPABASE_SERVICE_KEY
+    if not _SUPABASE_URL or not _key:
         return VectorSearchResponse(results=[])
 
     emb_str = "[" + ",".join(f"{v:.6f}" for v in req.embedding) + "]"
     headers = {
-        "Authorization": f"Bearer {_SUPABASE_KEY}",
-        "apikey":         _SUPABASE_KEY,
+        "Authorization": f"Bearer {_key}",
+        "apikey":         _key,
         "Content-Type":   "application/json",
     }
     payload = {
@@ -851,6 +1068,59 @@ async def musicnn_vector_search(req: MusicnnVectorSearchRequest) -> VectorSearch
     return VectorSearchResponse(results=results)
 
 
+@app.post("/admin/import-ab")
+async def start_ab_import(token: str, start_from: int = 0) -> dict:
+    """
+    Trigger the AcousticBrainz import on the Space itself.
+    Protected by ADMIN_TOKEN env var set in HF Space secrets.
+    Use start_from=N to resume from a specific archive (0-29) after a failure.
+    """
+    admin_token = os.environ.get("ADMIN_TOKEN", "")
+    if not admin_token or token != admin_token:
+        raise HTTPException(status_code=403, detail="Invalid token")
+    if _import_state["running"]:
+        return {"status": "already_running", **_import_state}
+    threading.Thread(target=_run_ab_import, args=(start_from,), daemon=True).start()
+    return {"status": "started", "total_archives": _AB_TOTAL_ARCHIVES}
+
+
+@app.get("/admin/import-ab/status")
+async def ab_import_status() -> dict:
+    """Check progress of a running or completed AcousticBrainz import."""
+    elapsed = None
+    if _import_state["started_at"]:
+        end = _import_state["finished_at"] or time.time()
+        elapsed = round(end - _import_state["started_at"])
+    return {**_import_state, "elapsed_seconds": elapsed}
+
+
+@app.get("/ab-lookup")
+async def ab_lookup(mbid: str) -> dict:
+    """
+    Look up AcousticBrainz features for a MusicBrainz Recording ID.
+    Returns bpm/key/mode/energy/danceability or 404 on miss.
+    """
+    if not mbid:
+        raise HTTPException(status_code=400, detail="mbid required")
+    if _ab_conn is None:
+        raise HTTPException(status_code=503, detail="AcousticBrainz DB not loaded")
+    row = _ab_conn.execute(
+        "SELECT bpm, key, mode, energy, danceability FROM acousticbrainz WHERE mbid = ?",
+        (mbid,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="MBID not found")
+    bpm, key, mode, energy, danceability = row
+    return {
+        "mbid":        mbid,
+        "bpm":         bpm,
+        "key":         key,
+        "mode":        mode,
+        "energy":      energy,
+        "danceability": danceability,
+    }
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     from audio_analyzer import (
@@ -858,6 +1128,16 @@ async def health() -> dict[str, str]:
         _msd_musicnn_available, _deam_onnx_available,
     )
     vector_catalog = "supabase_configured" if (_SUPABASE_URL and _SUPABASE_KEY) else "supabase_not_configured"
+    if _ab_conn is not None:
+        try:
+            ab_count = _ab_conn.execute("SELECT COUNT(*) FROM acousticbrainz").fetchone()[0]
+            ab_status = f"ready ({ab_count:,} tracks)"
+        except Exception:
+            ab_status = "error"
+    elif _AB_DB_PATH.exists():
+        ab_status = "loading"
+    else:
+        ab_status = "db_not_found"
     return {
         "status": "ok",
         "vector_catalog": vector_catalog,
@@ -865,4 +1145,5 @@ async def health() -> dict[str, str]:
         "musicnn": "ready" if _musicnn_embed_available else "unavailable",
         "msd_musicnn": "ready" if _msd_musicnn_available else "unavailable",
         "deam": "ready" if _deam_onnx_available else "unavailable",
+        "acousticbrainz": ab_status,
     }
