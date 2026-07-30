@@ -880,7 +880,9 @@ async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesRespon
     No-ops when DCLAP or Supabase is unavailable. MusiCNN is stored when available.
     """
     from audio_analyzer import _dclap_available, _musicnn_embed_available
-    if not _dclap_available or not _SUPABASE_URL or not _SUPABASE_KEY:
+    _write_key = _SUPABASE_SERVICE_KEY or _SUPABASE_KEY
+    if not _dclap_available or not _SUPABASE_URL or not _write_key:
+        print(f"⚠️  embed-candidates early return: dclap={_dclap_available} url={bool(_SUPABASE_URL)} key={bool(_write_key)}")
         return EmbedCandidatesResponse(embedded=0)
 
     import httpx as _httpx
@@ -899,7 +901,8 @@ async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesRespon
                     resp = await client.get(item.previewUrl)
                     resp.raise_for_status()
                     audio_bytes = resp.content
-            except Exception:
+            except Exception as e:
+                print(f"⚠️  embed-candidates download failed for {item.spotifyId}: {e}")
                 return False
 
             import tempfile, os as _os
@@ -926,6 +929,7 @@ async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesRespon
                     pass
 
             if dclap_emb is None:
+                print(f"⚠️  embed-candidates DCLAP returned None for {item.spotifyId}")
                 return False
 
             emb_str = "[" + ",".join(f"{v:.6f}" for v in dclap_emb) + "]"
@@ -956,8 +960,11 @@ async def embed_candidates(req: EmbedCandidatesRequest) -> EmbedCandidatesRespon
                         json=payload,
                         headers=headers,
                     )
+                    if r.status_code not in (200, 201):
+                        print(f"⚠️  embed-candidates upsert failed {r.status_code} for {item.spotifyId}: {r.text[:200]}")
                     return r.status_code in (200, 201)
-            except Exception:
+            except Exception as e:
+                print(f"⚠️  embed-candidates upsert exception for {item.spotifyId}: {e}")
                 return False
 
     results = await asyncio.gather(*[embed_one(c) for c in req.candidates[:25]])
