@@ -18,7 +18,7 @@ import librosa
 import scipy.stats
 import pandas as pd
 from pathlib import Path
-from sklearn.preprocessing import normalize
+from scipy.fftpack import dct
 
 # Krumhansl-Schmuckler profiles — matches SonicDNA's findKey() Pearson correlation
 _KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
@@ -35,17 +35,23 @@ def detect_key_mode(chroma_mean: np.ndarray) -> tuple:
     """Krumhansl-Schmuckler key detection via Pearson correlation.
 
     Returns (key: 0-11, mode: 0=minor/1=major, confidence: 0-1).
-    Mirrors SonicDNA's findKey(chroma:) implementation.
+    Mirrors SonicDNA's findKey(chroma:) implementation, including the
+    margin-based confidence formula (bestCorr - max(0, secondBest)) / 0.15.
     """
     best_key, best_mode, best_corr = 0, 1, -2.0
+    second_best = -2.0
     for key in range(12):
-        for mode_idx, profile in enumerate([_KS_MINOR, _KS_MAJOR]):
+        for profile, mode_idx in [(_KS_MAJOR, 1), (_KS_MINOR, 0)]:
             rotated = np.roll(profile, key)
             corr_matrix = np.corrcoef(chroma_mean, rotated)
-            corr = float(corr_matrix[0, 1]) if np.all(np.isfinite(corr_matrix)) else 0.0
+            corr = float(corr_matrix[0, 1]) if corr_matrix.shape == (2, 2) else -2.0
             if corr > best_corr:
+                second_best = best_corr
                 best_corr, best_key, best_mode = corr, key, mode_idx
-    confidence = float(np.clip((best_corr + 1.0) / 2.0, 0.0, 1.0))
+            elif corr > second_best:
+                second_best = corr
+    margin = best_corr - max(0.0, second_best)
+    confidence = float(np.clip(margin / 0.15, 0.0, 1.0))
     return best_key, best_mode, confidence
 
 
@@ -56,22 +62,32 @@ def build_feature_vector(y: np.ndarray, sr: int) -> list:
     The StandardScaler in the trained Pipeline handles per-feature normalization —
     raw values are fine except MFCCs which must be L2-normalized to match SonicDNA.
     """
-    # ── MFCCs: L2-normalize each frame, then take mean/std, then L2-normalize vectors ──
-    mfcc_frames = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC,
-                                        n_fft=2048, hop_length=512)
-    # mfcc_frames shape: (N_MFCC, n_frames). Normalize each frame (row in transposed form).
-    mfcc_norm   = normalize(mfcc_frames.T, norm="l2")        # (n_frames, N_MFCC)
-    mfcc_mean   = mfcc_norm.mean(axis=0)                     # (N_MFCC,)
-    mfcc_std    = mfcc_norm.std(axis=0)                      # (N_MFCC,)
+    # ── MFCCs: compute mel log energy, take mean/std across frames, DCT once, L2-normalize ──
+    # Matches Swift: accumulate melLogEnergy per frame, DCT the mean/std vectors, l2Normalize.
+    # htk=True  → HTK mel scale (matches Swift buildMelFilterbank)
+    # norm=None → no Slaney area normalization (matches Swift raw triangular weights)
+    mel_spec = librosa.feature.melspectrogram(
+        y=y, sr=sr, n_mels=128, n_fft=2048, hop_length=512, htk=True, norm=None
+    )
+    mel_log  = librosa.power_to_db(mel_spec)                 # (128, n_frames), dB log scale
+    mel_mean = mel_log.mean(axis=1)                          # (128,) — mean across frames
+    mel_std  = mel_log.std(axis=1)                           # (128,) — std across frames
+
+    mfcc_mean = dct(mel_mean, type=2, norm='ortho')[:N_MFCC]  # first 20 DCT coefficients
+    mfcc_std  = dct(mel_std,  type=2, norm='ortho')[:N_MFCC]
     # L2-normalize the summary vectors — matches SonicDNA's final l2Normalize(dctII(...))
     nm = np.linalg.norm(mfcc_mean); mfcc_mean = mfcc_mean / nm if nm > 1e-8 else mfcc_mean
     ns = np.linalg.norm(mfcc_std);  mfcc_std  = mfcc_std  / ns if ns > 1e-8 else mfcc_std
 
-    # ── Chroma: 12-bin CQT mean, normalized to sum-1 distribution ──────────────
-    chroma_frames = librosa.feature.chroma_cqt(y=y, sr=sr)  # (12, n_frames)
-    chroma_mean   = chroma_frames.mean(axis=1)               # (12,)
-    cs = chroma_mean.sum()
-    chroma_mean = chroma_mean / cs if cs > 1e-8 else chroma_mean
+    # ── Chroma: STFT-based, accumulate raw magnitudes across frames, normalize once ──
+    # Matches Swift: sum each frequency bin into its nearest pitch class, normalize to sum=1.
+    # norm=None → no per-frame normalization (matches Swift raw accumulation then single norm)
+    chroma_frames = librosa.feature.chroma_stft(
+        y=y, sr=sr, n_fft=2048, hop_length=512, norm=None
+    )                                                        # (12, n_frames)
+    chroma_sum  = chroma_frames.sum(axis=1)                  # (12,) — sum across frames
+    cs = chroma_sum.sum()
+    chroma_mean = chroma_sum / cs if cs > 1e-8 else np.ones(12) / 12.0
 
     # ── Chroma entropy: Shannon entropy normalized by max (log 12) ──────────────
     chroma_entropy = float(scipy.stats.entropy(chroma_mean + 1e-10) / np.log(12))
