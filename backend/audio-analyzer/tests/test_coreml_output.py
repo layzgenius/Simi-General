@@ -5,9 +5,11 @@ ML_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..
 VAL_PKG = os.path.join(ML_DIR, "SimiValenceRegressor.mlpackage")
 ARO_PKG = os.path.join(ML_DIR, "SimiArousalRegressor.mlpackage")
 VAL_JOB = os.path.join(ML_DIR, "valence_pipeline.joblib")
+ARO_JOB = os.path.join(ML_DIR, "arousal_pipeline.joblib")
 
 models_exist  = pytest.mark.skipif(not os.path.isdir(VAL_PKG), reason="run convert_to_coreml.py first")
 joblibs_exist = pytest.mark.skipif(not os.path.isfile(VAL_JOB), reason="run train_valence_model.py first")
+arousal_joblib_exists = pytest.mark.skipif(not os.path.isfile(ARO_JOB), reason="run train_valence_model.py first")
 
 
 @models_exist
@@ -36,7 +38,7 @@ def test_coreml_matches_sklearn_within_tolerance():
     rng = np.random.default_rng(99)
     for _ in range(5):
         row = rng.standard_normal(58)
-        sk_pred  = float(np.clip(skl.predict([row])[0], 0, 1))
+        sk_pred  = float(skl.predict([row])[0])
         ct_out   = cml.predict({"features": row})
         ct_pred  = float(list(ct_out.values())[0])
         assert abs(sk_pred - ct_pred) < 0.01, \
@@ -50,3 +52,29 @@ def test_output_feature_name_is_valence():
     spec = cml.get_spec()
     names = [o.name for o in spec.description.output]
     assert "valence" in names, f"Output names: {names}. Update Swift featureValue(for:) key."
+
+
+@models_exist
+@arousal_joblib_exists
+def test_arousal_coreml_matches_sklearn_within_tolerance():
+    """CoreML and sklearn must agree within 1% on the same input for arousal."""
+    import coremltools as ct, joblib
+    cml = ct.models.MLModel(ARO_PKG)
+    skl = joblib.load(ARO_JOB)
+    rng = np.random.default_rng(99)
+    for _ in range(5):
+        row = rng.standard_normal(58)
+        sk_pred  = float(skl.predict([row])[0])
+        ct_out   = cml.predict({"features": row})
+        ct_pred  = float(list(ct_out.values())[0])
+        assert abs(sk_pred - ct_pred) < 0.01, \
+            f"sklearn={sk_pred:.4f} CoreML={ct_pred:.4f} — mismatch exceeds 1%"
+
+
+@models_exist
+def test_output_feature_name_is_arousal():
+    import coremltools as ct
+    cml  = ct.models.MLModel(ARO_PKG)
+    spec = cml.get_spec()
+    names = [o.name for o in spec.description.output]
+    assert "arousal" in names, f"Output names: {names}. Update Swift featureValue(for:) key."
