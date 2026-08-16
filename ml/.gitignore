@@ -1,0 +1,5 @@
+# DEAM audio clips — large binary, do not commit
+deam/
+# Intermediate training artifacts
+*.joblib
+deam_features.npz
