@@ -27,7 +27,8 @@ final class ValenceArousalPredictor {
 
     private init() {
         func load(_ name: String) -> MLModel? {
-            guard let url = Bundle.main.url(forResource: name, withExtension: "mlpackage")
+            guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc")
+                ?? Bundle.main.url(forResource: name, withExtension: "mlpackage")
             else { return nil }
             return try? MLModel(contentsOf: url)
         }

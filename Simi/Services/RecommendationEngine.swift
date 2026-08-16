@@ -2054,7 +2054,7 @@ class RecommendationEngine: ObservableObject {
                             $0.title == title && $0.artist == artist
                         }), var af = recommendations[liveIdx].audioFeatures else { continue }
 
-                        af.valenceEssentia = pyFeatures.valenceEssentia
+                        if let vv = pyFeatures.valenceEssentia { af.valenceEssentia = vv }
                         if let da = pyFeatures.arousal { af.arousal = da }
                         recommendations[liveIdx].audioFeatures = af
                         let enriched = af  // snapshot before Task capture
