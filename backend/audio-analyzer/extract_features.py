@@ -123,33 +123,30 @@ def build_feature_vector(y: np.ndarray, sr: int) -> list:
 def load_deam_annotations(deam_root: str) -> pd.DataFrame:
     """Load per-song valence + arousal from DEAM annotation CSVs.
 
-    DEAM 2018 layout:
-      annotations/annotations averaged per song/song_level_ratings/valence.csv
-      annotations/annotations averaged per song/song_level_ratings/arousal.csv
+    Actual DEAM 2018 layout (from DEAM_Annotations.zip):
+      annotations/annotations averaged per song/song_level/
+        static_annotations_averaged_songs_1_2000.csv
+        static_annotations_averaged_songs_2000_2058.csv
+      Columns: song_id, valence_mean, valence_std, arousal_mean, arousal_std
+      Scale: SAM 1-9. Normalize to [0,1] via (value - 1) / 8.
 
-    Each CSV: first column = song_id (int), second column = mean (1-9 SAM scale).
-    Normalizes to [0,1] via (value - 1) / 8.
-
-    If your download has a different layout, update the paths below — the rest
-    of the code only needs a DataFrame with columns [song_id, valence, arousal].
+    The rest of the code only needs [song_id, valence, arousal].
     """
-    ann_dir = os.path.join(deam_root, "annotations",
-                           "annotations averaged per song", "song_level_ratings")
-    v_path  = os.path.join(ann_dir, "valence.csv")
-    a_path  = os.path.join(ann_dir, "arousal.csv")
-
-    def read_csv(path):
-        df = pd.read_csv(path).rename(columns=str.strip)
-        cols = df.columns.tolist()
-        return df[[cols[0], cols[1]]].rename(columns={cols[0]: "song_id", cols[1]: "mean"})
-
-    v_df = read_csv(v_path).rename(columns={"mean": "valence_raw"})
-    a_df = read_csv(a_path).rename(columns={"mean": "arousal_raw"})
-    merged = pd.merge(v_df, a_df, on="song_id")
-    merged["valence"] = (merged["valence_raw"].astype(float) - 1.0) / 8.0
-    merged["arousal"] = (merged["arousal_raw"].astype(float) - 1.0) / 8.0
-    merged["song_id"] = merged["song_id"].astype(int)
-    return merged[["song_id", "valence", "arousal"]]
+    song_level_dir = os.path.join(deam_root, "annotations",
+                                  "annotations averaged per song", "song_level")
+    parts = []
+    for fname in ("static_annotations_averaged_songs_1_2000.csv",
+                  "static_annotations_averaged_songs_2000_2058.csv"):
+        path = os.path.join(song_level_dir, fname)
+        if os.path.exists(path):
+            parts.append(pd.read_csv(path).rename(columns=str.strip))
+    if not parts:
+        raise FileNotFoundError(f"No annotation CSVs found in {song_level_dir}")
+    df = pd.concat(parts, ignore_index=True)
+    df["song_id"] = df["song_id"].astype(int)
+    df["valence"] = (df["valence_mean"].astype(float) - 1.0) / 8.0
+    df["arousal"] = (df["arousal_mean"].astype(float) - 1.0) / 8.0
+    return df[["song_id", "valence", "arousal"]]
 
 
 def extract_deam_dataset(deam_root: str, output_path: str, max_clips: int = None):
