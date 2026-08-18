@@ -2,15 +2,17 @@
 // Simi — Music Discovery App
 //
 // The brain of Simi. Coordinates Spotify, Last.fm, Deezer, MusicBrainz, ListenBrainz,
-// and a Railway-hosted librosa microservice to produce a ranked list of similar songs.
+// and a HuggingFace-hosted librosa microservice to produce a ranked list of similar songs.
 //
 // Audio feature priority chain:
 //   1. Supabase feature cache  (any prior source — instant)
-//   2. Railway librosa         (full measured FFT/chroma/MFCC — primary source)
-//   3. Local preview analyzer  (energy + brightness) merged with tag estimation
-//   4. Tag estimation alone    (genre/mood tags → energy, valence, danceability)
-//   5. BPM only                (GetSongBPM/Deezer + neutral energy/valence)
-//   6. Neutral defaults        (app still works, just less accurate scoring)
+//   2. HF librosa              (full measured FFT/chroma/MFCC + DEAM arousal — primary source)
+//   3. SonicDNA LocalAudio     (on-device DSP: BPM, key, chroma, mfccMean — enables MFCC cosine)
+//   4. Local preview analyzer  (energy + brightness) merged with tag estimation
+//   5. Tag estimation alone    (genre/mood tags → energy, valence, danceability)
+//   5.5. FreqBlog              (BPM always; energy/valence/danceability/key when estimated)
+//   6. GetSongBPM              (BPM + key only — FreqBlog fallback)
+//   7. Neutral defaults        (app still works, just less accurate scoring)
 //
 // Recommendation flow:
 //   1. User pastes URL or types a title → resolve Spotify track
@@ -23,6 +25,18 @@
 import Foundation
 import Combine
 
+// Represents a point on the valence × arousal (mood) plane chosen by the user.
+struct MoodTarget: Equatable {
+    let valence: Double   // 0 = dark/sad, 1 = bright/happy
+    let arousal: Double   // 0 = calm, 1 = energetic
+
+    var label: String {
+        let v = valence > 0.5 ? "Bright" : "Dark"
+        let a = arousal > 0.5 ? "Energetic" : "Calm"
+        return "\(v) & \(a)"
+    }
+}
+
 @MainActor
 class RecommendationEngine: ObservableObject {
 
@@ -32,6 +46,7 @@ class RecommendationEngine: ObservableObject {
 
     @Published var sourceSong: Song?
     @Published var blendedSongs: [Song] = []    // Populated when blending >1 seeds; empty for single-song searches
+    @Published var moodTarget: MoodTarget? = nil  // Set when searching by mood coordinates; nil otherwise
     @Published var recommendations: [SimilarSong] = []
     @Published var isLoading = false
     @Published var loadingMessage = "Finding songs…"
@@ -46,12 +61,16 @@ class RecommendationEngine: ObservableObject {
     private let spotifyService      = SpotifyService()
     private let lastFMService       = LastFMService()
     private let deezerService       = DeezerService()
+    private let soundCloudService   = SoundCloudService()
     private let musicBrainzService  = MusicBrainzService()
     private let listenBrainzService = ListenBrainzService()
-    private let acousticBrainzService = AcousticBrainzService()
     private let itunesService       = iTunesService()
     private let getSongBPMService   = GetSongBPMService()
-    private let simiAudioService    = SimiAudioService.shared
+    private let freqBlogService        = FreqBlogService()
+    private let acousticBrainzService  = AcousticBrainzService()
+    private let discogsService         = DiscogsService()
+    private let simiAudioService       = SimiAudioService.shared
+    private let localAudioAnalyzer  = LocalAudioAnalyzer.shared
     private let urlParser           = URLParserService()
     private let supabase            = SupabaseCacheService()
     private let previewAnalyzer      = PreviewAudioAnalyzer.shared
@@ -67,12 +86,16 @@ class RecommendationEngine: ObservableObject {
     // ──────────────────────────────────────────────
 
     /// Fetches genre tags for a song.
-    /// Priority: Last.fm → iTunes Search API
+    /// Priority: Supabase cache (specific genres only) → Last.fm → iTunes Search API
     /// Returns at least [Genre(main: "Unknown")] — never empty.
     private func fetchGenresWithFallback(title: String, artist: String) async -> [Genre] {
-        // Stage 0: Supabase tag cache — instant, no API call needed
+        // Stage 0: Supabase tag cache — fast return when cache has a specific subgenre.
+        // If cache only has generic umbrella labels (e.g. "pop rap", "trap"), fall through
+        // to Last.fm so stale entries self-heal and the pool gets accurate genre seeds.
         if let cached = await supabase.lookupTags(title: title, artist: artist), !cached.isEmpty {
-            return genresFromRawTags(cached)
+            let hasSpecific = cached.contains { Self.specificSubgenres.contains($0.lowercased()) }
+            if hasSpecific { return genresFromRawTags(cached) }
+            // Cache is all-generic — try Last.fm for a more specific tag before giving up.
         }
 
         // Stage 1: Last.fm
@@ -98,6 +121,23 @@ class RecommendationEngine: ObservableObject {
         return [Genre(main: "Unknown")]
     }
 
+    /// Strips featured-artist credits that confuse ACR/MBID lookups.
+    /// ListenBrainz often stores the recording as "Gold Feet" not "Gold Feet (feat. J.I.D.)".
+    private func cleanTitleForMBID(_ title: String) -> String {
+        var result = title
+        let patterns = [
+            "\\s*\\(feat\\..*?\\)", "\\s*\\(ft\\..*?\\)", "\\s*\\(featuring.*?\\)",
+            "\\s*\\[feat\\..*?\\]", "\\s*\\[ft\\..*?\\]",
+            "\\s+feat\\..*$", "\\s+ft\\..*$", "\\s+featuring.*$",
+        ]
+        for pattern in patterns {
+            if let range = result.range(of: pattern, options: [.regularExpression, .caseInsensitive]) {
+                result.removeSubrange(range)
+            }
+        }
+        return result.trimmingCharacters(in: .whitespaces)
+    }
+
     /// Checks Supabase similar_tracks_cache first; falls back to Last.fm on miss.
     /// Cache write is fire-and-forget — doesn't block the return path.
     private func fetchSimilarTracksWithCache(title: String, artist: String) async -> [(title: String, artist: String)] {
@@ -121,18 +161,26 @@ class RecommendationEngine: ObservableObject {
     /// Path B (fallback): MusicBrainz search (1.1s sleep) + lb-radio playlist endpoint.
     ///   Only used when Labs returns no results for the recording.
     private func fetchListenBrainzTracks(title: String, artist: String) async -> [(title: String, artist: String)] {
+        // Strip "feat. X" credits — ListenBrainz often stores recordings without them.
+        // Try cleaned title first; fall back to original on miss.
+        let clean = cleanTitleForMBID(title)
+
         // ── Path A: Labs (fast, genre-agnostic, session-based CF) ──
-        if let mbid = await listenBrainzService.resolveACRMBID(title: title, artist: artist) {
+        var mbidA = await listenBrainzService.resolveACRMBID(title: clean, artist: artist)
+        if mbidA == nil, clean != title {
+            mbidA = await listenBrainzService.resolveACRMBID(title: title, artist: artist)
+        }
+
+        if let mbid = mbidA {
             let labsTracks = await listenBrainzService.fetchLabsSimilarTracks(mbid: mbid)
-            if !labsTracks.isEmpty {
-                return labsTracks
-            }
+            if !labsTracks.isEmpty { return labsTracks }
             // Labs had the MBID but no similar recordings — try lb-radio on same MBID
             let radioTracks = await listenBrainzService.fetchSimilarRecordings(mbid: mbid)
             if !radioTracks.isEmpty { return radioTracks }
         }
+
         // ── Path B: MusicBrainz search + lb-radio (1.1s rate-limit sleep) ──
-        guard let mbid = await musicBrainzService.findMBID(title: title, artist: artist) else {
+        guard let mbid = await musicBrainzService.findMBID(title: clean, artist: artist) else {
             return []
         }
         return await listenBrainzService.fetchSimilarRecordings(mbid: mbid)
@@ -140,24 +188,51 @@ class RecommendationEngine: ObservableObject {
 
     /// Fetches top tracks from up to 8 artists similar to the given artist.
     /// Always-on parallel source — not a fallback. Returns up to ~40 deduplicated (title, artist) pairs.
-    private func fetchArtistSimilarCandidates(artist: String) async -> [(title: String, artist: String)] {
-        let similarArtists = (try? await lastFMService.fetchSimilarArtists(artist: artist)) ?? []
+    /// Fetches discovery candidates from artists similar to the source.
+    /// Primary: Spotify related-artists (600M-user co-listening graph, works for niche artists).
+    /// Fallback: Last.fm artist.getSimilar (scrobble-based, weaker for niche).
+    /// Takes tracks 2-4 from each similar artist — skips their #1 hit to avoid chart-toppers.
+    /// Fetches the source artist's own top tracks (excluding the source song itself).
+    /// These are always the closest stylistic match and belong in the pool — the diversity
+    /// filter caps them at 3 so they don't monopolize the list.
+    private func fetchSourceArtistCandidates(song: Song) async -> [(title: String, artist: String)] {
+        let all = await lastFMService.fetchArtistTopTracks(artist: song.artist, limit: 15)
+        let sourceKey = "\(song.title)|\(song.artist)".lowercased()
+        return all
+            .filter { "\($0.title)|\($0.artist)".lowercased() != sourceKey }
+            .prefix(12)
+            .map { $0 }
+    }
+
+    private func fetchArtistSimilarCandidates(song: Song) async -> [(title: String, artist: String)] {
+        // Deep 2-hop graph: hop-1 + related-of-related for 5 closest hop-1 artists.
+        // Falls back to Last.fm if Spotify returns nothing (no Spotify ID, niche artist).
+        let spotifyRelated = await spotifyService.fetchRelatedArtistsDeep(forTrackId: song.id)
+        let similarArtists: [String]
+        if !spotifyRelated.isEmpty {
+            similarArtists = spotifyRelated
+        } else {
+            similarArtists = (try? await lastFMService.fetchSimilarArtists(artist: song.artist)) ?? []
+            if !similarArtists.isEmpty {
+                simiLog("🎸 Artist pool: Spotify empty → Last.fm fallback (\(similarArtists.count) artists)")
+            }
+        }
         guard !similarArtists.isEmpty else { return [] }
+
         var tracks: [(title: String, artist: String)] = []
         await withTaskGroup(of: [(title: String, artist: String)].self) { group in
-            for similarArtist in similarArtists.prefix(8) {
+            for similarArtist in similarArtists.prefix(20) {
                 group.addTask {
-                    await self.lastFMService.fetchArtistTopTracks(artist: similarArtist)
+                    let all = await self.lastFMService.fetchArtistTopTracks(artist: similarArtist, limit: 15)
+                    // Skip rank-1 hit; take the next 3 (well-known but not chart-toppers).
+                    // Hop-2 artists are already further from source so deeper cuts make sense.
+                    return Array(all.dropFirst(min(1, all.count)).prefix(3))
                 }
             }
-            for await artistTracks in group {
-                tracks += artistTracks
-            }
+            for await artistTracks in group { tracks += artistTracks }
         }
         var seen = Set<String>()
-        return tracks.filter { t in
-            seen.insert("\(t.title)|\(t.artist)".lowercased()).inserted
-        }
+        return tracks.filter { t in seen.insert("\(t.title)|\(t.artist)".lowercased()).inserted }
     }
 
     /// Looks up the source song's raw Last.fm tags using the Supabase cache first.
@@ -186,35 +261,40 @@ class RecommendationEngine: ObservableObject {
         return merged
     }
 
+    // Specific subgenres — preferred over generic umbrella labels when present.
+    // Used both in genresFromRawTags and in fetchGenresWithFallback to detect stale cache entries.
+    private static let specificSubgenres: Set<String> = [
+        // Hip-hop
+        "cloud rap", "cloud trap", "psychedelic trap", "melodic trap", "dark trap",
+        "emo rap", "emo trap", "rage rap", "boom bap", "uk drill", "phonk", "grime",
+        "alternative hip hop", "alternative rap", "experimental hip hop", "punk rap",
+        "rap rock", "southern hip hop", "trap soul",
+        // R&B / Soul
+        // "alternative rnb" / "alternative r&b" must be here so that songs like Love Galore
+        // (SZA, tags: "pop rap, alternative rnb, rnb") don't resolve to hiphop family via
+        // "pop rap" and escape the hiphop↔rnb genre penalty entirely.
+        "alternative rnb", "alternative r&b", "alt r&b",
+        "neo-soul", "neo soul", "slow jam", "quiet storm", "smooth r&b", "contemporary r&b",
+        "gospel",
+        // Pop / Electronic
+        "dream pop", "bedroom pop", "indie pop", "indie rock", "alt-rock",
+        "electropop", "synth-pop", "synth pop", "chillwave", "synthwave",
+        "lo-fi", "lofi", "drum and bass", "future bass", "hyperpop", "breakcore",
+        "vaporwave", "chiptune", "jersey club", "amapiano",
+        // Rock
+        "post-rock", "post-punk", "shoegaze", "darkwave", "hard rock", "classic rock",
+        "grunge", "new wave", "progressive rock", "prog rock", "nu-metal", "metalcore",
+        "pop punk", "folk rock",
+        // Acoustic / World
+        "disco", "funk", "reggae", "dancehall", "ska",
+        "afrobeats", "afropop",
+        "reggaeton", "latin", "bossa nova",
+        "americana", "bluegrass",
+        // Jazz
+        "jazz fusion", "smooth jazz",
+    ]
+
     private func genresFromRawTags(_ tags: [String]) -> [Genre] {
-        // Specific subgenres — preferred over generic umbrella labels when present.
-        // e.g. "cloud rap" beats "rap", "psychedelic trap" beats "trap".
-        let specificSubgenres: Set<String> = [
-            // Hip-hop
-            "cloud rap", "cloud trap", "psychedelic trap", "melodic trap", "dark trap",
-            "emo rap", "emo trap", "rage rap", "boom bap", "uk drill", "phonk", "grime",
-            "alternative hip hop", "alternative rap", "experimental hip hop", "punk rap",
-            "trap soul",
-            // R&B / Soul
-            "neo-soul", "neo soul", "slow jam", "quiet storm", "smooth r&b", "contemporary r&b",
-            "gospel",
-            // Pop / Electronic
-            "dream pop", "bedroom pop", "indie pop", "indie rock", "alt-rock",
-            "electropop", "synth-pop", "synth pop", "chillwave", "synthwave",
-            "lo-fi", "lofi", "drum and bass", "future bass", "hyperpop", "breakcore",
-            "vaporwave", "chiptune", "jersey club", "amapiano",
-            // Rock
-            "post-rock", "post-punk", "shoegaze", "darkwave", "hard rock", "classic rock",
-            "grunge", "new wave", "progressive rock", "prog rock", "nu-metal", "metalcore",
-            "pop punk", "folk rock",
-            // Acoustic / World
-            "disco", "funk", "reggae", "dancehall", "ska",
-            "afrobeats", "afropop",
-            "reggaeton", "latin", "bossa nova",
-            "americana", "bluegrass",
-            // Jazz
-            "jazz fusion", "smooth jazz",
-        ]
         let generic = [
             "indie pop","dream pop","bedroom pop","indie rock","alt-rock","alternative",
             "rock","pop","hip-hop","hip hop","rap","trap","r&b","rnb","soul","neo-soul",
@@ -223,8 +303,38 @@ class RecommendationEngine: ObservableObject {
             "reggae","reggaeton","afrobeats","latin","gospel","dancehall",
         ]
 
+        // Trap-pop detection: if "pop" appears in the top 3 tags alongside "trap" or "drill",
+        // treat it as pop — not hip-hop. Ariana Grande "7 rings", Dua Lipa, Billie Eilish
+        // often land here. Genuine trap/drill tracks don't carry a top-3 "pop" tag.
+        let top3 = Set(tags.prefix(3).map { $0.lowercased() })
+        if top3.contains("pop") && (top3.contains("trap") || top3.contains("drill")) {
+            return [Genre(main: "Pop")]
+        }
+
+        // K-pop / J-pop / regional pop override: check ALL tags regardless of position.
+        // Last.fm users frequently apply hip-hop/trap tags to K-pop tracks, but if a Korean
+        // or Japanese pop identifier appears anywhere in the tag list it's authoritative —
+        // these genres are too sonically distinct to let a misclassified "trap" tag slide.
+        let regionalPopTags: Set<String> = [
+            "k-pop", "kpop", "k pop", "korean pop", "korean music", "korean",
+            "j-pop", "jpop", "j pop", "japanese pop", "c-pop", "cpop", "mandopop", "sino-pop"
+        ]
+        if let found = tags.first(where: { regionalPopTags.contains($0.lowercased()) }) {
+            let normalized = found == "kpop" ? "K-Pop" : found == "jpop" ? "J-Pop" : found == "cpop" ? "C-Pop" : found.capitalized
+            return [Genre(main: normalized)]
+        }
+
+        // Pop-adjacent tags that should win over any specific subgenre found deeper in the list.
+        // "pop rock" and "pop punk" are Last.fm's most-applied tags for acts like Olivia Rodrigo
+        // and Paramore — if they appear in the top-2 positions they represent the dominant genre,
+        // not a minor "rap rock" tag that appears at position 3.
+        let popPriorityTags: Set<String> = ["pop punk", "pop rock", "power pop", "teen pop", "bubblegum pop"]
+        if let popTag = tags.prefix(2).first(where: { popPriorityTags.contains($0.lowercased()) }) {
+            return [Genre(main: popTag.capitalized)]
+        }
+
         let primary: String
-        if let specific = tags.first(where: { specificSubgenres.contains($0) }) {
+        if let specific = tags.first(where: { Self.specificSubgenres.contains($0) }) {
             primary = specific
         } else {
             let matched = tags.filter { tag in generic.contains { tag.contains($0) || $0.contains(tag) } }
@@ -266,36 +376,78 @@ class RecommendationEngine: ObservableObject {
             self.sourceSong = song
 
             loadingMessage = "Analyzing the feeling…"
-            // Launch source-independent candidate fetches immediately — don't stall behind Railway/GetSongBPM.
+            // Launch source-independent candidate fetches immediately — don't stall behind HF/GetSongBPM.
             // genres, Last.fm similar tracks, and ListenBrainz only need title+artist, not audio features.
-            async let featuresTask      = fetchAudioFeaturesWithFallback(song: song)
-            async let tagsEarlyTask     = fetchRawTagsCached(song: song)
-            async let genresTask        = fetchGenresWithFallback(title: song.title, artist: song.artist)
-            async let similarTracksTask = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
-            async let lbTask            = fetchListenBrainzTracks(title: song.title, artist: song.artist)
-            async let artistSimilarTask = fetchArtistSimilarCandidates(artist: song.artist)
+            async let featuresTask              = fetchAudioFeaturesWithFallback(song: song)
+            async let tagsEarlyTask             = fetchRawTagsCached(song: song)
+            async let genresTask                = fetchGenresWithFallback(title: song.title, artist: song.artist)
+            async let similarTracksTask         = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
+            async let lbTask                    = fetchListenBrainzTracks(title: song.title, artist: song.artist)
+            async let artistCandidatesTask      = fetchArtistSimilarCandidates(song: song)
+            async let sourceArtistTask          = fetchSourceArtistCandidates(song: song)
+            async let deezerTask                = deezerService.fetchSimilarTracks(title: song.title, artist: song.artist)
+            async let soundCloudTask            = soundCloudService.fetchRelatedTracks(title: song.title, artist: song.artist)
+            // Spotify artist genres run concurrently — they don't need audio features or rawTags.
+            // Two-hop: track ID → artist ID → full artist object (search endpoint omits genres).
+            async let spotifyGenresTask         = spotifyService.fetchArtistGenres(forTrackId: song.id)
+            async let discogsTask               = discogsService.fetchStyles(title: song.title, artist: song.artist)
 
-            // Genre-based tag candidates don't need audio features — start as soon as rawTags arrive.
-            // Previously this waited for full feature analysis, adding ~1-2s to the critical path.
-            let earlyTags = await tagsEarlyTask
-            async let genreTagCandidatesTask = lastFMService.fetchEmotionalTagCandidates(rawTags: earlyTags)
+            let earlyTags     = await tagsEarlyTask + (await discogsTask)
+            // Launch tag pool in parallel — earlyTags needed to pick the right vibe queries.
+            async let emotionalTagTask    = lastFMService.fetchEmotionalTagCandidates(rawTags: earlyTags)
+            // Underground mood chain: mood tags → page-2 artists (past mainstream) → their tracks.
+            async let undergroundMoodTask = lastFMService.fetchUndergroundMoodCandidates(rawTags: earlyTags)
+            let spotifyGenres = await spotifyGenresTask
+            if !spotifyGenres.isEmpty { simiLog("🎸 Spotify genres: \(spotifyGenres.prefix(5).joined(separator: ", "))") }
 
             // Wait for features — needed for BPM correction and feature-dependent searches.
             var features = await featuresTask
             let correctedBPM = normalizeBPM(features.bpm, tags: earlyTags)
             if correctedBPM != features.bpm {
                 simiLog("🎚️ Source BPM corrected \(Int(features.bpm)) → \(Int(correctedBPM)) via genre tags")
-                let fixed = AudioFeatures(
-                    bpm: correctedBPM, energy: features.energy, valence: features.valence,
-                    danceability: features.danceability, acousticness: features.acousticness,
-                    instrumentalness: features.instrumentalness, liveness: features.liveness,
-                    loudness: features.loudness, key: features.key, mode: features.mode,
-                    isEstimated: features.isEstimated, isKeyEstimated: features.isKeyEstimated,
-                    spectralWarmth: features.spectralWarmth, tonalClarity: features.tonalClarity,
-                    vocalPresence: features.vocalPresence, reverbSpace: features.reverbSpace
-                )
+                var fixed = features
+                fixed.bpm = correctedBPM
                 features = fixed
                 Task { await self.supabase.storeFeatures(title: song.title, artist: song.artist, features: fixed, source: "librosa") }
+            }
+            // FreqBlog: BPM (always), key (when estimated), danceability + valence
+            // (when features are tag-estimated). Energy/acousticness/liveness skipped —
+            // FreqBlog analyses 30-second iTunes previews; those fields are unreliable.
+            // Falls back to GetSongBPM (BPM + key only) when FreqBlog misses or queues.
+            if let fb = await freqBlogService.fetchFeatures(title: song.title, artist: song.artist) {
+                let fbBPM = normalizeBPM(fb.bpm, tags: earlyTags)
+                simiLog("🎸 FreqBlog source: \(song.title) — \(Int(fbBPM))BPM, V:\(String(format:"%.2f",fb.valence)), D:\(String(format:"%.2f",fb.danceability))")
+                var updated = features
+                updated.bpm = fbBPM
+                if features.isEstimated {
+                    updated.valence      = fb.valence
+                    updated.danceability = fb.danceability
+                } else {
+                    // Python ran — blend with FreqBlog perceptual read.
+                    // FreqBlog hears the emotional feel; Python reads signal math.
+                    // Average pulls the valence toward how it actually sounds.
+                    let blended = (features.valence + fb.valence) / 2.0
+                    simiLog("🎸 FreqBlog source valence blend: Python=\(String(format:"%.2f",features.valence)) FreqBlog=\(String(format:"%.2f",fb.valence)) → \(String(format:"%.2f",blended))")
+                    updated.valence = blended
+                }
+                if features.isKeyEstimated {
+                    updated.key            = fb.key
+                    updated.mode           = fb.mode
+                    updated.isKeyEstimated = false
+                }
+                features = updated
+            } else if let bpmData = await getSongBPMService.fetchSongData(title: song.title, artist: song.artist),
+                      bpmData.bpm > 0 {
+                let gBPM = normalizeBPM(bpmData.bpm, tags: earlyTags)
+                simiLog("🎵 GetSongBPM source (FreqBlog miss): \(song.title) — \(Int(gBPM))BPM")
+                var updated = features
+                updated.bpm = gBPM
+                if let key = bpmData.key, let mode = bpmData.mode, features.isKeyEstimated {
+                    updated.key = key; updated.mode = mode; updated.isKeyEstimated = false
+                    let keyNames = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+                    simiLog("🎵 GetSongBPM source key: \(keyNames[safe: key] ?? "?") \(mode == 1 ? "Major" : "Minor") for \(song.title)")
+                }
+                features = updated
             }
             self.sourceSong?.audioFeatures = features
             self.lastSourceFeatures = features
@@ -306,23 +458,9 @@ class RecommendationEngine: ObservableObject {
             async let spotifyRecsTask = spotifyService.getRecommendations(seedTrackID: song.id, features: sourceFeatures)
             async let vectorTask      = supabase.fetchSimilarByVector(embedding: SupabaseCacheService.buildEmbedding(from: sourceFeatures))
             async let dclapTask       = fetchVectorCandidates(embedding: sourceFeatures.dclapEmbedding ?? [])
+            async let musicnnTask     = fetchMusiCNNCandidates(embedding: sourceFeatures.musicnnEmbedding ?? [])
 
             let genres = await genresTask
-            let highEnergyMarkers1 = ["metal", "hard rock", "punk", "thrash", "hardcore", "grunge"]
-            let genreSaysLoud1 = earlyTags.contains { tag in highEnergyMarkers1.contains { tag.lowercased().contains($0) } }
-            let audioTags = (genreSaysLoud1 && sourceFeatures.energy < 0.45)
-                ? []
-                : deriveAudioQueryTags(from: sourceFeatures, genreTags: genres).filter { !$0.isEmpty }
-            if !audioTags.isEmpty { simiLog("🎵 Audio-derived query tags: \(audioTags)") }
-
-            // Supplementary fetch for audio-derived tags not already covered by earlyTags (~1-2 tags).
-            // Runs concurrently with Spotify recs + vector search — typically done in <0.5s.
-            let audioOnlyTags = audioTags.filter { !earlyTags.contains($0) }
-            let audioTagCandidatesTask = Task<[(title: String, artist: String)], Never> {
-                guard !audioOnlyTags.isEmpty else { return [] }
-                return await self.lastFMService.fetchEmotionalTagCandidates(rawTags: audioOnlyTags)
-            }
-
             // Phase 1: await early candidates (Last.fm + ListenBrainz arrive first)
             let lastFMTracks     = await similarTracksTask
             let lbTracks         = await lbTask
@@ -350,20 +488,49 @@ class RecommendationEngine: ObservableObject {
             let spotifyRecs          = (try? await spotifyRecsTask) ?? []
             let vectorCandidates     = await vectorTask
             let dclapCandidates      = await dclapTask
-            let artistSimilarCandidates = await artistSimilarTask
+            let musicnnCandidates    = await musicnnTask
             self.detectedGenres  = genres
             self.lastGenres      = genres
 
-            let genreTagCandidates = await genreTagCandidatesTask
-            let audioTagCandidates = await audioTagCandidatesTask.value
-            let tagCandidates      = Self.mergeTracks(primary: genreTagCandidates, secondary: audioTagCandidates)
-            let expandedTracks     = Self.mergeTracks(
-                primary: Self.mergeTracks(primary: lastFMTracks, secondary: tagCandidates),
+            let artistCandidates       = await artistCandidatesTask
+            let sourceArtistCandidates = await sourceArtistTask
+            let deezerCandidates       = await deezerTask
+            let soundCloudCandidates   = await soundCloudTask
+            let emotionalTagCandidates = await emotionalTagTask
+            let undergroundMoodCandidates = await undergroundMoodTask
+            let expandedTracks = Self.mergeTracks(
+                primary: Self.mergeTracks(
+                    primary:   Array(dclapCandidates.prefix(25)),
+                    secondary: Self.mergeTracks(
+                        primary:   Array(musicnnCandidates.prefix(20)),
+                        secondary: Array(vectorCandidates.prefix(20))
+                    )
+                ),
                 secondary: Self.mergeTracks(
-                    primary: Self.mergeTracks(primary: lbTracks, secondary: vectorCandidates),
-                    secondary: Self.mergeTracks(primary: dclapCandidates, secondary: artistSimilarCandidates)
+                    primary:   Array(lastFMTracks.prefix(25)),
+                    secondary: Self.mergeTracks(
+                        primary:   Array(lbTracks.prefix(10)),
+                        secondary: Self.mergeTracks(
+                            primary:   Array(soundCloudCandidates.prefix(25)),
+                            secondary: Self.mergeTracks(
+                                primary:   Array(emotionalTagCandidates.prefix(20)),
+                                secondary: Self.mergeTracks(
+                                    primary:   Array(undergroundMoodCandidates.prefix(20)),
+                                    secondary: Self.mergeTracks(
+                                        primary:   Array(deezerCandidates.prefix(15)),
+                                        secondary: Self.mergeTracks(
+                                            primary:   Array(sourceArtistCandidates.prefix(4)),
+                                            secondary: Array(artistCandidates.prefix(8))
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
                 )
             )
+            simiLog("🧬 Source embeddings: dclap=\(sourceFeatures.dclapEmbedding.map { "\($0.count)d" } ?? "nil") musicnn=\(sourceFeatures.musicnnEmbedding.map { "\($0.count)d" } ?? "nil")")
+            simiLog("📦 Pool: dclap=\(min(dclapCandidates.count, 25)) musicnn=\(min(musicnnCandidates.count, 20)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(lastFMTracks.count, 25)) lb=\(min(lbTracks.count, 25)) sc=\(min(soundCloudCandidates.count, 25)) tag=\(min(emotionalTagCandidates.count, 20)) mood=\(min(undergroundMoodCandidates.count, 20)) deezer=\(min(deezerCandidates.count, 15)) src=\(min(sourceArtistCandidates.count, 4)) artist=\(min(artistCandidates.count, 8)) → \(expandedTracks.count) unique")
 
             let merged = try await mergeAndScore(
                 spotifyRecs: spotifyRecs,
@@ -373,8 +540,10 @@ class RecommendationEngine: ObservableObject {
                 genres: genres,
                 prefetchedFeatures: [:]
             )
+            simiLog("🔀 mergeAndScore → \(merged.count) candidates (top score: \(String(format: "%.3f", merged.first?.similarityScore ?? 0.0)))")
 
             guard !merged.isEmpty else {
+                simiLog("⛔ mergeAndScore empty — all \(expandedTracks.count) tracks failed Spotify search or were deduped")
                 errorMessage = "Couldn't find similar songs for this track. Try searching by name instead."
                 isLoading = false
                 return
@@ -382,24 +551,26 @@ class RecommendationEngine: ObservableObject {
 
             loadingMessage = "Putting it together…"
             let earlyCache = await earlyLookupTask.value
+            let gated = await applyGenreGate(candidates: merged, genres: genres)
             let enriched = await prefetchCandidateFeatures(
-                candidates: merged,
+                candidates: gated,
                 sourceFeatures: sourceFeatures,
                 genres: genres,
-                prewarmedCache: earlyCache
+                prewarmedCache: earlyCache,
+                sourceArtist: song.artist
             )
+            simiLog("✅ prefetchCandidateFeatures → \(enriched.count) songs (top score: \(String(format: "%.3f", enriched.first?.similarityScore ?? 0.0)), min: \(String(format: "%.3f", enriched.last?.similarityScore ?? 0.0)))")
             self.recommendations = enriched
             if let song = self.sourceSong {
                 history.record(song: song, query: urlString)
             }
             isLoading = false
 
-            // Background: embed result candidates so the catalog self-populates.
-            if sourceFeatures.dclapEmbedding != nil {
-                Task { await self.embedCandidatesInBackground(songs: merged, sourceFeatures: sourceFeatures) }
-            }
-
-            await enrichWithABFeatures(sourceFeatures: sourceFeatures, genres: genres)
+            await enrichWithABFeatures(sourceFeatures: sourceFeatures, genres: genres, rawTags: earlyTags)
+            // Fire AFTER enrichWithABFeatures — self.recommendations has iTunes previewURLs
+            // filled in by then, which /embed-candidates needs as the audio source.
+            Task { await self.embedCandidatesInBackground(songs: self.recommendations, sourceFeatures: sourceFeatures) }
+            Task { await self.warmArtistCache(artist: self.sourceSong?.artist ?? "") }
             return
 
         } catch let error as SimiError {
@@ -483,39 +654,96 @@ class RecommendationEngine: ObservableObject {
         blendedSongs = []
 
         do {
-            guard let song = try await spotifyService.searchTrack(title: title, artist: artist) else {
-                throw SimiError.songNotFound
+            let song: Song
+            if let cached = await supabase.lookupSpotifyTrack(title: title, artist: artist) {
+                // Supabase hit — zero Spotify calls, instant
+                song = cached
+            } else if let spotifySong = try? await spotifyService.searchTrack(title: title, artist: artist) {
+                // Spotify hit — write through to cache for next user
+                await supabase.storeSpotifyTrack(spotifySong)
+                song = spotifySong
+            } else {
+                // Spotify unavailable (rate-limit, network, or song not catalogued).
+                // iTunes is free, requires no auth, covers most mainstream + indie tracks.
+                let (previewURL, artwork) = await itunesService.fetchPreviewAndArtwork(title: title, artist: artist)
+                guard previewURL != nil || artwork != nil else {
+                    throw SimiError.songNotFound
+                }
+                simiLog("🎵 Spotify miss — iTunes fallback for '\(title)' by '\(artist)'")
+                song = Song(
+                    id: "itunes:\(title.lowercased()):\(artist.lowercased())",
+                    title: title,
+                    artist: artist.isEmpty ? "Unknown" : artist,
+                    albumArt: artwork ?? "",
+                    previewURL: previewURL,
+                    spotifyURL: "",
+                    sourceURL: ""
+                )
             }
             self.sourceSong = song
 
             loadingMessage = "Analyzing the feeling…"
             // Launch source-independent candidate fetches immediately.
-            async let featuresTask      = fetchAudioFeaturesWithFallback(song: song)
-            async let tagsEarlyTask     = fetchRawTagsCached(song: song)
-            async let genresTask        = fetchGenresWithFallback(title: song.title, artist: song.artist)
-            async let similarTracksTask = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
-            async let lbTask            = fetchListenBrainzTracks(title: song.title, artist: song.artist)
-            async let artistSimilarTask = fetchArtistSimilarCandidates(artist: song.artist)
+            async let featuresTask           = fetchAudioFeaturesWithFallback(song: song)
+            async let tagsEarlyTask          = fetchRawTagsCached(song: song)
+            async let genresTask             = fetchGenresWithFallback(title: song.title, artist: song.artist)
+            async let similarTracksTask      = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
+            async let lbTask                 = fetchListenBrainzTracks(title: song.title, artist: song.artist)
+            async let artistCandidatesTask   = fetchArtistSimilarCandidates(song: song)
+            async let sourceArtistTask2      = fetchSourceArtistCandidates(song: song)
+            async let deezerTask             = deezerService.fetchSimilarTracks(title: song.title, artist: song.artist)
+            async let soundCloudTask2        = soundCloudService.fetchRelatedTracks(title: song.title, artist: song.artist)
+            async let spotifyGenresTask      = spotifyService.fetchArtistGenres(forTrackId: song.id)
+            async let discogsTask2           = discogsService.fetchStyles(title: song.title, artist: song.artist)
 
-            // Genre-based tag candidates don't need features — start as soon as rawTags arrive.
-            let earlyTags = await tagsEarlyTask
-            async let genreTagCandidatesTask = lastFMService.fetchEmotionalTagCandidates(rawTags: earlyTags)
-
+            let earlyTags     = await tagsEarlyTask + (await discogsTask2)
+            async let emotionalTagTask2    = lastFMService.fetchEmotionalTagCandidates(rawTags: earlyTags)
+            async let undergroundMoodTask2 = lastFMService.fetchUndergroundMoodCandidates(rawTags: earlyTags)
+            let spotifyGenres = await spotifyGenresTask
+            if !spotifyGenres.isEmpty { simiLog("🎸 Spotify genres: \(spotifyGenres.prefix(5).joined(separator: ", "))") }
             var features = await featuresTask
             let correctedBPM = normalizeBPM(features.bpm, tags: earlyTags)
             if correctedBPM != features.bpm {
                 simiLog("🎚️ Source BPM corrected \(Int(features.bpm)) → \(Int(correctedBPM)) via genre tags")
-                let fixed = AudioFeatures(
-                    bpm: correctedBPM, energy: features.energy, valence: features.valence,
-                    danceability: features.danceability, acousticness: features.acousticness,
-                    instrumentalness: features.instrumentalness, liveness: features.liveness,
-                    loudness: features.loudness, key: features.key, mode: features.mode,
-                    isEstimated: features.isEstimated, isKeyEstimated: features.isKeyEstimated,
-                    spectralWarmth: features.spectralWarmth, tonalClarity: features.tonalClarity,
-                    vocalPresence: features.vocalPresence, reverbSpace: features.reverbSpace
-                )
+                var fixed = features
+                fixed.bpm = correctedBPM
                 features = fixed
                 Task { await self.supabase.storeFeatures(title: song.title, artist: song.artist, features: fixed, source: "librosa") }
+            }
+            // FreqBlog: BPM (always), key (when estimated), danceability + valence.
+            // When Python ran (isEstimated=false), blend valences — Python reads signal math,
+            // FreqBlog hears perceptual feel. Average anchors to how the track actually sounds.
+            if let fb = await freqBlogService.fetchFeatures(title: song.title, artist: song.artist) {
+                let fbBPM = normalizeBPM(fb.bpm, tags: earlyTags)
+                simiLog("🎸 FreqBlog source: \(song.title) — \(Int(fbBPM))BPM, V:\(String(format:"%.2f",fb.valence)), D:\(String(format:"%.2f",fb.danceability))")
+                var updated = features
+                updated.bpm = fbBPM
+                if features.isEstimated {
+                    updated.valence      = fb.valence
+                    updated.danceability = fb.danceability
+                } else {
+                    let blended = (features.valence + fb.valence) / 2.0
+                    simiLog("🎸 FreqBlog source valence blend: Python=\(String(format:"%.2f",features.valence)) FreqBlog=\(String(format:"%.2f",fb.valence)) → \(String(format:"%.2f",blended))")
+                    updated.valence = blended
+                }
+                if features.isKeyEstimated {
+                    updated.key            = fb.key
+                    updated.mode           = fb.mode
+                    updated.isKeyEstimated = false
+                }
+                features = updated
+            } else if let bpmData = await getSongBPMService.fetchSongData(title: song.title, artist: song.artist),
+                      bpmData.bpm > 0 {
+                let gBPM = normalizeBPM(bpmData.bpm, tags: earlyTags)
+                simiLog("🎵 GetSongBPM source (FreqBlog miss): \(song.title) — \(Int(gBPM))BPM")
+                var updated = features
+                updated.bpm = gBPM
+                if let key = bpmData.key, let mode = bpmData.mode, features.isKeyEstimated {
+                    updated.key = key; updated.mode = mode; updated.isKeyEstimated = false
+                    let keyNames = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+                    simiLog("🎵 GetSongBPM source key: \(keyNames[safe: key] ?? "?") \(mode == 1 ? "Major" : "Minor") for \(song.title)")
+                }
+                features = updated
             }
             self.sourceSong?.audioFeatures = features
             self.lastSourceFeatures = features
@@ -525,21 +753,9 @@ class RecommendationEngine: ObservableObject {
             async let spotifyRecsTask = spotifyService.getRecommendations(seedTrackID: song.id, features: sourceFeatures)
             async let vectorTask      = supabase.fetchSimilarByVector(embedding: SupabaseCacheService.buildEmbedding(from: sourceFeatures))
             async let dclapTask2      = fetchVectorCandidates(embedding: sourceFeatures.dclapEmbedding ?? [])
+            async let musicnnTask2    = fetchMusiCNNCandidates(embedding: sourceFeatures.musicnnEmbedding ?? [])
 
             let genres = await genresTask
-            let highEnergyMarkers2 = ["metal", "hard rock", "punk", "thrash", "hardcore", "grunge"]
-            let genreSaysLoud2 = earlyTags.contains { tag in highEnergyMarkers2.contains { tag.lowercased().contains($0) } }
-            let audioTags = (genreSaysLoud2 && sourceFeatures.energy < 0.45)
-                ? []
-                : deriveAudioQueryTags(from: sourceFeatures, genreTags: genres).filter { !$0.isEmpty }
-            if !audioTags.isEmpty { simiLog("🎵 Audio-derived query tags: \(audioTags)") }
-
-            let audioOnlyTags = audioTags.filter { !earlyTags.contains($0) }
-            let audioTagCandidatesTask = Task<[(title: String, artist: String)], Never> {
-                guard !audioOnlyTags.isEmpty else { return [] }
-                return await self.lastFMService.fetchEmotionalTagCandidates(rawTags: audioOnlyTags)
-            }
-
             // Phase 1: await early candidates (Last.fm + ListenBrainz arrive first)
             let lastFMTracks     = await similarTracksTask
             let lbTracks         = await lbTask
@@ -567,20 +783,49 @@ class RecommendationEngine: ObservableObject {
             let spotifyRecs          = (try? await spotifyRecsTask) ?? []
             let vectorCandidates     = await vectorTask
             let dclapCandidates2     = await dclapTask2
-            let artistSimilarCandidates = await artistSimilarTask
+            let musicnnCandidates2   = await musicnnTask2
             self.detectedGenres  = genres
             self.lastGenres      = genres
 
-            let genreTagCandidates = await genreTagCandidatesTask
-            let audioTagCandidates = await audioTagCandidatesTask.value
-            let tagCandidates      = Self.mergeTracks(primary: genreTagCandidates, secondary: audioTagCandidates)
-            let expandedTracks     = Self.mergeTracks(
-                primary: Self.mergeTracks(primary: lastFMTracks, secondary: tagCandidates),
+            let artistCandidates          = await artistCandidatesTask
+            let sourceArtistCandidates2   = await sourceArtistTask2
+            let deezerCandidates          = await deezerTask
+            let soundCloudCandidates2     = await soundCloudTask2
+            let emotionalTagCandidates2   = await emotionalTagTask2
+            let undergroundMoodCandidates2 = await undergroundMoodTask2
+            let expandedTracks = Self.mergeTracks(
+                primary: Self.mergeTracks(
+                    primary:   Array(dclapCandidates2.prefix(25)),
+                    secondary: Self.mergeTracks(
+                        primary:   Array(musicnnCandidates2.prefix(20)),
+                        secondary: Array(vectorCandidates.prefix(20))
+                    )
+                ),
                 secondary: Self.mergeTracks(
-                    primary: Self.mergeTracks(primary: lbTracks, secondary: vectorCandidates),
-                    secondary: Self.mergeTracks(primary: dclapCandidates2, secondary: artistSimilarCandidates)
+                    primary:   Array(lastFMTracks.prefix(25)),
+                    secondary: Self.mergeTracks(
+                        primary:   Array(lbTracks.prefix(10)),
+                        secondary: Self.mergeTracks(
+                            primary:   Array(soundCloudCandidates2.prefix(25)),
+                            secondary: Self.mergeTracks(
+                                primary:   Array(emotionalTagCandidates2.prefix(20)),
+                                secondary: Self.mergeTracks(
+                                    primary:   Array(undergroundMoodCandidates2.prefix(20)),
+                                    secondary: Self.mergeTracks(
+                                        primary:   Array(deezerCandidates.prefix(15)),
+                                        secondary: Self.mergeTracks(
+                                            primary:   Array(sourceArtistCandidates2.prefix(4)),
+                                            secondary: Array(artistCandidates.prefix(8))
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
                 )
             )
+            simiLog("🧬 Source embeddings: dclap=\(sourceFeatures.dclapEmbedding.map { "\($0.count)d" } ?? "nil") musicnn=\(sourceFeatures.musicnnEmbedding.map { "\($0.count)d" } ?? "nil")")
+            simiLog("📦 Pool: dclap=\(min(dclapCandidates2.count, 25)) musicnn=\(min(musicnnCandidates2.count, 20)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(lastFMTracks.count, 25)) lb=\(min(lbTracks.count, 25)) sc=\(min(soundCloudCandidates2.count, 25)) tag=\(min(emotionalTagCandidates2.count, 20)) mood=\(min(undergroundMoodCandidates2.count, 20)) deezer=\(min(deezerCandidates.count, 15)) src=\(min(sourceArtistCandidates2.count, 4)) artist=\(min(artistCandidates.count, 8)) → \(expandedTracks.count) unique")
 
             let merged = try await mergeAndScore(
                 spotifyRecs: spotifyRecs,
@@ -590,8 +835,10 @@ class RecommendationEngine: ObservableObject {
                 genres: genres,
                 prefetchedFeatures: [:]
             )
+            simiLog("🔀 mergeAndScore → \(merged.count) candidates (top score: \(String(format: "%.3f", merged.first?.similarityScore ?? 0.0)))")
 
             guard !merged.isEmpty else {
+                simiLog("⛔ mergeAndScore empty — all \(expandedTracks.count) tracks failed Spotify search or were deduped")
                 errorMessage = "Couldn't find similar songs for this track. Try a different song."
                 isLoading = false
                 return
@@ -599,21 +846,22 @@ class RecommendationEngine: ObservableObject {
 
             loadingMessage = "Putting it together…"
             let earlyCache = await earlyLookupTask.value
+            let gated = await applyGenreGate(candidates: merged, genres: genres)
             let enriched = await prefetchCandidateFeatures(
-                candidates: merged,
+                candidates: gated,
                 sourceFeatures: sourceFeatures,
                 genres: genres,
-                prewarmedCache: earlyCache
+                prewarmedCache: earlyCache,
+                sourceArtist: song.artist
             )
+            simiLog("✅ prefetchCandidateFeatures → \(enriched.count) songs (top score: \(String(format: "%.3f", enriched.first?.similarityScore ?? 0.0)), min: \(String(format: "%.3f", enriched.last?.similarityScore ?? 0.0)))")
             self.recommendations = enriched
             history.record(song: song, query: query)
             isLoading = false
 
-            if sourceFeatures.dclapEmbedding != nil {
-                Task { await self.embedCandidatesInBackground(songs: merged, sourceFeatures: sourceFeatures) }
-            }
-
-            await enrichWithABFeatures(sourceFeatures: sourceFeatures, genres: genres)
+            await enrichWithABFeatures(sourceFeatures: sourceFeatures, genres: genres, rawTags: earlyTags)
+            Task { await self.embedCandidatesInBackground(songs: self.recommendations, sourceFeatures: sourceFeatures) }
+            Task { await self.warmArtistCache(artist: self.sourceSong?.artist ?? "") }
             return
 
         } catch let error as SimiError {
@@ -685,7 +933,7 @@ class RecommendationEngine: ObservableObject {
 
             // ── Step 3: All candidate fetches concurrently ──
             // None of these depend on each other — they all need only resolvedSongs/blended/seedIDs.
-            // Previously sequential (allLastFMTracks → allGenres → spotifyRecs → allRawTags) added ~2s.
+            // Previously sequential (allLastFMTracks → allGenres → spotifyRecs) added ~2s.
             loadingMessage = "Finding similar songs…"
             let seedIDs = resolvedSongs.map { $0.id }
 
@@ -703,20 +951,25 @@ class RecommendationEngine: ObservableObject {
                 for song in resolvedSongs { group.addTask { await self.fetchGenresWithFallback(title: song.title, artist: song.artist) } }
                 var all: [[Genre]] = []; for await g in group { all.append(g) }; return all
             }
-            async let allRawTagsTask = withTaskGroup(of: [String].self) { group in
-                for song in resolvedSongs { group.addTask { await self.fetchRawTagsCached(song: song) } }
-                var tagSet = Set<String>(); for await tags in group { tagSet.formUnion(tags) }; return Array(tagSet)
-            }
             async let spotifyRecsTask   = spotifyService.getRecommendations(seedTrackIDs: seedIDs, features: blended)
             async let vectorTask        = supabase.fetchSimilarByVector(embedding: SupabaseCacheService.buildEmbedding(from: blended))
             async let dclapTask3        = fetchVectorCandidates(embedding: blended.dclapEmbedding ?? [])
+            async let musicnnTask3      = fetchMusiCNNCandidates(embedding: blended.musicnnEmbedding ?? [])
+            // Use first seed for Deezer + SoundCloud radio — close enough for blend context
+            let deezerSeed = resolvedSongs.first
+            async let deezerTask3      = deezerService.fetchSimilarTracks(
+                title: deezerSeed?.title ?? "", artist: deezerSeed?.artist ?? "")
+            async let soundCloudTask3  = soundCloudService.fetchRelatedTracks(
+                title: deezerSeed?.title ?? "", artist: deezerSeed?.artist ?? "")
 
-            let allLastFMTracks  = await lastFMTracksTask
-            let allGenres        = await allGenresTask
-            let allRawTags       = await allRawTagsTask
-            let spotifyRecs      = (try? await spotifyRecsTask) ?? []
-            let vectorCandidates = await vectorTask
-            let dclapCandidates3 = await dclapTask3
+            let allLastFMTracks     = await lastFMTracksTask
+            let allGenres           = await allGenresTask
+            let spotifyRecs         = (try? await spotifyRecsTask) ?? []
+            let vectorCandidates    = await vectorTask
+            let dclapCandidates3    = await dclapTask3
+            let musicnnCandidates3  = await musicnnTask3
+            let deezerCandidates3   = await deezerTask3
+            let soundCloudCandidates3 = await soundCloudTask3
 
             // Flatten + dedup genres
             var seenGenres = Set<String>()
@@ -724,28 +977,24 @@ class RecommendationEngine: ObservableObject {
             self.detectedGenres = mergedGenres
             self.lastGenres = mergedGenres
 
-            // Tag candidates — rawTags available now; audio-derived tags are a small supplementary fetch
-            let highEnergyMarkers3 = ["metal", "hard rock", "punk", "thrash", "hardcore", "grunge"]
-            let genreSaysLoud3 = allRawTags.contains { tag in highEnergyMarkers3.contains { tag.lowercased().contains($0) } }
-            let audioTags = (genreSaysLoud3 && blended.energy < 0.45)
-                ? []
-                : deriveAudioQueryTags(from: blended).filter { !$0.isEmpty }
-            if !audioTags.isEmpty { simiLog("🎵 Audio-derived query tags (blend): \(audioTags)") }
-
-            async let genreTagCandidatesTask = lastFMService.fetchEmotionalTagCandidates(rawTags: allRawTags)
-            let audioOnlyTags = audioTags.filter { !allRawTags.contains($0) }
-            let audioTagCandidatesTask2 = Task<[(title: String, artist: String)], Never> {
-                guard !audioOnlyTags.isEmpty else { return [] }
-                return await self.lastFMService.fetchEmotionalTagCandidates(rawTags: audioOnlyTags)
-            }
-
-            let genreTagCandidates = await genreTagCandidatesTask
-            let audioTagCandidates = await audioTagCandidatesTask2.value
-            let tagCandidates      = Self.mergeTracks(primary: genreTagCandidates, secondary: audioTagCandidates)
-            let expandedTracks     = Self.mergeTracks(
-                primary: Self.mergeTracks(primary: allLastFMTracks, secondary: tagCandidates),
-                secondary: Self.mergeTracks(primary: vectorCandidates, secondary: dclapCandidates3)
+            // Multi-seed: allLastFMTracks is the union across all seeds, so it's bigger than single-seed.
+            let expandedTracks = Self.mergeTracks(
+                primary: Self.mergeTracks(
+                    primary:   Array(dclapCandidates3.prefix(25)),
+                    secondary: Self.mergeTracks(
+                        primary:   Array(musicnnCandidates3.prefix(20)),
+                        secondary: Array(vectorCandidates.prefix(20))
+                    )
+                ),
+                secondary: Self.mergeTracks(
+                    primary:   Array(allLastFMTracks.prefix(25)),
+                    secondary: Self.mergeTracks(
+                        primary:   Array(deezerCandidates3.prefix(15)),
+                        secondary: Array(soundCloudCandidates3.prefix(15))
+                    )
+                )
             )
+            simiLog("📦 Pool (blend): dclap=\(min(dclapCandidates3.count, 25)) musicnn=\(min(musicnnCandidates3.count, 20)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(allLastFMTracks.count, 25)) deezer=\(min(deezerCandidates3.count, 15)) sc=\(min(soundCloudCandidates3.count, 15)) → \(expandedTracks.count) unique")
 
             // Exclude all seed songs from results
             let seedIDSet = Set(seedIDs)
@@ -765,8 +1014,9 @@ class RecommendationEngine: ObservableObject {
             )
 
             loadingMessage = "Almost ready…"
+            let gated = await applyGenreGate(candidates: merged, genres: mergedGenres)
             let enriched = await prefetchCandidateFeatures(
-                candidates: merged,
+                candidates: gated,
                 sourceFeatures: blended,
                 genres: mergedGenres,
                 seedFeatures: allFeatures
@@ -778,11 +1028,9 @@ class RecommendationEngine: ObservableObject {
             }
             isLoading = false
 
-            if blended.dclapEmbedding != nil {
-                Task { await self.embedCandidatesInBackground(songs: merged, sourceFeatures: blended) }
-            }
-
             await enrichWithABFeatures(sourceFeatures: blended, genres: mergedGenres, seedFeatures: allFeatures)
+            Task { await self.embedCandidatesInBackground(songs: self.recommendations, sourceFeatures: blended) }
+            Task { await self.warmArtistCache(artist: self.sourceSong?.artist ?? "") }
 
         } catch let error as SimiError {
             errorMessage = error.localizedDescription
@@ -792,6 +1040,98 @@ class RecommendationEngine: ObservableObject {
         }
 
         isLoading = false
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Mood Coordinate Search
+    // No reference song — user picks a valence × arousal point.
+    // Spotify genre seeds replace the track seed; a synthetic source
+    // AudioFeatures drives the scoring pipeline as-is.
+    // ──────────────────────────────────────────────
+
+    func findSimilarSongs(valence: Double, arousal: Double) async {
+        isLoading = true
+        loadingMessage = "Finding the feeling…"
+        errorMessage = nil
+        recommendations = []
+        sourceSong = nil
+        blendedSongs = []
+        moodTarget = MoodTarget(valence: valence, arousal: arousal)
+
+        // Synthetic source features derived from mood coordinates.
+        // Energy and valence are set directly; other dims are estimated
+        // to give the scoring pipeline plausible context.
+        let syntheticFeatures = AudioFeatures(
+            bpm: 0,
+            energy: arousal,
+            valence: valence,
+            danceability: (arousal + valence) / 2.0,
+            acousticness: max(0.0, 0.65 - arousal * 0.6),
+            instrumentalness: 0.1,
+            liveness: 0.1,
+            loudness: -14.0 + arousal * 9.0,
+            key: 0,
+            mode: valence > 0.5 ? 1 : 0,
+            isEstimated: true
+        )
+        lastSourceFeatures = syntheticFeatures
+        detectedGenres = []
+        lastGenres = []
+
+        do {
+            loadingMessage = "Searching by feel…"
+            let moodSongs = (try? await spotifyService.getRecommendationsByMood(
+                valence: valence, arousal: arousal, limit: 20
+            )) ?? []
+
+            guard !moodSongs.isEmpty else {
+                errorMessage = "Couldn't find songs for this mood. Try a different area on the pad."
+                isLoading = false
+                return
+            }
+
+            // Placeholder source: its ID is a UUID, so nothing gets excluded from results.
+            let placeholder = Song(
+                id: "mood-\(UUID().uuidString)",
+                title: moodTarget?.label ?? "Mood",
+                artist: "",
+                albumArt: "",
+                previewURL: nil,
+                spotifyURL: "",
+                sourceURL: "",
+                releaseYear: nil
+            )
+
+            loadingMessage = "Analyzing the feel…"
+            let merged = try await mergeAndScore(
+                spotifyRecs: moodSongs,
+                lastFMTracks: [],
+                sourceSong: placeholder,
+                sourceFeatures: syntheticFeatures,
+                genres: []
+            )
+
+            guard !merged.isEmpty else {
+                errorMessage = "Couldn't score results for this mood. Try a different area."
+                isLoading = false
+                return
+            }
+
+            loadingMessage = "Putting it together…"
+            let enriched = await prefetchCandidateFeatures(
+                candidates: merged,
+                sourceFeatures: syntheticFeatures,
+                genres: []
+            )
+            recommendations = enriched
+            isLoading = false
+
+            await enrichWithABFeatures(sourceFeatures: syntheticFeatures, genres: [])
+        } catch {
+            errorMessage = "Something went wrong. Please try again."
+            simiLog("Mood search error:", error)
+            isLoading = false
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -949,16 +1289,39 @@ class RecommendationEngine: ObservableObject {
             previewURL = await deezerService.fetchPreviewURL(title: song.title, artist: song.artist)
         }
 
-        // 2. Railway librosa — full measured analysis (BPM, energy, valence, danceability,
-        //    acousticness, instrumentalness, liveness, loudness, key, mode via FFT/chroma/MFCC).
-        //    Falls through silently when Railway is unreachable so tag estimation takes over.
+        // 2. Audio analysis — download once, try HF then SonicDNA.
+        //    2a. HF librosa: DEAM arousal/valence + full librosa features (gold standard).
+        //    2b. LocalAudioAnalyzer: full SonicDNA features including mfccMean — activates
+        //        the 0.08 mfccCosine weight in computeSimilarity for source-side scoring.
+        //    Both receive the same downloaded bytes — no double-download on HF failure.
         if let previewURL {
-            if let pyFeatures = await simiAudioService.analyzePreview(url: previewURL, artist: song.artist, title: song.title) {
-                simiLog("✅ Python audio analyzer: \(song.title) — \(Int(pyFeatures.bpm))BPM energy=\(String(format: "%.2f", pyFeatures.energy)) valence=\(String(format: "%.2f", pyFeatures.valence))")
-                Task { await supabase.storeFeatures(title: song.title, artist: song.artist, features: pyFeatures, source: "librosa") }
-                return pyFeatures
+            var downloadedAudio: Data? = nil
+            if let audioURL = URL(string: previewURL),
+               let (data, audioResp) = try? await URLSession.shared.data(from: audioURL),
+               (audioResp as? HTTPURLResponse)?.statusCode == 200 {
+                downloadedAudio = data
             }
-            // Service unreachable or analysis failed — fall through to local analyzer + tag estimation.
+
+            if let audioData = downloadedAudio {
+                // 2a: HF librosa
+                if let pyFeatures = await simiAudioService.analyzeDownloadedAudio(
+                       data: audioData, sourceURL: previewURL,
+                       artist: song.artist, title: song.title, spotifyId: song.id) {
+                    simiLog("✅ Python audio analyzer: \(song.title) — \(Int(pyFeatures.bpm))BPM energy=\(String(format: "%.2f", pyFeatures.energy)) valence=\(String(format: "%.2f", pyFeatures.valence))")
+                    Task { await supabase.storeFeatures(title: song.title, artist: song.artist, features: pyFeatures, source: "librosa") }
+                    return pyFeatures
+                }
+
+                // 2b: SonicDNA on-device analysis
+                if let localFeatures = await localAudioAnalyzer.analyze(
+                       data: audioData, sourceURL: previewURL, title: song.title) {
+                    simiLog("✅ SonicDNA source: \(song.title) — \(Int(localFeatures.bpm))BPM energy=\(String(format: "%.2f", localFeatures.energy)) valence=\(String(format: "%.2f", localFeatures.valence))")
+                    Task { await supabase.storeFeatures(title: song.title, artist: song.artist, features: localFeatures, source: "preview_audio") }
+                    return localFeatures
+                }
+            }
+
+            // Both failed or audio unavailable — fall through to PreviewAudioAnalyzer + tag estimation.
             audioMeasurements = await previewAnalyzer.analyze(previewURL: previewURL)
         }
 
@@ -1042,14 +1405,17 @@ class RecommendationEngine: ObservableObject {
                 let finalMode = gsbpmMode ?? audio.detectedMode
                 // Key is reliable if GetSongBPM provided it OR if chroma detection was confident.
                 let keyIsReliable = gsbpmKey != nil || audio.modeConfidence >= 0.4
+                // Acousticness: blend on-device measurement with tag estimate.
+                // Liveness: on-device RMS variance is more reliable than any tag guess.
+                let mergedAcousticness = audio.acousticness * 0.6 + tagEstimated.acousticness * 0.4
                 let merged = AudioFeatures(
                     bpm:              tagEstimated.bpm,
                     energy:           mergedEnergy,
                     valence:          mergedValence,
                     danceability:     tagEstimated.danceability,
-                    acousticness:     tagEstimated.acousticness,
+                    acousticness:     mergedAcousticness,
                     instrumentalness: tagEstimated.instrumentalness,
-                    liveness:         tagEstimated.liveness,
+                    liveness:         audio.liveness,
                     loudness:         tagEstimated.loudness,
                     key:              finalKey,
                     mode:             finalMode,
@@ -1081,9 +1447,9 @@ class RecommendationEngine: ObservableObject {
                 energy:           audio.energy,
                 valence:          audioValence,
                 danceability:     0.5,
-                acousticness:     0.0,
+                acousticness:     audio.acousticness,
                 instrumentalness: 0.0,
-                liveness:         0.0,
+                liveness:         audio.liveness,
                 loudness:         -10.0,
                 key:              audio.detectedKey,
                 mode:             audio.detectedMode,
@@ -1132,11 +1498,17 @@ class RecommendationEngine: ObservableObject {
     ) -> MatchExplanation {
         var rows: [MatchExplanationRow] = []
 
-        // Row 1: Emotional weight — valence (prefer DEAM-regressed value, consistent with computeSimilarity)
-        // Gate: threshold unchanged (0.20), but isEstimated check removed — estimated songs show
-        // softer descriptors instead of nothing.
-        let srcValence = source.valenceEssentia ?? source.valence
-        let tgtValence = target.valenceEssentia ?? target.valence
+        // Row 1: Emotional weight — valence.
+        // Use DEAM only when BOTH songs have it (same measurement scale). Mixing DEAM source with
+        // SonicDNA-proxy target compresses all candidates to an equal distance from the source,
+        // making energy the sole discriminator and producing cross-genre false matches.
+        let srcValence: Double
+        let tgtValence: Double
+        if let sv = source.valenceEssentia, let tv = target.valenceEssentia {
+            (srcValence, tgtValence) = (sv, tv)
+        } else {
+            (srcValence, tgtValence) = (source.valence, target.valence)
+        }
         let isEitherEstimated = source.isEstimated || target.isEstimated
         if abs(srcValence - tgtValence) < 0.20 {
             let avg = (srcValence + tgtValence) / 2
@@ -1157,6 +1529,27 @@ class RecommendationEngine: ObservableObject {
                 }
             }
             rows.append(MatchExplanationRow(label: "Emotional weight", descriptor: descriptor))
+        }
+
+        // Row 1.5: Activation level — circumplex arousal axis (librosa only)
+        if let srcArousal = source.arousal, let tgtArousal = target.arousal,
+           abs(srcArousal - tgtArousal) < 0.20 {
+            let avgArousal = (srcArousal + tgtArousal) / 2
+            let descriptor: String
+            if isEitherEstimated {
+                switch avgArousal {
+                case ..<0.35:         descriptor = "Similarly calm"
+                case 0.35..<0.55:     descriptor = "Similarly measured"
+                default:              descriptor = "Similarly activated"
+                }
+            } else {
+                switch avgArousal {
+                case ..<0.35:         descriptor = "Equally calm and unhurried"
+                case 0.35..<0.55:     descriptor = "Equally measured activation"
+                default:              descriptor = "Equally heightened"
+                }
+            }
+            rows.append(MatchExplanationRow(label: "Activation level", descriptor: descriptor))
         }
 
         // Row 2: Intensity — energy
@@ -1281,64 +1674,171 @@ class RecommendationEngine: ObservableObject {
     /// filter on recommended songs without requiring Spotify Extended Quota Mode.
     /// When seedFeatures has >1 entry (blend mode), scores candidates against all seeds
     /// and returns the average — ensuring blend results fit the full range of the user's taste.
+    // Genre → expected Spotify-scale energy/valence.
+    // Python+SonicDNA measure RMS/spectral — systematically ~40-50% lower than
+    // Spotify's perceptual energy for groovy/rhythmic genres. These tables let us
+    // detect and correct for that bias when raw tags are available.
+    private static let genreEnergyTable: [String: Double] = [
+        "funk": 0.75, "disco": 0.78, "dance": 0.76, "electronic": 0.74,
+        "edm": 0.84, "house": 0.80, "techno": 0.82, "hip-hop": 0.68,
+        "hip hop": 0.68, "rap": 0.70, "soul": 0.58, "rnb": 0.58,
+        "r&b": 0.58, "pop": 0.64, "rock": 0.70, "punk": 0.82,
+        "metal": 0.90, "jazz": 0.44, "blues": 0.46, "folk": 0.38,
+        "country": 0.54, "classical": 0.24, "ambient": 0.14,
+        "neo-soul": 0.52, "motown": 0.62, "gospel": 0.66
+    ]
+    private static let genreValenceTable: [String: Double] = [
+        "funk": 0.80, "disco": 0.84, "dance": 0.78, "pop": 0.72,
+        "soul": 0.64, "rnb": 0.60, "r&b": 0.60, "motown": 0.68,
+        "jazz": 0.60, "blues": 0.38, "hip-hop": 0.54, "rap": 0.52,
+        "rock": 0.52, "punk": 0.54, "metal": 0.32, "electronic": 0.60,
+        "house": 0.74, "folk": 0.54, "country": 0.62, "classical": 0.48,
+        "ambient": 0.42, "gospel": 0.72, "neo-soul": 0.56
+    ]
+
     private func enrichWithABFeatures(
         sourceFeatures: AudioFeatures,
         genres: [Genre],
+        rawTags: [String] = [],
         seedFeatures: [AudioFeatures] = []
     ) async {
         let snapshot = recommendations
+        simiLog("🎵 enrichWithABFeatures called: \(snapshot.count) songs in recommendations")
         guard !snapshot.isEmpty else { return }
+
+        // Stage 0.5: pre-calibrate source before Stage 1 candidate scoring.
+        // SonicDNA/Python measure RMS/spectral amplitude — 40-50% lower than Spotify's
+        // perceptual energy for groovy genres. Without this, Boogie Wonderland (tag energy 0.75)
+        // scores terribly against Fantasy's raw energy (0.27), gets cut by the quality filter,
+        // and never reaches Stage 2.5 where calibration previously lived. Classic rock songs
+        // with moderate estimated energy (~0.45) survive instead because they're "closer" to 0.27.
+        // Calibrating here ensures genre-correct candidates aren't filtered before they can compete.
+        var sourceFeatures = sourceFeatures
+        if !rawTags.isEmpty {
+            let tagEnergies = rawTags.compactMap { Self.genreEnergyTable[$0.lowercased()] }
+            let tagValences = rawTags.compactMap { Self.genreValenceTable[$0.lowercased()] }
+            if !tagEnergies.isEmpty {
+                let genreMeanEnergy = tagEnergies.reduce(0, +) / Double(tagEnergies.count)
+                let energyGap = genreMeanEnergy - sourceFeatures.energy
+                if energyGap > 0.25 {
+                    let calibrated = sourceFeatures.energy * 0.35 + genreMeanEnergy * 0.65
+                    simiLog("📈 Stage 1 source energy calibration (\(rawTags.prefix(3).joined(separator: "/"))): \(String(format: "%.2f", sourceFeatures.energy)) → \(String(format: "%.2f", calibrated)) (genre mean \(String(format: "%.2f", genreMeanEnergy)))")
+                    sourceFeatures.energy = calibrated
+                }
+            }
+            if !tagValences.isEmpty {
+                let genreMeanValence = tagValences.reduce(0, +) / Double(tagValences.count)
+                let valenceGap = genreMeanValence - sourceFeatures.valence
+                if valenceGap > 0.20 {
+                    let calibrated = sourceFeatures.valence * 0.35 + genreMeanValence * 0.65
+                    simiLog("📈 Stage 1 source valence calibration (\(rawTags.prefix(3).joined(separator: "/"))): \(String(format: "%.2f", sourceFeatures.valence)) → \(String(format: "%.2f", calibrated)) (genre mean \(String(format: "%.2f", genreMeanValence)))")
+                    sourceFeatures.valence = calibrated
+                }
+            }
+        }
 
         simiLog("🎵 Starting tag-feature enrichment for \(snapshot.count) songs...")
 
         // Fill preview URLs so the audio player can play songs.
+        // Snapshot is intentionally taken before the fill: songs from Last.fm/MusicBrainz arrive
+        // without previewURL, so Priority 2 (LocalAudio) fails immediately and falls through to fast
+        // tag estimation for them. Stage 2 then handles the top-10 with SonicDNA.
+        // Running fill first would make Priority 2 fire for 50+ songs simultaneously, turning
+        // a 3s enrichment into a 2-minute download+analyze marathon.
         await fillMissingPreviewURLs()
 
-        var tagUpdates: [(index: Int, features: AudioFeatures)] = []
+        var tagUpdates: [(index: Int, features: AudioFeatures, genre: Genre?)] = []
 
-        await withTaskGroup(of: (Int, AudioFeatures?).self) { group in
+        // Limits adjacent-genre candidates (penalty 0.12) to 10 slots across the entire pool.
+        // Distant-genre candidates (penalty 0.18+) remain hard-excluded regardless.
+        // Same-genre candidates are uncapped.
+        // The actor counter is claimed in index order, so higher-priority (lower-index) candidates
+        // consume slots first — tag/vector candidates before social-graph candidates.
+        // 10 (up from 5) to accommodate hybrid-family sources like "raprock" where both
+        // hiphop AND rock neighbours are adjacent — previously both were free (same "hiphop" family).
+        let adjacentQuota = GenreQuotaTracker(limit: 10)
+        // Captured once on main actor so child tasks don't hop back to it for every analyze call.
+        let analyzer = localAudioAnalyzer
+
+        await withTaskGroup(of: (Int, AudioFeatures?, Genre?).self) { group in
             for (index, song) in snapshot.enumerated() {
                 group.addTask {
-                    // ── Priority 1: Supabase feature cache ──
-                    // Songs analyzed in a previous session are stored here; skip Last.fm
-                    // entirely for them. No stagger needed — cache hit is a single indexed read.
-                    if let cached = await self.supabase.lookupFeatures(title: song.title, artist: song.artist) {
-                        simiLog("✅ Supabase cache hit (enrichment): \"\(song.title)\"")
-                        return (index, cached)
-                    }
-
-                    // ── Priority 2: AcousticBrainz (pre-2022 real measurements) ──
-                    // MBID lookup short-circuits on miss for modern tracks (one fast indexed GET).
-                    // AB fetch only fires on MBID hit. Returns isEstimated=false by default.
-                    if let mbid = await self.listenBrainzService.resolveACRMBID(title: song.title, artist: song.artist),
-                       let abFeatures = await self.acousticBrainzService.fetchFeatures(mbid: mbid) {
-                        simiLog("✅ AcousticBrainz features: \"\(song.title)\"")
-                        return (index, abFeatures)
-                    }
-
-                    // ── Priority 3: tag estimation ──
-                    // Stagger requests to respect Last.fm rate limits.
-                    // Capped at index 15 (300ms max) — was unbounded × 20ms (760ms for song 38).
+                    // ── Step 0: Last.fm tags → genre pre-filter ──
+                    // Tags are fetched first for ALL candidates so that:
+                    // (1) cross-genre songs are excluded before any expensive feature lookups,
+                    // (2) Supabase/AB cache hits get the correct targetGenre (fixes nil-genre
+                    //     bug where cached songs inherited the SOURCE genre and escaped penalty).
+                    // Stagger applies to all paths since all now call Last.fm.
                     if index > 0 {
                         try? await Task.sleep(nanoseconds: UInt64(min(index, 15)) * 20_000_000)
                     }
-                    // Estimate from Last.fm genre/mood tags — covers nearly everything
-                    let tags = await self.lastFMService.fetchRawTags(
-                        title: song.title, artist: song.artist
-                    )
+                    // Fetch track-level AND artist-level tags in parallel.
+                    // Track tags alone are unreliable — community mis-tags happen constantly
+                    // (BTS "Aliens" → "trap, pop rap" at track level, "k-pop" at artist level).
+                    // Merging both gives the genre filter the full picture.
+                    async let trackTagsTask   = self.lastFMService.fetchRawTags(title: song.title, artist: song.artist)
+                    async let artistTagsTask  = self.lastFMService.fetchArtistRawTags(artist: song.artist)
+                    let trackTags  = await trackTagsTask
+                    let artistTags = await artistTagsTask
+                    // Append artist tags that aren't already covered by track tags (up to 5 extra).
+                    let trackTagSet = Set(trackTags)
+                    let extraArtist = artistTags.filter { !trackTagSet.contains($0) }.prefix(5)
+                    let tags = trackTags + Array(extraArtist)
+                    let targetGenre = await self.genresFromRawTags(tags).first
+
+                    // Genre gate: hard-exclude distant families; soft-cap adjacent families at 5.
+                    // Distant (0.18+): never passes regardless of acoustic score.
+                    // Adjacent (0.12): max 5 candidates across the whole pool — prevents social-graph
+                    //   bleed from filling result slots that should go to genre-correct candidates,
+                    //   while still allowing the rare emotionally-matched cross-genre find.
+                    // Same family (0): uncapped.
+                    if let tg = targetGenre, !genres.isEmpty {
+                        let penalty = self.genrePenalty(sourceGenres: genres, targetGenre: tg)
+                        if penalty >= 0.18 {
+                            simiLog("🚫 Pool pre-filter: excluded \"\(song.title)\" (\(tg.main), penalty \(String(format: "%.2f", penalty)))")
+                            return (index, nil, nil)
+                        } else if penalty > 0 {
+                            let allowed = await adjacentQuota.claim()
+                            if !allowed {
+                                simiLog("🚫 Adjacent quota full: excluded \"\(song.title)\" (\(tg.main))")
+                                return (index, nil, nil)
+                            }
+                        }
+                    }
+
+                    // ── Priority 1: Supabase feature cache ──
+                    if let cached = await self.supabase.lookupFeatures(title: song.title, artist: song.artist) {
+                        simiLog("✅ Supabase cache hit (enrichment): \"\(song.title)\"")
+                        return (index, cached, targetGenre)
+                    }
+
+                    // ── Priority 2: on-device local audio analysis ──
+                    // Only fires for songs that already had previewURL before enrichment started
+                    // (Spotify-sourced songs). Last.fm/MusicBrainz songs have nil previewURL here
+                    // since the snapshot is taken before fillMissingPreviewURLs — intentional, keeps
+                    // enrichment fast. Stage 2 covers the top 10 with SonicDNA after tag estimation.
+                    if let previewURL = song.previewURL,
+                       let audioURL = URL(string: previewURL),
+                       let (audioData, audioResp) = try? await URLSession.shared.data(from: audioURL),
+                       (audioResp as? HTTPURLResponse)?.statusCode == 200,
+                       let measured = await analyzer.analyze(data: audioData, sourceURL: previewURL, title: song.title) {
+                        simiLog("🎛️ LocalAudio measured: \"\(song.title)\"")
+                        Task { await self.supabase.storeFeatures(title: song.title, artist: song.artist, features: measured, source: "preview_audio") }
+                        return (index, measured, targetGenre)
+                    }
+
+                    // ── Priority 3: tag estimation (fallback when no preview URL or download failed) ──
                     guard var estimated = await self.estimateFeaturesFromTags(tags) else {
-                        return (index, nil)
+                        return (index, nil, nil)
                     }
                     simiLog("🏷️ Tag-estimated features for \"\(song.title)\": \(tags.prefix(3).joined(separator: ", "))")
 
-                    // Fetch musical key from GetSongBPM — makes the Same Key filter work.
-                    // Capped to top 20 songs: protects the 500 req/day quota and keeps
-                    // tail latency bounded (lower-ranked songs rarely need key accuracy).
+                    // GetSongBPM key: only needed here because tag estimation leaves key=0/mode=1
+                    // (LocalAudio songs already have measured key/BPM — quota saved there).
+                    // Capped to top 20 songs: protects the 500 req/day quota.
                     if index < 20,
                        let songData = await self.getSongBPMService.fetchSongData(title: song.title, artist: song.artist),
                        let key = songData.key, let mode = songData.mode {
-                        // Apply the same BPM correction used for the source song so recommended
-                        // songs aren't penalized by doubled/halved GetSongBPM readings.
                         let rawBPM = songData.bpm > 0 ? songData.bpm : estimated.bpm
                         let resolvedBPM = songData.bpm > 0 ? self.normalizeBPM(rawBPM, tags: tags) : estimated.bpm
                         estimated = AudioFeatures(
@@ -1361,13 +1861,21 @@ class RecommendationEngine: ObservableObject {
                         simiLog("🎵 Key from GetSongBPM: \(keyLabel) \(modeName) for \"\(song.title)\"")
                     }
 
-                    return (index, estimated)
+                    return (index, estimated, targetGenre)
                 }
             }
 
-            for await (index, features) in group {
-                guard let features = features else { continue }
-                tagUpdates.append((index: index, features: features))
+            for await (index, features, genre) in group {
+                if let features {
+                    tagUpdates.append((index: index, features: features, genre: genre))
+                } else if index < recommendations.count {
+                    // Stage 1 excluded this song (distant genre / quota). Zero its score so
+                    // the quality filter removes it before Stage 2 picks it up via previewURL.
+                    // Without this, excluded songs (e.g. L.E.S. Girl for a rap search) keep
+                    // their mergeAndScore value, survive the filter, and get SonicDNA analysis
+                    // with no genre penalty applied — producing nonsense "Very similar" matches.
+                    recommendations[index].similarityScore = 0
+                }
             }
         }
 
@@ -1375,9 +1883,15 @@ class RecommendationEngine: ObservableObject {
         var enrichedCount = 0
         for update in tagUpdates {
             guard update.index < recommendations.count else { continue }
+            // Store the candidate's own genre derived from its Last.fm tags so the genre
+            // penalty has real target data and the UI shows the correct genre label.
+            if let tg = update.genre {
+                recommendations[update.index].genre = tg
+            }
+            let targetGenre = recommendations[update.index].genre
             let (score, reasons) = seedFeatures.count > 1
-                ? computeSimilarityMultiSeed(seeds: seedFeatures, target: update.features, genres: genres)
-                : computeSimilarity(source: sourceFeatures, target: update.features, genres: genres)
+                ? computeSimilarityMultiSeed(seeds: seedFeatures, target: update.features, genres: genres, targetGenre: targetGenre)
+                : computeSimilarity(source: sourceFeatures, target: update.features, genres: genres, targetGenre: targetGenre)
             recommendations[update.index].audioFeatures   = update.features
             recommendations[update.index].similarityScore = score
             recommendations[update.index].matchReasons    = reasons
@@ -1386,7 +1900,7 @@ class RecommendationEngine: ObservableObject {
                 source: explanationSource,
                 target: update.features,
                 sourceGenres: genres,
-                targetGenre: recommendations[update.index].genre
+                targetGenre: targetGenre
             )
             enrichedCount += 1
         }
@@ -1396,92 +1910,291 @@ class RecommendationEngine: ObservableObject {
         }
 
         let coverageRatio = Double(enrichedCount) / Double(max(1, snapshot.count))
+        simiLog("📊 Enrichment coverage: \(enrichedCount)/\(snapshot.count) (\(String(format: "%.0f", coverageRatio * 100))%) — quality filter \(coverageRatio >= 0.3 ? "will run" : "skipped (low coverage)")")
         if coverageRatio >= 0.3 {
             let before = recommendations.count
-            recommendations = recommendations.filter { $0.similarityScore >= 0.62 }
+            let scoreRange = recommendations.map { $0.similarityScore }
+            let minScore = scoreRange.min() ?? 0
+            let maxScore = scoreRange.max() ?? 0
+            simiLog("📊 Score distribution before filter: min=\(String(format: "%.3f", minScore)) max=\(String(format: "%.3f", maxScore))")
+            let threshold = 0.65
+            let minFloor  = 8
+            let filtered  = recommendations.filter { $0.similarityScore >= threshold }
+            // Never show fewer than minFloor results — if threshold is too aggressive for this
+            // pool (e.g. Spotify down, only LB candidates), keep the top minFloor by score.
+            recommendations = filtered.count >= minFloor ? filtered : Array(recommendations.prefix(minFloor))
             let removed = before - recommendations.count
             if removed > 0 {
-                simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold 0.62)")
+                simiLog("🔪 Quality filter removed \(removed) low-scoring songs (threshold \(threshold)), \(recommendations.count) remain")
             }
         }
 
+        recommendations.sort { $0.similarityScore > $1.similarityScore }
         simiLog("✅ Tag enrichment done: \(enrichedCount)/\(snapshot.count) songs got features")
 
-        // ── STAGE 2: librosa enrichment for top candidates ──
-        // Check cancellation first — a new search may have fired during Stage 1.
+        // ── STAGE 2: SonicDNA on-device analysis for top candidates ──
+        // Replaces remote HF Spaces with LocalAudioAnalyzer — the same DSP engine
+        // used for source songs. All songs run fully concurrently: no batching needed,
+        // no cold starts, no network roundtrip. Each call writes its own temp file so
+        // concurrent execution is safe by design (see LocalAudioAnalyzer comments).
         guard !Task.isCancelled else {
-            simiLog("⚠️ Librosa enrichment cancelled before Stage 2 — new search started")
+            simiLog("⚠️ SonicDNA Stage 2 cancelled before start — new search fired")
             return
         }
 
-        let librosaTargets = recommendations
-            .prefix(10)
+        // Filter: only songs still on tag-estimated features (isEstimated = true or nil features).
+        // Songs already measured (isEstimated = false) came from Supabase or source analysis — skip.
+        let sonicTargets = Array(recommendations
+            .prefix(15)
             .enumerated()
-            .compactMap { (i, song) -> (index: Int, url: String)? in
+            .compactMap { (i, song) -> (index: Int, url: String, title: String, artist: String, genreHints: [String])? in
                 guard let url = song.previewURL,
                       song.audioFeatures?.isEstimated != false else { return nil }
-                return (index: i, url: url)
+                var hints = [song.genre.main.lowercased()]
+                if let sub = song.genre.sub { hints.append(sub.lowercased()) }
+                return (index: i, url: url, title: song.title, artist: song.artist, genreHints: hints)
             }
+            .prefix(10))
 
-        guard !librosaTargets.isEmpty else {
-            simiLog("🎵 No librosa candidates (all measured or no preview URLs)")
+        guard !sonicTargets.isEmpty else {
+            simiLog("🎛️ Stage 2 skipped — top songs already have measured features")
             return
         }
 
-        simiLog("🎵 Starting librosa enrichment for \(librosaTargets.count) candidates (max 2 concurrent)...")
+        simiLog("🎛️ SonicDNA Stage 2: \(sonicTargets.count) candidates, fully concurrent…")
 
-        // Chunk into pairs to keep Railway at ≤2 concurrent requests.
-        // Python GIL serializes librosa; >2 concurrent causes queue buildup and timeouts.
-        let chunks = stride(from: 0, to: librosaTargets.count, by: 2).map {
-            Array(librosaTargets[$0..<min($0 + 2, librosaTargets.count)])
+        // Phase 1: Download all preview audio in parallel (pure I/O).
+        typealias DownloadedTarget = (index: Int, data: Data, url: String, title: String, artist: String, genreHints: [String])
+        let downloaded: [DownloadedTarget] = await withTaskGroup(of: DownloadedTarget?.self) { group in
+            for target in sonicTargets {
+                group.addTask {
+                    guard !Task.isCancelled,
+                          let audioURL = URL(string: target.url),
+                          let (data, response) = try? await URLSession.shared.data(from: audioURL),
+                          (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+                    return (target.index, data, target.url, target.title, target.artist, target.genreHints)
+                }
+            }
+            var results: [DownloadedTarget] = []
+            for await result in group { if let r = result { results.append(r) } }
+            return results
         }
 
-        var librosaSucceeded = 0
-        for chunk in chunks {
-            guard !Task.isCancelled else {
-                simiLog("⚠️ Librosa enrichment cancelled mid-run — new search started")
-                return
-            }
+        guard !downloaded.isEmpty else { return }
 
-            let batchResults: [(Int, AudioFeatures?)] = await withTaskGroup(of: (Int, AudioFeatures?).self) { group in
-                for (idx, url) in chunk {
-                    group.addTask {
-                        guard !Task.isCancelled else { return (idx, nil) }
-                        let features = await self.simiAudioService.analyzePreview(url: url)
-                        return (idx, features)
-                    }
+        // Phase 2: Analyze downloads with SonicDNA via DSPCoolant.
+        // Coolant caps concurrent analyze() calls at 3 and staggers the initial
+        // burst (80 ms between the first 3 starts) to smooth the CPU ramp-up.
+        // Task.yield() inside buildFeatures() every 128 frames makes each task
+        // genuinely cooperative so the OS can service UI events mid-analysis.
+        var sonicSucceeded = 0
+        let coolant = DSPCoolant(slots: 3)
+        await withTaskGroup(of: (Int, AudioFeatures?).self) { group in
+            for dl in downloaded {
+                group.addTask(priority: .utility) {
+                    await coolant.enter()
+                    defer { Task { await coolant.exit() } }
+                    guard !Task.isCancelled else { return (dl.index, nil) }
+                    return (dl.index, await analyzer.analyze(data: dl.data, sourceURL: dl.url, title: dl.title, genreHints: dl.genreHints))
                 }
-                var results: [(Int, AudioFeatures?)] = []
-                for await result in group { results.append(result) }
-                return results
             }
-
-            for (idx, features) in batchResults {
-                guard let features, idx < recommendations.count else { continue }
-                let song = recommendations[idx]
+            for await result in group {
+                let (idx, features) = result
+                guard let features, idx < self.recommendations.count else { continue }
+                let song = self.recommendations[idx]
+                let targetGenre = self.recommendations[idx].genre
                 let (score, reasons) = seedFeatures.count > 1
-                    ? computeSimilarityMultiSeed(seeds: seedFeatures, target: features, genres: genres)
-                    : computeSimilarity(source: sourceFeatures, target: features, genres: genres)
-                recommendations[idx].audioFeatures   = features
-                recommendations[idx].similarityScore = score
-                recommendations[idx].matchReasons    = reasons
-                let explanationSource = seedFeatures.count > 1 ? centroid(of: seedFeatures) : sourceFeatures
-                recommendations[idx].matchExplanation = buildMatchExplanation(
+                    ? self.computeSimilarityMultiSeed(seeds: seedFeatures, target: features, genres: genres, targetGenre: targetGenre)
+                    : self.computeSimilarity(source: sourceFeatures, target: features, genres: genres, targetGenre: targetGenre)
+                self.recommendations[idx].audioFeatures   = features
+                self.recommendations[idx].similarityScore = score
+                self.recommendations[idx].matchReasons    = reasons
+                let explanationSource = seedFeatures.count > 1 ? self.centroid(of: seedFeatures) : sourceFeatures
+                self.recommendations[idx].matchExplanation = self.buildMatchExplanation(
                     source: explanationSource,
                     target: features,
                     sourceGenres: genres,
-                    targetGenre: recommendations[idx].genre
+                    targetGenre: self.recommendations[idx].genre
                 )
-                // Write to Supabase so the next time this song appears it's a cache hit — no Railway call.
-                Task { await self.supabase.storeFeatures(title: song.title, artist: song.artist, features: features, source: "librosa") }
-                librosaSucceeded += 1
+                Task { await self.supabase.storeFeatures(title: song.title, artist: song.artist, features: features, source: "sonicdna") }
+                sonicSucceeded += 1
             }
         }
 
-        if librosaSucceeded > 0 {
-            simiLog("✅ Librosa Stage 2 done: \(librosaSucceeded)/\(librosaTargets.count) songs upgraded (positions frozen)")
+        if sonicSucceeded > 0 {
+            recommendations.sort { $0.similarityScore > $1.similarityScore }
+            simiLog("✅ SonicDNA Stage 2 done: \(sonicSucceeded)/\(sonicTargets.count) measured, list re-sorted")
+
+            // Stage 2.6: Silent async DEAM enrichment for top candidates.
+            // Fires non-blocking after Stage 2 — the user already sees results.
+            // Re-downloads preview audio for up to 5 top-ranked candidates with
+            // a previewURL, runs HF Essentia/DEAM, and overwrites valenceEssentia
+            // + arousal (including any CoreML bootstrap) with ground-truth DEAM.
+            // Persists to Supabase — future searches get DEAM-quality valence
+            // with zero wait time (cache hit at Stage 1).
+            let deamQueue = recommendations
+                .prefix(8)
+                .filter { $0.previewURL != nil }
+                .prefix(5)
+                .map { ($0.title, $0.artist, $0.id, $0.previewURL!) }
+
+            if !deamQueue.isEmpty {
+                simiLog("🔬 Stage 2.6: queuing DEAM enrichment for \(deamQueue.count) candidates")
+                Task(priority: .background) {
+                    for (title, artist, songId, urlStr) in deamQueue {
+                        guard let audioURL = URL(string: urlStr),
+                              let (data, resp) = try? await URLSession.shared.data(from: audioURL),
+                              (resp as? HTTPURLResponse)?.statusCode == 200 else { continue }
+
+                        guard let pyFeatures = await simiAudioService.analyzeDownloadedAudio(
+                            data: data, sourceURL: urlStr,
+                            artist: artist, title: title, spotifyId: songId) else { continue }
+
+                        guard let liveIdx = recommendations.firstIndex(where: {
+                            $0.title == title && $0.artist == artist
+                        }), var af = recommendations[liveIdx].audioFeatures else { continue }
+
+                        if let vv = pyFeatures.valenceEssentia { af.valenceEssentia = vv }
+                        if let da = pyFeatures.arousal { af.arousal = da }
+                        recommendations[liveIdx].audioFeatures = af
+                        let enriched = af  // snapshot before Task capture
+                        Task { await supabase.storeFeatures(title: title, artist: artist, features: enriched, source: "deam_enriched") }
+                        simiLog("🔬 Stage 2.6 ✓ \(title): valenceEssentia=\(String(format:"%.2f", pyFeatures.valenceEssentia ?? -1)) arousal=\(String(format:"%.2f", pyFeatures.arousal ?? -1))")
+                    }
+                }
+            }
+
+            // Stage 2.5: source re-analysis.
+            // Triggers when source is tag-estimated OR Python-measured (valenceEssentia != nil).
+            // Python (DEAM neural) and SonicDNA (DSP proxy) don't share a measurement scale —
+            // comparing Python source to SonicDNA candidates inflates scores for any song with
+            // similar energy regardless of actual vibe. Re-analyzing the source with SonicDNA
+            // gives apples-to-apples comparison and fixes "family ties looks like Peso" false matches.
+            if (sourceFeatures.isEstimated || sourceFeatures.valenceEssentia != nil), let srcSong = self.sourceSong {
+                let srcURL: String?
+                if let url = srcSong.previewURL {
+                    srcURL = url
+                } else if let url = await itunesService.fetchPreviewURL(title: srcSong.title, artist: srcSong.artist) {
+                    srcURL = url
+                } else if let url = await deezerService.fetchPreviewURL(title: srcSong.title, artist: srcSong.artist) {
+                    srcURL = url
+                } else {
+                    srcURL = nil
+                }
+                if let url = srcURL,
+                   let audioURL = URL(string: url),
+                   let (data, response) = try? await URLSession.shared.data(from: audioURL),
+                   (response as? HTTPURLResponse)?.statusCode == 200,
+                   var real = await localAudioAnalyzer.analyze(data: data, sourceURL: url, title: srcSong.title, genreHints: rawTags) {
+                    // BPM octave guard: the local analyzer uses a 30-second preview and can land
+                    // at half- or double-tempo. Python librosa analyzes the full track and is
+                    // more reliable in most cases — but half-time feel songs (bolero, danzón,
+                    // slow rumba) have a slow felt groove that Python double-detects as subdivisions.
+                    // When SonicDNA reads ~half Python's BPM and energy is low, trust SonicDNA.
+                    let pythonBPM = sourceFeatures.bpm
+                    var halfTimeFeel = false
+                    if pythonBPM > 0 && real.bpm > 0 {
+                        let directDiff = abs(real.bpm - pythonBPM)
+                        let halfDiff   = abs(real.bpm * 2.0 - pythonBPM)
+                        let dblDiff    = abs(real.bpm / 2.0 - pythonBPM)
+                        if directDiff > 15 && (halfDiff < 20 || dblDiff < 20) {
+                            let sonicIsHalf = halfDiff < 20
+                            if sonicIsHalf && real.bpm < 100 && real.energy < 0.55 {
+                                // Half-time feel: Python locked onto subdivisions of a slow groove.
+                                // SonicDNA's lower BPM is the actual felt tempo — keep it.
+                                halfTimeFeel = true
+                                simiLog("🥁 Stage 2.5 BPM: half-time feel (SonicDNA=\(Int(real.bpm))BPM energy=\(String(format: "%.2f", real.energy))) — trusting SonicDNA over Python \(Int(pythonBPM))BPM")
+                            } else {
+                                simiLog("🥁 Stage 2.5 BPM octave correction: SonicDNA=\(Int(real.bpm)) → keeping Python \(Int(pythonBPM))BPM")
+                                real.bpm = pythonBPM
+                            }
+                        }
+                    }
+                    // Quiet-intro deflation guard: some songs have soft intros; the 30-second
+                    // preview deflates energy/valence vs the full song that Python measured.
+                    // Blend 50/50 so Stage 2.5 stays on the SonicDNA scale (apples-to-apples with
+                    // candidates) while anchoring against intro-only misreadings.
+                    // Skip the blend for half-time feel songs — SonicDNA's low energy is correct.
+                    if !sourceFeatures.isEstimated && !halfTimeFeel {
+                        // Always log the SonicDNA↔Python delta — calibration feedback loop.
+                        let vDelta = real.valence - sourceFeatures.valence
+                        let eDelta = real.energy - sourceFeatures.energy
+                        let arousalDeltaStr: String
+                        if let ra = real.arousal, let sa = sourceFeatures.arousal {
+                            arousalDeltaStr = " | arousal SonicDNA=\(String(format:"%.2f",ra)) Python=\(String(format:"%.2f",sa)) Δ=\(String(format:"%+.2f",ra-sa))"
+                        } else {
+                            arousalDeltaStr = ""
+                        }
+                        simiLog("📐 Stage 2.5 delta: valence SonicDNA=\(String(format:"%.2f",real.valence)) Python=\(String(format:"%.2f",sourceFeatures.valence)) Δ=\(String(format:"%+.2f",vDelta)) | energy SonicDNA=\(String(format:"%.2f",real.energy)) Python=\(String(format:"%.2f",sourceFeatures.energy)) Δ=\(String(format:"%+.2f",eDelta))\(arousalDeltaStr)")
+                        let eDropped = sourceFeatures.energy - real.energy
+                        if eDropped > 0.12 {
+                            let blended = (sourceFeatures.energy + real.energy) / 2.0
+                            simiLog("⚡ Stage 2.5 energy blend: SonicDNA=\(String(format: "%.2f", real.energy)) Python=\(String(format: "%.2f", sourceFeatures.energy)) → \(String(format: "%.2f", blended))")
+                            real.energy = blended
+                        }
+                        let vDropped = sourceFeatures.valence - real.valence
+                        if vDropped > 0.12 {
+                            let blended = (sourceFeatures.valence + real.valence) / 2.0
+                            simiLog("🎭 Stage 2.5 valence blend: SonicDNA=\(String(format: "%.2f", real.valence)) Python=\(String(format: "%.2f", sourceFeatures.valence)) → \(String(format: "%.2f", blended))")
+                            real.valence = blended
+                        }
+                    }
+                    // Genre calibration: Python+SonicDNA measure RMS/spectral amplitude;
+                    // Spotify's energy is perceptual (rhythm, groove, dynamic complexity).
+                    // For funk/disco/soul, the gap is ~40-50%. When the raw tags strongly
+                    // suggest a high-energy genre but measured energy is low, blend toward
+                    // the genre expectation to avoid matching quiet ballads as "Near-perfect".
+                    if !rawTags.isEmpty {
+                        let tagEnergies = rawTags.compactMap { Self.genreEnergyTable[$0.lowercased()] }
+                        let tagValences = rawTags.compactMap { Self.genreValenceTable[$0.lowercased()] }
+                        if !tagEnergies.isEmpty {
+                            let genreMeanEnergy = tagEnergies.reduce(0, +) / Double(tagEnergies.count)
+                            let energyGap = genreMeanEnergy - real.energy
+                            if energyGap > 0.25 {
+                                let calibrated = real.energy * 0.35 + genreMeanEnergy * 0.65
+                                simiLog("📈 Genre energy calibration (\(rawTags.prefix(3).joined(separator: "/"))): \(String(format: "%.2f", real.energy)) → \(String(format: "%.2f", calibrated)) (genre mean \(String(format: "%.2f", genreMeanEnergy)))")
+                                real.energy = calibrated
+                            }
+                        }
+                        if !tagValences.isEmpty {
+                            let genreMeanValence = tagValences.reduce(0, +) / Double(tagValences.count)
+                            let valenceGap = genreMeanValence - real.valence
+                            if valenceGap > 0.20 {
+                                let calibrated = real.valence * 0.35 + genreMeanValence * 0.65
+                                simiLog("📈 Genre valence calibration (\(rawTags.prefix(3).joined(separator: "/"))): \(String(format: "%.2f", real.valence)) → \(String(format: "%.2f", calibrated)) (genre mean \(String(format: "%.2f", genreMeanValence)))")
+                                real.valence = calibrated
+                            }
+                        }
+                    }
+                    // Preserve source key — SonicDNA key detection on quiet-intro previews is
+                    // unreliable (e.g. Ab Major confidently detected as D# Minor via chroma
+                    // centroid confusion). The key from Spotify is reliable; estimated key keeps
+                    // mode scoring neutral. Either is better than SonicDNA's guess here.
+                    real.key           = sourceFeatures.key
+                    real.mode          = sourceFeatures.mode
+                    real.isKeyEstimated = sourceFeatures.isKeyEstimated
+                    simiLog("✅ Source re-analyzed (SonicDNA): \(srcSong.title) — \(Int(real.bpm))BPM e=\(String(format: "%.2f", real.energy)) v=\(String(format: "%.2f", real.valence))")
+                    self.lastSourceFeatures = real
+                    self.sourceSong?.audioFeatures = real
+                    Task { await self.supabase.storeFeatures(title: srcSong.title, artist: srcSong.artist, features: real, source: "sonicdna") }
+                    for i in 0..<recommendations.count {
+                        guard let tf = recommendations[i].audioFeatures else { continue }
+                        let tg = recommendations[i].genre
+                        let (score, reasons) = seedFeatures.count > 1
+                            ? computeSimilarityMultiSeed(seeds: seedFeatures, target: tf, genres: genres, targetGenre: tg)
+                            : computeSimilarity(source: real, target: tf, genres: genres, targetGenre: tg)
+                        recommendations[i].similarityScore = score
+                        recommendations[i].matchReasons    = reasons
+                        recommendations[i].matchExplanation = buildMatchExplanation(
+                            source: real, target: tf, sourceGenres: genres, targetGenre: tg
+                        )
+                    }
+                    recommendations.sort { $0.similarityScore > $1.similarityScore }
+                    simiLog("🎯 Source upgraded estimated → measured, list re-sorted")
+                }
+            }
         } else {
-            simiLog("⚠️ Librosa Stage 2: 0/\(librosaTargets.count) — Railway may be cold or busy")
+            simiLog("⚠️ SonicDNA Stage 2: 0/\(sonicTargets.count) — audio decode failed or search cancelled")
         }
     }
 
@@ -1495,34 +2208,50 @@ class RecommendationEngine: ObservableObject {
     private func fillMissingPreviewURLs() async {
         let snapshot = recommendations
         let needsURL = snapshot.enumerated()
-            .filter { $0.element.previewURL == nil }
-            .map { (index: $0.offset, title: $0.element.title, artist: $0.element.artist) }
+            .filter { $0.element.previewURL == nil || $0.element.albumArt.isEmpty }
+            .map { (index: $0.offset, title: $0.element.title, artist: $0.element.artist,
+                    needsPreview: $0.element.previewURL == nil) }
         guard !needsURL.isEmpty else { return }
 
         simiLog("🎵 Fetching \(needsURL.count) iTunes preview URLs in parallel…")
-        let updates: [(Int, String)] = await withTaskGroup(of: (Int, String?).self) { group in
+        let updates: [(Int, String?, String?)] = await withTaskGroup(of: (Int, String?, String?).self) { group in
             for item in needsURL {
                 group.addTask {
-                    var url = await self.itunesService.fetchPreviewURL(title: item.title, artist: item.artist)
-                    if url == nil {
-                        url = await self.deezerService.fetchPreviewURL(title: item.title, artist: item.artist)
+                    let (itPreview, artwork) = await self.itunesService.fetchPreviewAndArtwork(
+                        title: item.title, artist: item.artist)
+                    var preview: String? = itPreview
+                    if item.needsPreview && preview == nil {
+                        preview = await self.deezerService.fetchPreviewURL(title: item.title, artist: item.artist)
                     }
-                    return (item.index, url)
+                    // LB crosswalk fallback: MBID → Apple Music ID → iTunes /lookup
+                    // More precise than fuzzy search — resolves tracks iTunes search misses.
+                    if item.needsPreview && preview == nil,
+                       let mbid   = await self.listenBrainzService.resolveACRMBID(title: item.title, artist: item.artist),
+                       let amID   = await self.listenBrainzService.resolveAppleMusicID(mbid: mbid),
+                       let lbPreview = await self.itunesService.fetchPreviewByAppleMusicID(amID) {
+                        preview = lbPreview
+                        simiLog("🔗 LB crosswalk resolved preview for \(item.title)")
+                    }
+                    return (item.index, item.needsPreview ? preview : nil, artwork)
                 }
             }
-            var result: [(Int, String)] = []
-            for await (index, url) in group {
-                if let url { result.append((index, url)) }
-            }
+            var result: [(Int, String?, String?)] = []
+            for await tuple in group { result.append(tuple) }
             return result
         }
 
         guard !updates.isEmpty else { return }
-        for (index, url) in updates {
+        var previewCount = 0, artCount = 0
+        for (index, preview, artwork) in updates {
             guard index < recommendations.count else { continue }
-            recommendations[index].previewURL = url
+            if let preview { recommendations[index].previewURL = preview; previewCount += 1 }
+            if let artwork, recommendations[index].albumArt.isEmpty {
+                recommendations[index].albumArt = artwork; artCount += 1
+            }
         }
-        simiLog("🎵 Preview URLs filled: \(updates.count)/\(needsURL.count)")
+        let needsPreviewCount = needsURL.filter { $0.needsPreview }.count
+        simiLog("🎵 Preview URLs filled: \(previewCount)/\(needsPreviewCount)")
+        if artCount > 0 { simiLog("🖼️ Album art filled: \(artCount)") }
     }
 
     // ──────────────────────────────────────────────
@@ -1573,24 +2302,53 @@ class RecommendationEngine: ObservableObject {
             guard seen.insert(song.id).inserted else { continue }
             let features = prefetchedFeatures[song.id]
             let (s, reasons) = score(target: features)
+            let era = eraPenalty(sourceYear: sourceSong.releaseYear, targetYear: song.releaseYear)
             results.append(SimilarSong(
                 id: song.id, title: song.title, artist: song.artist,
                 albumArt: song.albumArt, spotifyURL: song.spotifyURL, previewURL: song.previewURL,
                 genre: genres.first ?? Genre(main: "Unknown"),
-                audioFeatures: features, similarityScore: s, matchReasons: reasons
+                audioFeatures: features, similarityScore: max(0, s - era), matchReasons: reasons
             ))
         }
 
         // ── Source 2: Last.fm similar tracks + emotional tag pool ──
         // Resolve in parallel, then score sequentially to avoid races on `seen`.
-        // Limit raised to 40 to accommodate the tag-expanded pool (was 20).
-        let lastFMSongs: [Song] = await withTaskGroup(of: Song?.self) { group in
-            for (title, artist) in lastFMTracks.prefix(40) {
-                group.addTask { try? await self.spotifyService.searchTrack(title: title, artist: artist) }
+        // Cache-first Spotify resolution:
+        //   1. Check Supabase — popular songs served instantly, zero Spotify calls
+        //   2. On Supabase miss, call Spotify and write result back to cache
+        //   3. On Spotify 429/failure, fall through to stub (iTunes fills art + preview later)
+        // Cap at 25 (was 60) — shared credentials mean shared rate limit across all users.
+        // Stagger: 80ms/track so 25 calls spread over ~2s instead of bursting.
+        let lastFMSongs: [Song] = await withTaskGroup(of: Song.self) { group in
+            for (index, (title, artist)) in lastFMTracks.prefix(25).enumerated() {
+                group.addTask {
+                    // Layer 1: Supabase cache — free, instant, no rate limit
+                    if let cached = await self.supabase.lookupSpotifyTrack(title: title, artist: artist) {
+                        return cached
+                    }
+                    // Layer 2: Spotify live search — staggered to avoid burst
+                    if index > 0 {
+                        try? await Task.sleep(nanoseconds: UInt64(index) * 80_000_000)
+                    }
+                    if let found = try? await self.spotifyService.searchTrack(title: title, artist: artist) {
+                        // Write through to cache so next user gets it for free
+                        await self.supabase.storeSpotifyTrack(found)
+                        return found
+                    }
+                    // Layer 3: Stub — iTunes fills art + preview in enrichWithABFeatures
+                    let stubID = "stub:\(title.lowercased()):\(artist.lowercased())"
+                    return Song(id: stubID, title: title, artist: artist,
+                                albumArt: "", previewURL: nil, spotifyURL: "",
+                                sourceURL: "")
+                }
             }
             var songs: [Song] = []
-            for await song in group { if let song { songs.append(song) } }
+            for await song in group { songs.append(song) }
             return songs
+        }
+        let spotifyHits = lastFMSongs.filter { !$0.id.hasPrefix("stub:") }.count
+        if spotifyHits < lastFMSongs.count {
+            simiLog("⚠️ Spotify search: \(spotifyHits)/\(lastFMSongs.count) resolved — \(lastFMSongs.count - spotifyHits) using stubs (no art/link)")
         }
         // Batch-lookup Supabase feature cache for all resolved Last.fm songs in parallel.
         // Songs analyzed in a previous session get real similarity scores on first render
@@ -1617,16 +2375,85 @@ class RecommendationEngine: ObservableObject {
             guard seen.insert(song.id).inserted else { continue }
             let cachedFeatures = supabasePrefetch[song.id]
             let (s, reasons) = score(target: cachedFeatures)
+            let era = eraPenalty(sourceYear: sourceSong.releaseYear, targetYear: song.releaseYear)
             results.append(SimilarSong(
                 id: song.id, title: song.title, artist: song.artist,
                 albumArt: song.albumArt, spotifyURL: song.spotifyURL, previewURL: song.previewURL,
                 genre: genres.first ?? Genre(main: "Unknown"),
-                audioFeatures: cachedFeatures, similarityScore: s, matchReasons: reasons
+                audioFeatures: cachedFeatures, similarityScore: max(0, s - era), matchReasons: reasons
             ))
         }
 
         results.sort { $0.similarityScore > $1.similarityScore }
         return applyArtistDiversity(results, sourceArtist: sourceSong.artist)
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Genre Gate (pre-enrichment pass)
+    // ──────────────────────────────────────────────
+
+    /// Removes genre-distant candidates BEFORE the enrichment timeout race.
+    /// This is the critical fix: the genre gate used to live inside runPrefetchEnrichment
+    /// which is inside the 10s timeout. When the timeout fired, unfiltered candidates
+    /// (K-pop, distant genres) sailed through. Now the gate runs first, independently,
+    /// with its own 6s timeout. If Last.fm is slow the gate fails open (returns all),
+    /// which is safer than blocking forever.
+    private func applyGenreGate(candidates: [SimilarSong], genres: [Genre]) async -> [SimilarSong] {
+        guard !genres.isEmpty, !candidates.isEmpty else { return candidates }
+
+        return await withTaskGroup(of: [SimilarSong].self) { outer in
+            outer.addTask {
+                let adjacentQuota = GenreQuotaTracker(limit: 10)
+                let decisions: [(Int, Bool)] = await withTaskGroup(of: (Int, Bool).self) { inner in
+                    for (index, song) in candidates.enumerated() {
+                        inner.addTask {
+                            if index > 0 {
+                                try? await Task.sleep(nanoseconds: UInt64(min(index, 15)) * 20_000_000)
+                            }
+                            async let trackTagsTask  = self.lastFMService.fetchRawTags(title: song.title, artist: song.artist)
+                            async let artistTagsTask = self.lastFMService.fetchArtistRawTags(artist: song.artist)
+                            let trackTags  = await trackTagsTask
+                            let artistTags = await artistTagsTask
+                            let trackTagSet = Set(trackTags)
+                            let extraArtist = artistTags.filter { !trackTagSet.contains($0) }.prefix(5)
+                            let tags = trackTags + Array(extraArtist)
+                            guard let targetGenre = await self.genresFromRawTags(tags).first else {
+                                return (index, true) // no tags → let through
+                            }
+                            let penalty = self.genrePenalty(sourceGenres: genres, targetGenre: targetGenre)
+                            if penalty >= 0.18 {
+                                simiLog("🚫 GenreGate: excluded \"\(song.title)\" (\(targetGenre.main), penalty \(String(format: "%.2f", penalty)))")
+                                return (index, false)
+                            }
+                            if penalty > 0 {
+                                let allowed = await adjacentQuota.claim()
+                                if !allowed {
+                                    simiLog("🚫 GenreGate adjacent quota: excluded \"\(song.title)\"")
+                                    return (index, false)
+                                }
+                            }
+                            return (index, true)
+                        }
+                    }
+                    var out: [(Int, Bool)] = []
+                    for await d in inner { out.append(d) }
+                    return out
+                }
+                let allowed = Set(decisions.compactMap { $0.1 ? $0.0 : nil })
+                let result = candidates.enumerated().compactMap { allowed.contains($0.offset) ? $0.element : nil }
+                simiLog("🎯 GenreGate: \(result.count)/\(candidates.count) passed genre check")
+                return result
+            }
+            // Fail open: if Last.fm is unreachable, return all candidates rather than block.
+            outer.addTask {
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                simiLog("⚠️ GenreGate timed out — passing all \(candidates.count) candidates unfiltered")
+                return candidates
+            }
+            let result = await outer.next()!
+            outer.cancelAll()
+            return result
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -1641,11 +2468,13 @@ class RecommendationEngine: ObservableObject {
         sourceFeatures: AudioFeatures,
         genres: [Genre],
         seedFeatures: [AudioFeatures] = [],
-        prewarmedCache: [String: AudioFeatures] = [:]
+        prewarmedCache: [String: AudioFeatures] = [:],
+        sourceArtist: String = ""
     ) async -> [SimilarSong] {
         guard !candidates.isEmpty else { return candidates }
 
-        // Race: enrichment vs. 7s timeout. Returns unenriched candidates on timeout.
+        // Race: enrichment vs. 10s timeout. Returns unenriched candidates on timeout.
+        // 10s gives AcousticBrainz time to respond for pools of 40-50 songs in parallel.
         return await withTaskGroup(of: [SimilarSong].self) { group in
             // Task A: do the actual enrichment
             group.addTask {
@@ -1654,12 +2483,15 @@ class RecommendationEngine: ObservableObject {
                     sourceFeatures: sourceFeatures,
                     genres: genres,
                     seedFeatures: seedFeatures,
-                    prewarmedCache: prewarmedCache
+                    prewarmedCache: prewarmedCache,
+                    sourceArtist: sourceArtist
                 )
             }
-            // Task B: 7-second timeout fallback
+            // Task B: 16-second timeout fallback.
+            // FreqBlog is 8s per call; with stagger (max 300ms) + API latency variance,
+            // 10s was firing before most candidates got FreqBlog data. 16s gives headroom.
             group.addTask {
-                try? await Task.sleep(nanoseconds: 7_000_000_000)
+                try? await Task.sleep(nanoseconds: 16_000_000_000)
                 simiLog("⚠️ prefetchCandidateFeatures timed out — revealing with best-effort features")
                 return candidates
             }
@@ -1675,7 +2507,8 @@ class RecommendationEngine: ObservableObject {
         sourceFeatures: AudioFeatures,
         genres: [Genre],
         seedFeatures: [AudioFeatures],
-        prewarmedCache: [String: AudioFeatures] = [:]
+        prewarmedCache: [String: AudioFeatures] = [:],
+        sourceArtist: String = ""
     ) async -> [SimilarSong] {
         var result = candidates
 
@@ -1698,9 +2531,39 @@ class RecommendationEngine: ObservableObject {
                     if index > 0 {
                         try? await Task.sleep(nanoseconds: UInt64(min(index, 15)) * 20_000_000)
                     }
-                    let tags = await self.lastFMService.fetchRawTags(title: song.title, artist: song.artist)
-                    let estimated = await self.estimateFeaturesFromTags(tags)
-                    return (index, estimated)
+                    // FreqBlog and Last.fm tags run concurrently — FreqBlog gives real
+                    // valence/BPM/key/danceability measured from the actual audio preview.
+                    // Tag estimation fills in energy/acousticness (FreqBlog doesn't measure
+                    // these reliably from 30s clips). The overlay replaces the generic genre
+                    // centroid with track-specific feel data — the core of the sound/feel engine.
+                    async let fbFetch  = self.freqBlogService.fetchFeatures(title: song.title, artist: song.artist)
+                    let tags           = await self.lastFMService.fetchRawTags(title: song.title, artist: song.artist)
+                    var features       = await self.estimateFeaturesFromTags(tags)
+                    if let fb = await fbFetch {
+                        features?.valence        = fb.valence
+                        features?.danceability   = fb.danceability
+                        features?.bpm            = fb.bpm
+                        features?.key            = fb.key
+                        features?.mode           = fb.mode
+                        features?.isKeyEstimated = false
+                        simiLog("🎵 FreqBlog candidate: \(song.title) — v=\(String(format:"%.2f",fb.valence)) d=\(String(format:"%.2f",fb.danceability)) bpm=\(Int(fb.bpm))")
+                    } else {
+                        // No iTunes preview → FreqBlog can't analyze. Try AcousticBrainz
+                        // frozen dump (7.5M tracks keyed by MBID) for real BPM/key/mode/energy.
+                        // Underground mood-artist chain tracks are the primary beneficiaries —
+                        // they're the most likely to lack previews but exist in MusicBrainz.
+                        if let mbid = await self.listenBrainzService.resolveACRMBID(title: song.title, artist: song.artist),
+                           let ab   = await self.acousticBrainzService.fetchFeatures(mbid: mbid) {
+                            features?.bpm          = ab.bpm
+                            features?.key          = ab.key
+                            features?.mode         = ab.mode
+                            features?.energy       = ab.energy
+                            features?.danceability = ab.danceability
+                            features?.isKeyEstimated = false
+                            simiLog("📀 AcousticBrainz candidate: \(song.title) — \(Int(ab.bpm))BPM k:\(ab.key) m:\(ab.mode) e:\(String(format:"%.2f",ab.energy))")
+                        }
+                    }
+                    return (index, features)
                 }
             }
             var updates: [(Int, AudioFeatures?)] = []
@@ -1712,9 +2575,14 @@ class RecommendationEngine: ObservableObject {
 
         for (idx, features) in fetched {
             guard let features, idx < result.count else { continue }
-            let (score, reasons) = seedFeatures.count > 1
+            let (rawScore, reasons) = seedFeatures.count > 1
                 ? computeSimilarityMultiSeed(seeds: seedFeatures, target: features, genres: genres)
                 : computeSimilarity(source: sourceFeatures, target: features, genres: genres)
+            // Tag-estimated features are synthetic (genre → BPM/energy table lookup).
+            // They can produce false-positive similarity when a track is mis-tagged (e.g. K-pop
+            // tagged as "trap" → estimates Kanye-like features → scores 0.88 against Flashing Lights).
+            // Cap estimated scores so they can never beat a song with real measured data.
+            let score = features.isEstimated ? min(rawScore, 0.68) : rawScore
             result[idx].audioFeatures    = features
             result[idx].similarityScore  = score
             result[idx].matchReasons     = reasons
@@ -1726,7 +2594,8 @@ class RecommendationEngine: ObservableObject {
             )
         }
 
-        return result.sorted { $0.similarityScore > $1.similarityScore }
+        let sorted = result.sorted { $0.similarityScore > $1.similarityScore }
+        return applyArtistDiversity(sorted, sourceArtist: sourceArtist)
     }
 
     // ──────────────────────────────────────────────
@@ -1748,7 +2617,9 @@ class RecommendationEngine: ObservableObject {
 
         for song in songs {
             let key   = song.artist.lowercased().trimmingCharacters(in: .whitespaces)
-            let limit = key == sourceKey ? 2 : 3
+            // Source artist gets 3 slots — their own catalog IS the closest match.
+            // Every other artist gets 1 slot to keep the list varied.
+            let limit = (!sourceKey.isEmpty && key == sourceKey) ? 3 : 1
             let count = artistCount[key, default: 0]
             if count < limit {
                 artistCount[key] = count + 1
@@ -1791,8 +2662,10 @@ class RecommendationEngine: ObservableObject {
         // "Classic Rock" first even for blues artists, so scan the whole list.
         if any({ $0.contains("blues") }) { return .blues }
         if any({ $0.contains("metal") || $0.contains("thrash") || $0.contains("metalcore") || $0.contains("deathcore") || $0.contains("doom") }) { return .metal }
-        if any({ $0.contains("hard rock") || $0.contains("punk") || $0.contains("grunge") || $0.contains("rock") || $0.contains("hardcore") || $0.contains("shoegaze") || $0.contains("post-rock") }) { return .rock }
+        // Hip-hop checked before rock: "rap rock", "punk rap", "hardcore rap" are primarily
+        // hip-hop and should not penalize other rap/trap songs as genre-crosses.
         if any({ $0.contains("hip") || $0.contains("rap") || $0.contains("trap") || $0.contains("drill") || $0.contains("grime") || $0.contains("phonk") }) { return .hiphop }
+        if any({ $0.contains("hard rock") || $0.contains("punk") || $0.contains("grunge") || $0.contains("rock") || $0.contains("hardcore") || $0.contains("shoegaze") || $0.contains("post-rock") }) { return .rock }
         if any({ $0.contains("r&b") || $0.contains("rnb") || $0.contains("soul") || $0.contains("funk") || $0.contains("gospel") || $0.contains("slow jam") || $0.contains("neo-soul") }) { return .rnb }
         if any({ $0.contains("jazz") }) { return .jazz }
         if any({ $0.contains("classical") || $0.contains("orchestral") }) { return .classical }
@@ -1810,9 +2683,9 @@ class RecommendationEngine: ObservableObject {
     // People don't want the same BPM — they want the same feeling.
     //
     // Weights (sum = 1.00):
-    //   valence        0.30 — emotional color; prefers valenceEssentia (DEAM) over Spotify proxy
-    //   arousal        0.10 — calm/relaxed vs energetic/excited (new DEAM axis, distinct from energy)
-    //   danceability   0.20 — groove/rhythm feel (slow jam vs. dance track within the same mood)
+    //   valence        0.28 — emotional color; prefers valenceEssentia (DEAM) over Spotify proxy
+    //   arousal        0.15 — calm/relaxed vs. excited/tense (DEAM y-axis; maps to circumplex quadrant)
+    //   danceability   0.17 — groove/rhythm feel (slow jam vs. dance track within the same mood)
     //   energy         0.15 — intensity of the feeling (mellow bedroom vs. mosh pit)
     //   mode           0.09 — major/minor emotional signature; neutral when key is estimated
     //   mfccCosine     0.08 — timbral texture similarity via MFCC cosine (when available)
@@ -1835,10 +2708,98 @@ class RecommendationEngine: ObservableObject {
     // Danceability still carries weight because it separates slow jams from club tracks even
     // when both have warm valence — the critical failure mode within warm-valence genres like R&B.
     // BPM tolerance widened to ±60 so songs at very different tempos can match on emotional feel.
+
+    // Counts adjacent-genre candidates as they claim slots in the enrichment pool.
+    // Swift actor makes the counter safe across the concurrent task group without locks.
+    private actor GenreQuotaTracker {
+        private var adjacentCount = 0
+        private let limit: Int
+        init(limit: Int) { self.limit = limit }
+        /// Attempts to claim one adjacent-genre slot. Returns true (allow) or false (quota full).
+        func claim() -> Bool {
+            guard adjacentCount < limit else { return false }
+            adjacentCount += 1
+            return true
+        }
+    }
+
+    // Maps a genre name to a broad family bucket used for cross-genre penalty.
+    nonisolated private func genreFamily(_ genreName: String) -> String {
+        let g = genreName.lowercased()
+        // Hybrid genres — must be checked before the hip-hop and rock sweeps.
+        if g.contains("rap rock") || g.contains("raprock") || g.contains("punk rap") { return "raprock" }
+        // Pop sub-genres that share "rock" or "punk" vocabulary but live in the pop world, not the rock world.
+        // "pop punk" = Olivia Rodrigo, Paramore; "pop rock" = Bruno Mars, Maroon 5 — pop-adjacent, not rock-adjacent.
+        if g == "pop punk" || g.contains("pop punk") || g == "pop rock" || g.contains("pop rock") || g == "power pop" { return "pop" }
+        // "trap pop" / "pop trap" = Ariana Grande "7 rings" style — trap production under pop vocals.
+        // Must be caught before the bare "trap" sweep or it resolves as hiphop.
+        if g.contains("trap pop") || g.contains("pop trap") || g.contains("electropop") || g.contains("synth pop") { return "pop" }
+        if g.contains("hip") || g.contains("hop") || g.contains("rap") || g.contains("trap") || g.contains("drill") || g.contains("grime") { return "hiphop" }
+        if g.contains("r&b") || g.contains("rnb") || g.contains("soul") || g.contains("funk") || g.contains("slow jam") { return "rnb" }
+        // Latin must be checked before "alternative" — "Latin Alternative" (iLe, Natalia Lafourcade) is
+        // a Latin subgenre that contains the word "alternative"; catching it after the rock sweep would
+        // misclassify the source as "rock" and hard-exclude all Latin candidates via GenreGate.
+        if g.contains("latin") || g.contains("reggaeton") || g.contains("salsa") || g.contains("cumbia") || g.contains("bossa nova") || g.contains("samba") || g.contains("merengue") || g.contains("bachata") { return "latin" }
+        if g.contains("rock") || g.contains("indie") || g.contains("alternative") || g.contains("punk") || g.contains("grunge") || g.contains("shoegaze") || g.contains("emo") { return "rock" }
+        if g.contains("metal") || g.contains("hardcore") || g.contains("screamo") { return "metal" }
+        if g.contains("electronic") || g.contains("edm") || g.contains("house") || g.contains("techno") || g.contains("ambient") || g.contains("dubstep") || g.contains("trance") { return "electronic" }
+        if g.contains("jazz") || g.contains("blues") { return "jazz" }
+        if g.contains("classical") || g.contains("orchestral") || g.contains("opera") { return "classical" }
+        if g.contains("country") || g.contains("folk") || g.contains("bluegrass") || g.contains("americana") { return "country" }
+        if g.contains("pop") { return "pop" }
+        return "other"
+    }
+
+    // Cross-genre penalty: 0 for same/adjacent families, 0.18 for distant ones.
+    // Applied after all feature scoring so it can push an audio-similar cross-genre
+    // candidate below a slightly-lower-scoring same-genre candidate.
+    nonisolated private func genrePenalty(sourceGenres: [Genre], targetGenre: Genre) -> Double {
+        let targetFamily = genreFamily(targetGenre.main)
+        guard targetFamily != "other" && targetFamily != "unknown" else { return 0 }
+        let sourceFamilies = Set(sourceGenres.map { genreFamily($0.main) })
+        guard !sourceFamilies.contains("other") else { return 0 }
+        if sourceFamilies.contains(targetFamily) { return 0 }
+        // raprock is a hip-hop/rock hybrid. It's adjacent to both parent families (0.12),
+        // but hard-excluded from pop and R&B (0.20 ≥ 0.18 threshold → pool pre-filter removes them).
+        // This is the fix for Olivia Rodrigo-style pop-punk songs scoring high on rap-rock source songs:
+        // "get him back!" (pop-punk → pop family) gets 0.20 → hard excluded before scoring.
+        if sourceFamilies.contains("raprock") || targetFamily == "raprock" {
+            let other = sourceFamilies.contains("raprock") ? targetFamily : sourceFamilies.first ?? "other"
+            switch other {
+            case "hiphop", "rock", "metal": return 0.12
+            case "pop", "rnb":              return 0.20  // hard-excluded (≥ 0.18 threshold)
+            default:                         return 0.18
+            }
+        }
+        // Pairs that are culturally/sonically adjacent — small friction only.
+        // hiphop↔pop removed: pure pop (Nelly Furtado, Taylor Swift) is not adjacent to hip-hop.
+        // Pop rap is a hip-hop subgenre and resolves to "hiphop" family already, so no penalty is applied.
+        // hiphop↔rnb: requires penalty > 0.21 to filter Doja Cat / SZA songs that
+        // score ~86% raw acoustic similarity to Drake (shared BPM, energy, danceability).
+        // 0.22 ensures cross-genre R&B is cut at Stage 1 (64% < 0.65 threshold).
+        // Trade-off: Drake R&B tracks (Shut It Down, ~80% raw → 58%) also filter,
+        // but the top-of-list experience is fully hip-hop, which is what we want.
+        if sourceFamilies.contains("hiphop") && targetFamily == "rnb" { return 0.22 }
+        if sourceFamilies.contains("rnb") && targetFamily == "hiphop" { return 0.22 }
+        let adjacent: Set<Set<String>> = [
+            ["rnb", "pop"],
+            ["pop", "electronic"], ["rock", "metal"], ["rock", "pop"],
+            ["country", "folk"],
+            // Latin crosses many families — Latin pop, Latin R&B, bossa nova (jazz), cumbia (folk).
+            // Adjacent (not same) so it's a soft preference, not a free pass.
+            ["latin", "pop"], ["latin", "rnb"], ["latin", "folk"], ["latin", "jazz"],
+        ]
+        for family in sourceFamilies {
+            if adjacent.contains([family, targetFamily]) { return 0.12 }
+        }
+        return 0.18  // distant families: indie rock ≠ trap, classical ≠ hip-hop, etc.
+    }
+
     private func computeSimilarity(
         source: AudioFeatures,
         target: AudioFeatures?,
-        genres: [Genre]
+        genres: [Genre],
+        targetGenre: Genre? = nil
     ) -> (Double, [MatchReason]) {
         guard let target = target else {
             return (0.5, [.genre])
@@ -1872,42 +2833,89 @@ class RecommendationEngine: ObservableObject {
             } else {
                 reasons.append(.energy)
             }
-            // Mood label — only use directional labels for clearly skewed valence.
-            // Mid-range R&B/hip-hop estimates sit around 0.50–0.68; labelling that
-            // range "Dark Mood" is wrong for upbeat songs. Use a neutral label instead.
+            // Mood label — use circumplex quadrant when source has DEAM arousal,
+            // otherwise fall back to valence-only directional labels.
             let srcValenceForLabel = source.valenceEssentia ?? source.valence
-            if srcValenceForLabel < 0.42 {
-                reasons.append(.darkMood)       // Genuinely dark: metal, emo, sad rap
-            } else if srcValenceForLabel > 0.72 && source.energy > 0.50 {
-                reasons.append(.upbeatMood)     // Genuinely bright AND energetic: pop, dance, k-pop
+            if let srcArousal = source.arousal {
+                // Russell's circumplex: valence (x) × arousal (y) → 4 emotionally specific labels
+                if srcValenceForLabel >= 0.55 && srcArousal >= 0.55 {
+                    reasons.append(.euphoric)
+                } else if srcValenceForLabel >= 0.55 && srcArousal < 0.45 {
+                    reasons.append(.serene)
+                } else if srcValenceForLabel < 0.45 && srcArousal >= 0.55 {
+                    reasons.append(.tense)
+                } else if srcValenceForLabel < 0.45 && srcArousal < 0.45 {
+                    reasons.append(.melancholic)
+                } else {
+                    reasons.append(.mood)       // Mid-quadrant — not clearly assignable
+                }
             } else {
-                reasons.append(.mood)           // Warm, mellow, or mid-range: "Same Mood"
+                // No DEAM arousal — fall back to valence-only labels.
+                // Mid-range R&B/hip-hop estimates sit around 0.50–0.68; labelling that
+                // range "Dark Mood" is wrong for upbeat songs. Use a neutral label instead.
+                if srcValenceForLabel < 0.42 {
+                    reasons.append(.darkMood)   // Genuinely dark: metal, emo, sad rap
+                } else if srcValenceForLabel > 0.72 && source.energy > 0.50 {
+                    reasons.append(.upbeatMood) // Genuinely bright AND energetic: pop, dance, k-pop
+                } else {
+                    reasons.append(.mood)       // Warm, mellow, or mid-range: "Same Mood"
+                }
             }
         }
 
         // Valence — the emotional color (happy / dark / bittersweet).
-        // Prefer DEAM-regressed valence (human-annotated) over Spotify proxy when available.
-        let srcValence = source.valenceEssentia ?? source.valence
-        let tgtValence = target.valenceEssentia ?? target.valence
+        // Use DEAM only when BOTH songs have it. Mixing DEAM source (e.g. Python-analyzed)
+        // with SonicDNA-proxy target collapses all candidates to an equal valence distance,
+        // killing discrimination and elevating wrong matches like "family ties ≈ Peso".
+        let srcValence: Double
+        let tgtValence: Double
+        let hasDeamValence: Bool
+        if let sv = source.valenceEssentia, let tv = target.valenceEssentia {
+            (srcValence, tgtValence) = (sv, tv)
+            hasDeamValence = true
+        } else {
+            (srcValence, tgtValence) = (source.valence, target.valence)
+            hasDeamValence = false
+        }
         let valenceDiff = abs(srcValence - tgtValence)
         let valenceScore = 1.0 - valenceDiff
-        totalScore += valenceScore * 0.30
+        // Without DEAM valenceEssentia, audio-only proxy is structurally weaker.
+        // Reduce weight by 0.10 and redistribute to danceability (see danceWeight below).
+        let valenceWeight = hasDeamValence ? 0.28 : 0.18
+        totalScore += valenceScore * valenceWeight
         // Tighter threshold when source is measured but target is tag-estimated:
         // soul-genre centroids cluster close enough that a 0.15 gate produces false "Same Mood"
         // labels between emotionally opposite songs (e.g. Tar Baby vs Respect).
         let moodThreshold = (!source.isEstimated && target.isEstimated) ? 0.10 : 0.15
         if !bothEstimated && valenceDiff < moodThreshold {
-            // Emotionally specific: name the actual mood shared, not just "Same Mood"
             let avgValence = (srcValence + tgtValence) / 2
             let avgEnergy  = (source.energy + target.energy) / 2
-            if avgValence < 0.40 {
-                reasons.append(.darkMood)      // Both dark/heavy — defiant, bleak, raw
-            } else if avgValence > 0.72 && avgEnergy > 0.50 {
-                // "Upbeat" requires both brightness AND energy — bedroom R&B can be
-                // emotionally positive but sonically laid-back; that's "Same Mood", not "Upbeat".
-                reasons.append(.upbeatMood)    // Both bright AND energetic
+            // Prefer circumplex quadrant labels when both songs have DEAM arousal.
+            // Falls back to valence-only labels when arousal is unavailable.
+            if let srcArousal = source.arousal, let tgtArousal = target.arousal {
+                let avgArousal = (srcArousal + tgtArousal) / 2
+                if avgValence >= 0.55 && avgArousal >= 0.55 {
+                    reasons.append(.euphoric)      // happy + activated
+                } else if avgValence >= 0.55 && avgArousal < 0.45 {
+                    reasons.append(.serene)        // happy + calm
+                } else if avgValence < 0.45 && avgArousal >= 0.55 {
+                    reasons.append(.tense)         // dark + activated
+                } else if avgValence < 0.45 && avgArousal < 0.45 {
+                    reasons.append(.melancholic)   // dark + calm
+                } else {
+                    reasons.append(.mood)          // mid-quadrant
+                }
             } else {
-                reasons.append(.mood)          // Warm, mellow, or mid-range emotional match
+                // Valence-only fallback — no DEAM arousal available.
+                if avgValence < 0.40 {
+                    reasons.append(.darkMood)      // Both dark/heavy — defiant, bleak, raw
+                } else if avgValence > 0.72 && avgEnergy > 0.50 {
+                    // "Upbeat" requires both brightness AND energy — bedroom R&B can be
+                    // emotionally positive but sonically laid-back; that's "Same Mood", not "Upbeat".
+                    reasons.append(.upbeatMood)    // Both bright AND energetic
+                } else {
+                    reasons.append(.mood)          // Warm, mellow, or mid-range emotional match
+                }
             }
         }
 
@@ -1916,7 +2924,7 @@ class RecommendationEngine: ObservableObject {
         // Only applied when both songs have Essentia arousal; falls through silently otherwise.
         if let srcArousal = source.arousal, let tgtArousal = target.arousal {
             let arousalDiff = abs(srcArousal - tgtArousal)
-            totalScore += (1.0 - arousalDiff) * 0.10
+            totalScore += (1.0 - arousalDiff) * 0.15
         }
 
         // Energy — the intensity of the feeling (mosh-pit vs. bedroom).
@@ -1953,7 +2961,10 @@ class RecommendationEngine: ObservableObject {
         // Discriminates within warm-valence genres (R&B, soul) where valence alone can't
         // separate a slow jam from a club banger. Weight reduced for restrained sources
         // since energy already carries the primary discrimination signal there.
-        let danceWeight = source.energy < 0.45 ? 0.10 : 0.20
+        // Absorb the 0.10 freed from valence when DEAM is absent — danceability
+        // is a reliable audio-only signal (beat regularity + BPM fit + energy).
+        let danceBaseWeight = source.energy < 0.45 ? 0.07 : 0.17
+        let danceWeight = hasDeamValence ? danceBaseWeight : danceBaseWeight + 0.10
         let danceDiff = abs(source.danceability - target.danceability)
         let danceScore = 1.0 - danceDiff
         totalScore += danceScore * danceWeight
@@ -1977,27 +2988,42 @@ class RecommendationEngine: ObservableObject {
         // the source is an outlier even within its genre — penalising every normal-energy track
         // produces false negatives. Sources in the 0.30–0.45 restrained zone (Tar Baby, After Dark)
         // should still penalise overtly energetic candidates.
+        // Threshold raised from 0.14 → 0.20: disco centroid (0.78) was getting penalized vs sources
+        // at 0.61 (gap 0.17 < 0.20), causing soul/motown to outscore disco for Don't Stop.
+        // Magnolia (0.86) vs Peso (0.59) still gets gap=0.27 → 0.14 penalty (slightly softer than before).
         if source.energy >= 0.30 {
             let energyGap = target.energy - source.energy
-            if energyGap > 0.14 {
-                let gapPenalty = min(0.10, (energyGap - 0.14) * 2.0)
+            if energyGap > 0.20 {
+                let gapPenalty = min(0.16, (energyGap - 0.20) * 2.0)
                 totalScore = max(0, totalScore - gapPenalty)
             }
         }
 
-        // BPM — disabled: arousal + danceability already capture tempo feel. Keeping the
-        // reason tag so "Same Tempo" still surfaces in the UI when BPM is very close.
-        let bpmDiff = abs(source.bpm - target.bpm)
-        if bpmDiff <= 15 { reasons.append(.bpm) }
+        // BPM reason tag — "Same Tempo" badge when BPM is very close (direct or octave match).
+        // The mismatch penalty lives below, applied post-normalization.
+        let bpmDirectDiff = abs(source.bpm - target.bpm)
+        let bpmOctaveDiff = source.bpm > 0 && target.bpm > 0
+            ? min(abs(source.bpm - target.bpm * 2.0), abs(source.bpm - target.bpm / 2.0))
+            : Double.infinity
+        if bpmDirectDiff <= 15 || bpmOctaveDiff <= 8 { reasons.append(.bpm) }
 
         // MFCC cosine similarity — timbral texture (warmth, breathiness, roughness, instrument blend).
         // Captures acoustic "feel" that valence/energy don't express.
-        // Only applied when both songs have MFCC data from Railway backend.
+        // Only applied when both songs have MFCC data from HF backend.
         if let srcMFCC = source.mfccMean, let tgtMFCC = target.mfccMean,
            srcMFCC.count == tgtMFCC.count, !srcMFCC.isEmpty {
             let cosine = mfccCosineSimilarity(srcMFCC, tgtMFCC)  // [-1, 1]
             let mfccScore = (cosine + 1.0) / 2.0                 // → [0, 1]
             totalScore += mfccScore * 0.08
+        }
+
+        // MFCC std cosine — timbral consistency (uniform vs. dynamic texture).
+        // Dense 808 trap loops: low std per-bin. Live drums + room: high std.
+        // Separates "same timbre family" songs that differ in texture variability.
+        if let srcStd = source.mfccStd, let tgtStd = target.mfccStd,
+           srcStd.count == tgtStd.count, !srcStd.isEmpty {
+            let cosine = mfccCosineSimilarity(srcStd, tgtStd)
+            totalScore += ((cosine + 1.0) / 2.0) * 0.04
         }
 
         // Chroma entropy — tonal complexity / harmonic tension.
@@ -2015,6 +3041,20 @@ class RecommendationEngine: ObservableObject {
         totalScore += acousticScore * 0.05
         if abs(source.acousticness - target.acousticness) < 0.2 { reasons.append(.acoustics) }
 
+        // Instrumentalness — vocal vs. instrumental separation.
+        // Only scored when both songs have SonicDNA-measured features; tag-estimated songs
+        // carry a neutral 0.5 which would produce false high scores against any measured value.
+        let estimatedPair = source.isEstimated || target.isEstimated
+        if !estimatedPair {
+            let instrScore = 1.0 - abs(source.instrumentalness - target.instrumentalness)
+            totalScore += instrScore * 0.05
+
+            // Liveness — studio vs. live recording. Only meaningful when both are measured;
+            // tag-estimated songs all carry 0.1 default and would produce false perfect scores.
+            let livenessScore = 1.0 - abs(source.liveness - target.liveness)
+            totalScore += livenessScore * 0.04
+        }
+
         // Mode — major/minor emotional signature. Major keys tend to feel brighter and more
         // resolved; minor keys darker and more tense. Only applied when both songs have
         // real key measurements (librosa or Spotify). Neutral 0.5 when mode is estimated.
@@ -2025,6 +3065,27 @@ class RecommendationEngine: ObservableObject {
             modeScore = 0.5
         }
         totalScore += modeScore * 0.09
+
+        // Key harmony — circle-of-fifths compatibility. Keys adjacent on the circle share
+        // the most harmonic content (e.g. C↔G, Am↔Dm). Only when both keys are measured.
+        // CoF position map: C=0,G=1,D=2,A=3,E=4,B=5,F#=6,Db=7,Ab=8,Eb=9,Bb=10,F=11
+        if !source.isKeyEstimated && !target.isKeyEstimated {
+            let cofPositions = [0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5]
+            let pos1 = cofPositions[source.key % 12]
+            let pos2 = cofPositions[target.key % 12]
+            let rawDist = abs(pos1 - pos2)
+            let cofDist = min(rawDist, 12 - rawDist)  // 0–6
+            let keyHarmonyScore: Double
+            switch cofDist {
+            case 0: keyHarmonyScore = 1.00
+            case 1: keyHarmonyScore = 0.85  // dominant / subdominant — extremely compatible
+            case 2: keyHarmonyScore = 0.65  // two steps — compatible
+            case 3: keyHarmonyScore = 0.40  // distant
+            case 4: keyHarmonyScore = 0.20  // very distant
+            default: keyHarmonyScore = 0.00 // tritone — maximally dissonant
+            }
+            totalScore += keyHarmonyScore * 0.06
+        }
 
         // Spectral warmth — disabled pending sub-bass RMS fix. Stored, contributes nothing.
         totalScore += (1.0 - abs(source.spectralWarmth - target.spectralWarmth)) * 0.00
@@ -2040,16 +3101,72 @@ class RecommendationEngine: ObservableObject {
         // Calibration: HF noise floor in trap gives falsely high spectral flatness.
         totalScore += (1.0 - abs(source.reverbSpace - target.reverbSpace)) * 0.00
 
-        // Normalize by used weight. When MFCC, arousal, or chroma entropy are
-        // unavailable (0.20 combined), raw scores are capped at ~0.80 even for a
+        // Normalize by used weight. When arousal, MFCC, and chroma entropy are
+        // all unavailable (0.25 combined), raw scores are capped at ~0.75 even for a
         // perfect match. Dividing by the weight actually earned restores the full
         // 0–1 scale so songs that feel similar score like it.
-        let missedWeight = (source.arousal == nil || target.arousal == nil ? 0.10 : 0.0)
-                         + (source.mfccMean == nil || target.mfccMean == nil ? 0.08 : 0.0)
+        let missedWeight = (source.arousal == nil || target.arousal == nil           ? 0.15 : 0.0)
+                         + (source.mfccMean == nil || target.mfccMean == nil       ? 0.08 : 0.0)
+                         + (source.mfccStd  == nil || target.mfccStd  == nil       ? 0.04 : 0.0)
                          + (source.chromaEntropy == nil || target.chromaEntropy == nil ? 0.02 : 0.0)
+                         + (estimatedPair                                          ? 0.09 : 0.0) // instrumentalness 0.05 + liveness 0.04
+                         + (source.isKeyEstimated || target.isKeyEstimated         ? 0.06 : 0.0) // key harmony (CoF)
         let usedWeight = 1.0 - missedWeight
         if usedWeight > 0 && usedWeight < 1.0 {
             totalScore = min(1.0, totalScore / usedWeight)
+        }
+
+        // Genre family penalty — fires when we know the target's actual genre and it
+        // belongs to a different sonic family from the source (e.g. indie rock vs trap).
+        // Applied after feature scoring so it overrides audio similarities that are
+        // coincidental rather than stylistic.
+        if let tg = targetGenre, !genres.isEmpty {
+            let penalty = genrePenalty(sourceGenres: genres, targetGenre: tg)
+            if penalty > 0 {
+                simiLog("🚫 Genre penalty \(String(format: "%.2f", penalty)): \(genres.first?.main ?? "?") → \(tg.main)")
+                totalScore = max(0, totalScore - penalty)
+            }
+        }
+
+        // BPM mismatch penalty — applied post-normalization so it isn't absorbed by the
+        // 1.0 cap on already-high raw scores. The arousal proxy compresses all hip-hop into
+        // 0.38–0.62 regardless of actual BPM, causing 69 BPM Afrobeats to score as
+        // "Near-perfect" for 142 BPM cloud rap. Octave matches still incur +50 friction
+        // because a perceptual half-time groove is a meaningful sonic difference.
+        // Gated on !target.isEstimated: tag-estimated BPMs are genre centroids, not real
+        // measurements — penalising a disco song at centroid 88 BPM vs 117 BPM source
+        // would filter it out based on a made-up number. SonicDNA-measured BPMs only.
+        if source.bpm > 0 && target.bpm > 0 && !target.isEstimated {
+            let directDiff = abs(source.bpm - target.bpm)
+            let octaveDiff = min(abs(source.bpm - target.bpm * 2.0),
+                                 abs(source.bpm - target.bpm / 2.0))
+            let effectiveDiff: Double
+            if directDiff <= 25 {
+                effectiveDiff = directDiff
+            } else if octaveDiff <= 20 {
+                effectiveDiff = octaveDiff + 50
+            } else {
+                effectiveDiff = min(directDiff, octaveDiff + 50)
+            }
+            if effectiveDiff > 25 {
+                let bpmPenalty = min(0.22, (effectiveDiff - 25) / 250.0)
+                simiLog("🥁 BPM penalty \(String(format: "%.3f", bpmPenalty)): \(Int(source.bpm))→\(Int(target.bpm)) BPM (eff diff \(Int(effectiveDiff)))")
+                totalScore = max(0, totalScore - bpmPenalty)
+            }
+        }
+
+        // Valence mismatch penalty for measured pairs — applied post-normalization.
+        // The 0.28 linear weight isn't enough when BPM/energy/danceability align but
+        // mood quadrants diverge (bright G Major cloud rap vs. dark D# Minor trap scores
+        // near-perfect purely on tempo/groove match). Estimated pairs share genre centroids
+        // so their valence already clusters within ±0.10 — no penalty needed there.
+        if !source.isEstimated && !target.isEstimated {
+            let vgap = abs(srcValence - tgtValence)
+            if vgap > 0.12 {
+                let valencePenalty = min(0.12, (vgap - 0.12) * 2.0)
+                simiLog("🎭 Valence gap penalty \(String(format: "%.3f", valencePenalty)): src=\(String(format: "%.2f", srcValence)) tgt=\(String(format: "%.2f", tgtValence))")
+                totalScore = max(0, totalScore - valencePenalty)
+            }
         }
 
         // Confidence adjustment: tag-estimated features cluster near genre centroids,
@@ -2063,7 +3180,11 @@ class RecommendationEngine: ObservableObject {
         switch (source.isEstimated, target.isEstimated) {
         case (true, true):   adjustedScore = 0.65 + (totalScore - 0.65) * 0.50
         case (true, false):  adjustedScore = 0.65 + (totalScore - 0.65) * 0.75
-        case (false, true):  adjustedScore = totalScore   // real source vs centroid — trust the score
+        // Real source vs tag-estimated target: weight normalization inflates centroid
+        // scores (arousal/MFCC/chromaEntropy always nil → usedWeight 0.80 → totalScore/0.80).
+        // Compress 45% toward 0.65 so Stage 1 ranks these conservatively until Stage 2
+        // can measure real features and replace these estimates.
+        case (false, true):  adjustedScore = 0.65 + (totalScore - 0.65) * 0.55
         case (false, false): adjustedScore = totalScore
         }
 
@@ -2073,6 +3194,15 @@ class RecommendationEngine: ObservableObject {
             reasons.insert(.genre, at: 0)
         }
         return (adjustedScore, Array(reasons.prefix(3)))
+    }
+
+    /// Soft era penalty for temporal mismatch. No penalty within 12 years; scales to 0.08 max.
+    /// Keeps results temporally coherent without hard-filtering cross-era discoveries.
+    private func eraPenalty(sourceYear: Int?, targetYear: Int?) -> Double {
+        guard let src = sourceYear, let tgt = targetYear, src > 1950, tgt > 1950 else { return 0 }
+        let gap = abs(src - tgt)
+        guard gap > 12 else { return 0 }
+        return min(0.08, Double(gap - 12) / 150.0)
     }
 
     /// Cosine similarity between two MFCC mean vectors. Returns [-1, 1].
@@ -2096,18 +3226,19 @@ class RecommendationEngine: ObservableObject {
     private func computeSimilarityMultiSeed(
         seeds: [AudioFeatures],
         target: AudioFeatures?,
-        genres: [Genre]
+        genres: [Genre],
+        targetGenre: Genre? = nil
     ) -> (Double, [MatchReason]) {
         guard !seeds.isEmpty else { return (0.5, [.genre]) }
         guard seeds.count > 1 else {
-            return computeSimilarity(source: seeds[0], target: target, genres: genres)
+            return computeSimilarity(source: seeds[0], target: target, genres: genres, targetGenre: targetGenre)
         }
 
         var totalScore = 0.0
         var reasonFrequency: [MatchReason: Int] = [:]
 
         for seed in seeds {
-            let (score, reasons) = computeSimilarity(source: seed, target: target, genres: genres)
+            let (score, reasons) = computeSimilarity(source: seed, target: target, genres: genres, targetGenre: targetGenre)
             totalScore += score
             for reason in reasons {
                 reasonFrequency[reason, default: 0] += 1
@@ -2145,8 +3276,57 @@ class RecommendationEngine: ObservableObject {
     /// Only runs when features are real (isEstimated=false) — tag-estimated features
     /// default to energy 0.7/valence 0.48 for trap, which would always return "trap"
     /// candidates and defeat the purpose.
-    private func deriveAudioQueryTags(from features: AudioFeatures, genreTags: [Genre] = []) -> [String] {
+    private func deriveAudioQueryTags(from features: AudioFeatures, genreTags: [Genre] = [], rawTags: [String] = [], spotifyGenres: [String] = []) -> [String] {
         guard !features.isEstimated else { return [] }
+
+        // Broad-umbrella set used in two places below:
+        // (A) as a filter to identify specific Spotify genre labels
+        // (B) as the guard deciding whether audio-feature routing should fire at all.
+        //
+        // These are top-level genre umbrellas that carry no subgenre information on their
+        // own — every Spotify artist tagged "hip-hop" also gets more specific labels like
+        // "new orleans rap" or "conscious hip hop". The umbrella terms alone are noise.
+        let broadUmbrella: Set<String> = [
+            // Root-level genre umbrellas
+            "hip-hop", "hip hop", "rap", "pop", "rock", "alternative", "indie",
+            "electronic", "edm", "r&b", "rnb", "soul", "metal", "punk", "jazz",
+            "blues", "classical", "country", "folk", "acoustic", "funk", "gospel",
+            "reggae", "reggaeton", "latin", "k-pop", "dancehall", "afrobeats", "afropop",
+            "house", "techno", "trance", "ambient",
+            // Era descriptors
+            "80s", "90s", "2000s", "2010s", "70s", "60s", "50s",
+            // Meta/descriptor tags
+            "seen live", "favorites", "love", "female vocalist", "male vocalist",
+            "british", "american",
+        ]
+
+        // ── Path A: Spotify artist genres (preferred) ──────────────────────────────
+        //
+        // Spotify's "Every Noise at Once" taxonomy covers thousands of micro-genre
+        // labels ("new orleans rap", "vapor trap", "chamber pop", "dark clubbing")
+        // maintained by genre experts at scale. These are far more reliable than
+        // inferring subgenre from audio features alone.
+        //
+        // When Spotify returns specific labels, skip audio-feature routing entirely
+        // and use the Spotify labels directly as Last.fm search anchors. They map
+        // well to Last.fm tags for mainstream micro-genres and return zero results
+        // for hyper-niche labels — both are better than wrong-subgenre injection.
+        let spotifySpecific = spotifyGenres.filter { !broadUmbrella.contains($0.lowercased()) }
+        if !spotifySpecific.isEmpty {
+            return Array(spotifySpecific.prefix(2))
+        }
+
+        // ── Path B: audio-feature routing, guarded by subgenre context ─────────────
+        //
+        // Only fires when Spotify has no specific genres AND Last.fm tags contain at
+        // least one non-umbrella term. Without any subgenre anchor, audio features
+        // alone mis-route songs: a soul-sampled boom-bap track reads high valence and
+        // pulls "melodic rap"; an ambient record reads low energy and pulls dark jazz.
+        // The social graph handles these better — return [] and let it.
+        guard !rawTags.isEmpty,
+              rawTags.contains(where: { !broadUmbrella.contains($0.lowercased()) }) else {
+            return []
+        }
 
         // Use VALENCE as the primary axis — it's derived from spectral brightness which
         // correctly captures dark/warm vs bright/intense emotional quality.
@@ -2207,7 +3387,37 @@ class RecommendationEngine: ObservableObject {
                 if features.danceability > 0.65 { return ["feel good", "groove"] }
                 return ["feel good"]
             }
-            return ["upbeat", "energetic"]                        // genuinely bright AND energetic: pop, dance
+            // Hip-hop genre routing: route by subgenre feel rather than bare "upbeat"/"energetic",
+            // which produce cross-genre noise on Last.fm. This injects melodic-rap / pop-rap
+            // candidates (Aston Martin Music, Devil In A New Dress) that the social graph misses.
+            // Subgenre context is guaranteed here — the broadUmbrella guard at the top of this
+            // function already returned [] for songs with only generic hip-hop/rap tags.
+            let genreMain = genreTags.first?.main.lowercased() ?? ""
+            let isHipHop = genreMain.contains("hip") || genreMain.contains("hop") ||
+                           genreMain.contains("rap") || genreMain.contains("trap")
+            if isHipHop {
+                let v = features.valence
+                let d = features.danceability
+                if v >= 0.65 && d < 0.68 {
+                    // Bright, polished, mid-danceability: pop rap / luxury rap (Fancy, Aston Martin Music)
+                    // "feel good" excluded — it's a cross-genre mood tag that pulls in Nelly Furtado,
+                    // Kylie Minogue, Taylor Swift etc. which beat hip-hop on raw audio score.
+                    return ["pop rap", "melodic rap", "luxury rap"]
+                } else if v >= 0.65 {
+                    // Bright + very danceable: party rap / feel-good rap
+                    return ["melodic rap", "pop rap", "luxury rap"]
+                } else {
+                    // High energy but not as bright: trap-leaning but still hype
+                    return ["melodic trap", "energetic"]
+                }
+            }
+            // Mid-tempo bright songs (90-109 BPM) feel warm/feel-good, not hype pop/dance.
+            // "Upbeat" and "energetic" tags on Last.fm index fast dance/pop tracks (120+ BPM).
+            // e.g. All Too Well: energy=0.71, valence=0.67, BPM=92 → should be "feel good", not "upbeat".
+            if features.bpm < 110 {
+                return features.danceability > 0.55 ? ["feel good", "groove"] : ["feel good"]
+            }
+            return ["upbeat", "energetic"]                        // genuinely bright AND energetic: pop, dance (120+ BPM)
         }()
 
         // Append genre+mood compound queries (e.g. "late night neo soul", "melancholic dream pop").
@@ -2255,22 +3465,26 @@ class RecommendationEngine: ObservableObject {
         // GetSongBPM measured ~67 at half-time — doubling 67 gives 134, but 70 gives 140.
         // The result check catches this: if doubled > 138 for plain trap (not dnb/hardstyle),
         // the reading is probably not a clean half-time doubling — trust the source instead.
-        if hasFastTag && bpm < 120 {
+        // Only attempt doubling when BPM looks like it was measured at half-time (< 90 BPM).
+        // 90–120 BPM is a legitimate tempo range for trap/rap — don't touch it.
+        // "hardcore rap".contains("hardcore") was a false positive triggering 103 → 206.
+        if hasFastTag && bpm < 90 {
             let doubled = bpm * 2
-            // Don't double into the ambiguous 135–160 range for generic trap/rap —
-            // that zone overlaps real half-time reads AND correct tempos.
-            // Fast genres like dnb (170+), hardstyle (150+), hyperpop (145+) are exempt.
+            // "hardcore" alone matches "hardcore rap"/"hardcore hip hop" — exclude those.
+            // Real fast-electronic genres (dnb, hardstyle, hyperpop) don't have "rap" in the tag.
             let isVeryFastGenre = tags.contains { tag in
-                ["drum and bass", "dnb", "hardstyle", "hardcore", "hyperpop", "breakcore", "rave", "trance"]
+                let noRapModifier = !tag.contains("rap") && !tag.contains("hip")
+                return noRapModifier && ["drum and bass", "dnb", "hardstyle", "hardcore", "hyperpop", "breakcore", "rave", "trance"]
                     .contains { tag.contains($0) }
             }
-            if isVeryFastGenre || doubled <= 138 {
+            // Non-extreme: only double if result lands in the 100–165 BPM trap/dance range.
+            // Very-fast genres (dnb 170+, hardstyle 150+) can go higher.
+            let resultInRange = isVeryFastGenre ? doubled <= 200 : (doubled >= 100 && doubled <= 165)
+            if resultInRange {
                 simiLog("🎚️ BPM doubled \(Int(bpm)) → \(Int(doubled)) (fast genre tag, BPM too low)")
                 return doubled
             }
-            // Doubling would land in the ambiguous 139–175 range for normal trap/rap —
-            // leave the value as-is and let the BPM source's reading stand.
-            simiLog("🎚️ BPM doubling skipped \(Int(bpm)) → would be \(Int(doubled)) (ambiguous range for non-extreme genre)")
+            simiLog("🎚️ BPM doubling skipped \(Int(bpm)) → would be \(Int(doubled)) (out of valid range for genre)")
         }
 
         guard bpm > 130 else { return bpm }  // Only fast readings need further correction
@@ -2410,6 +3624,8 @@ class RecommendationEngine: ObservableObject {
             "alternative rap":  (0.60, 0.42, 0.60),
             "experimental hip hop": (0.58, 0.40, 0.58),
             "trap soul":        (0.45, 0.55, 0.55),  // Bryson Tiller — slow R&B with trap production
+            "pop rap":          (0.65, 0.68, 0.72),  // Drake/J.Cole accessible mode — upbeat, bright, polished
+            "luxury rap":       (0.62, 0.65, 0.68),  // Rick Ross/Jay-Z/Drake — opulent, mid-tempo, smooth
             // Pop
             "pop":              (0.65, 0.68, 0.72),
             "k-pop":            (0.72, 0.72, 0.78),
@@ -2458,6 +3674,8 @@ class RecommendationEngine: ObservableObject {
             "late night":       (0.38, 0.55, 0.45),
             "smooth r&b":       (0.42, 0.64, 0.50),
             "contemporary r&b": (0.52, 0.62, 0.60),
+            "alternative rnb":  (0.48, 0.42, 0.55),  // SZA, Frank Ocean, Miguel — darker, introspective alt-R&B
+            "alternative r&b":  (0.48, 0.42, 0.55),  // alias — Last.fm uses both spellings
             // Hype / club R&B — high energy, high valence, very different from slow jams
             "new jack swing":   (0.78, 0.68, 0.80),
             "club":             (0.82, 0.68, 0.85),
@@ -2651,11 +3869,63 @@ class RecommendationEngine: ObservableObject {
     // MARK: - DCLAP Background Catalog Builder
     // ──────────────────────────────────────────────
 
-    /// Fire-and-forget: sends the top results to Railway /embed-candidates so their
+    /// Pre-analyzes the source artist's top tracks via Last.fm + SonicDNA and caches
+    /// them to Supabase. Runs entirely in the background after enrichment completes.
+    /// Next time the user searches any track by this artist, Stage 1 gets a cache hit
+    /// and skips the 3-5s LocalAudio analysis entirely.
+    private func warmArtistCache(artist: String) async {
+        guard !artist.isEmpty else { return }
+        let topTracks = await lastFMService.fetchArtistTopTracks(artist: artist)
+        guard !topTracks.isEmpty else { return }
+
+        // Filter out tracks already in Supabase before spawning tasks — avoids
+        // paying download + analysis cost for tracks we already have.
+        var uncached: [(title: String, artist: String)] = []
+        for track in topTracks.prefix(12) {
+            if await supabase.lookupFeatures(title: track.title, artist: track.artist) == nil {
+                uncached.append(track)
+            }
+        }
+        guard !uncached.isEmpty else { return }
+        simiLog("🔥 Cache warming \(uncached.count) tracks for \(artist)")
+
+        // 2 slots, 150 ms stagger: background work should barely be felt.
+        // Lower slot count + wider stagger than Stage 2 since the user isn't
+        // waiting on this — spread the CPU cost over time, not over results.
+        let analyzer = localAudioAnalyzer
+        let warmCoolant = DSPCoolant(slots: 2)
+        await withTaskGroup(of: Void.self) { group in
+            for track in uncached {
+                group.addTask(priority: .background) {
+                    await warmCoolant.enter()
+                    defer { Task { await warmCoolant.exit() } }
+                    var previewURL = await self.itunesService.fetchPreviewURL(title: track.title, artist: artist)
+                    if previewURL == nil { previewURL = await self.deezerService.fetchPreviewURL(title: track.title, artist: artist) }
+                    guard let url = previewURL,
+                          let audioURL = URL(string: url),
+                          let (data, resp) = try? await URLSession.shared.data(from: audioURL),
+                          (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
+                    guard let features = await analyzer.analyze(data: data, sourceURL: url, title: track.title) else { return }
+                    await self.supabase.storeFeatures(title: track.title, artist: artist, features: features, source: "preview_audio")
+                    simiLog("🔥 Warmed: \(track.title) by \(artist)")
+                }
+            }
+            for await _ in group {}
+        }
+    }
+
+    /// Fire-and-forget: sends the top results to HF /embed-candidates so their
     /// DCLAP embeddings are computed and written to Supabase track_embeddings.
     /// The catalog self-populates from actual user searches — no manual seeding needed.
     private func embedCandidatesInBackground(songs: [SimilarSong], sourceFeatures: AudioFeatures) async {
-        let candidates = songs.prefix(15).compactMap { song -> [String: Any]? in
+        // Only embed songs that earned their position. Score ≥ 0.60 filters noise without
+        // requiring isEstimated=false — the DCLAP embedding is derived from audio waveform,
+        // not from features, so feature source doesn't affect embedding quality. Requiring
+        // isEstimated=false blocked all tag-estimated songs (capped at 0.68) and starved
+        // the catalog. 0.60 still excludes poor matches while letting the catalog grow.
+        let candidates = songs.prefix(25)
+            .filter { $0.similarityScore >= 0.60 }
+            .compactMap { song -> [String: Any]? in
             guard let preview = song.previewURL else { return nil }
             var c: [String: Any] = [
                 "spotifyId":  song.id,
@@ -2675,20 +3945,28 @@ class RecommendationEngine: ObservableObject {
         let payload: [String: Any] = ["candidates": candidates]
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
 
-        var request = URLRequest(url: URL(string: "https://simi-audio-analyzer-production.up.railway.app/embed-candidates")!)
+        var request = URLRequest(url: URL(string: "https://layzskolah-simi-audio-analyzer.hf.space/embed-candidates")!)
         request.httpMethod  = "POST"
         request.httpBody    = body
         request.timeoutInterval = 60
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        _ = try? await URLSession.shared.data(for: request)
+        simiLog("🌱 embedCandidatesInBackground: sending \(candidates.count) candidates to /embed-candidates")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let preview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
+            simiLog("🌱 /embed-candidates → HTTP \(status): \(preview)")
+        } catch {
+            simiLog("⚠️ /embed-candidates failed: \(error)")
+        }
     }
 
     // ──────────────────────────────────────────────
     // MARK: - DCLAP Vector Candidate Fetch
     // ──────────────────────────────────────────────
 
-    /// Sends a 512-dim DCLAP embedding to the Railway /vector-search endpoint and
+    /// Sends a 512-dim DCLAP embedding to the HF /vector-search endpoint and
     /// returns (title, artist) pairs for the nearest neighbours in track_embeddings.
     /// Returns [] when the source song has no embedding or the backend is unreachable.
     private func fetchVectorCandidates(embedding: [Double]) async -> [(title: String, artist: String)] {
@@ -2699,7 +3977,7 @@ class RecommendationEngine: ObservableObject {
         ]
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return [] }
 
-        var request = URLRequest(url: URL(string: "https://simi-audio-analyzer-production.up.railway.app/vector-search")!)
+        var request = URLRequest(url: URL(string: "https://layzskolah-simi-audio-analyzer.hf.space/vector-search")!)
         request.httpMethod  = "POST"
         request.httpBody    = body
         request.timeoutInterval = 8
@@ -2708,9 +3986,40 @@ class RecommendationEngine: ObservableObject {
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
             let response  = try JSONDecoder().decode(VectorSearchResponse.self, from: data)
-            return response.results.map { (title: $0.title, artist: $0.artist) }
+            return response.results
+                .map { (title: $0.title, artist: $0.artist) }
         } catch {
             simiLog("⚠️ DCLAP vector-search failed: \(error)")
+            return []
+        }
+    }
+
+    /// Sends a 200-dim MusiCNN embedding to the HF /musicnn-vector-search endpoint and
+    /// returns (title, artist) pairs for the nearest neighbours in track_embeddings.
+    /// Falls back to [] gracefully — catalog starts empty and populates over time via /embed-candidates.
+    private func fetchMusiCNNCandidates(embedding: [Double]) async -> [(title: String, artist: String)] {
+        guard !embedding.isEmpty else { return [] }
+        let payload: [String: Any] = [
+            "embedding":  embedding,
+            "matchCount": 20,
+        ]
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return [] }
+
+        var request = URLRequest(url: URL(string: "https://layzskolah-simi-audio-analyzer.hf.space/musicnn-vector-search")!)
+        request.httpMethod  = "POST"
+        request.httpBody    = body
+        request.timeoutInterval = 8
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let response  = try JSONDecoder().decode(VectorSearchResponse.self, from: data)
+            let results   = response.results
+                .map { (title: $0.title, artist: $0.artist) }
+            if !results.isEmpty { simiLog("🎼 MusiCNN ANN: \(results.count) candidates") }
+            return results
+        } catch {
+            simiLog("⚠️ MusiCNN vector-search failed: \(error)")
             return []
         }
     }
@@ -2722,6 +4031,7 @@ class RecommendationEngine: ObservableObject {
     func reset() {
         sourceSong = nil
         blendedSongs = []
+        moodTarget = nil
         recommendations = []
         errorMessage = nil
         detectedGenres = []
@@ -2740,6 +4050,54 @@ class RecommendationEngine: ObservableObject {
     func setFeedback(songID: String, state: FeedbackState?) {
         guard let idx = recommendations.firstIndex(where: { $0.id == songID }) else { return }
         recommendations[idx].feedbackState = state
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// MARK: - DSPCoolant
+//
+// Thermal throttle for concurrent on-device DSP analysis.
+// Like a car's coolant system: keeps the engine powerful without
+// letting it run dangerously hot.
+//
+// Two mechanisms:
+//   1. Slot cap — never more than `slots` analyze() calls live at once.
+//   2. Stagger — the first `slots` tasks start with `startIntervalMs`
+//      spacing so they don't all pile onto the CPU simultaneously.
+//      After the initial burst, tasks start the moment a slot frees.
+//
+// Usage:
+//   let coolant = DSPCoolant(slots: 3, startIntervalMs: 80)
+//   group.addTask(priority: .utility) {
+//       let delay = await coolant.enter()
+//       defer { Task { await coolant.exit() } }
+//       if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+//       return await analyzer.analyze(...)
+//   }
+// ──────────────────────────────────────────────────────────────
+
+private actor DSPCoolant {
+    private let slots: Int
+    private var active = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(slots: Int = 3) {
+        self.slots = slots
+    }
+
+    /// Waits for a free slot before the caller starts DSP work.
+    func enter() async {
+        if active >= slots {
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        active += 1
+    }
+
+    func exit() {
+        active -= 1
+        if !waiters.isEmpty {
+            waiters.removeFirst().resume()
+        }
     }
 }
 
@@ -2775,13 +4133,15 @@ enum SimiError: LocalizedError {
     case invalidURL
     case authFailed
     case songNotFound
+    case rateLimited
     case apiError(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidURL:    return "That doesn't look like a valid song link. Try pasting a Spotify, YouTube, or SoundCloud URL."
         case .authFailed:    return "Couldn't connect to Spotify. Check your internet connection and try again."
-        case .songNotFound:  return "Couldn't find that song on Spotify. Try a different link."
+        case .songNotFound:  return "Couldn't find that song. Try a different title or artist spelling."
+        case .rateLimited:   return "Too many requests — please wait a moment and try again."
         case .apiError(let msg): return "API error: \(msg)"
         }
     }

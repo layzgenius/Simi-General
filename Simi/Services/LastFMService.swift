@@ -377,6 +377,7 @@ class LastFMService {
             // Hip-hop specific — general to specific
             "boom bap", "cloud rap", "cloud trap", "psychedelic trap", "dark trap",
             "melodic trap", "melodic rap", "emo trap", "emo rap", "rage rap",
+            "pop rap", "luxury rap",
             "trap", "drill", "uk drill", "phonk", "grime", "punk rap",
             "alternative hip hop", "alternative rap", "experimental hip hop",
             // Acoustic / singer-songwriter
@@ -416,9 +417,11 @@ class LastFMService {
             "ethereal":      "dream pop",
             "psychedelic":   "psychedelic trap",
             "stoner":        "cloud rap",
-            // Broad genre tags — map to more evocative specific queries
-            "rnb":           "late night",   // R&B with dark valence → late-night/slow-jam feel
-            "r&b":           "late night",
+            // Broad genre tags — deliberately unmapped: without audio measurements we don't
+            // know if the source is dark-R&B (needs "late night") or upbeat R&B (needs "feel good").
+            // The audio-feature path in deriveAudioQueryTags picks the right direction after librosa.
+            // "rnb": unmapped  — was "late night" but injected 12 wrong candidates for upbeat hip-hop
+            // "r&b": unmapped
         ]
 
         var queries: [String] = []
