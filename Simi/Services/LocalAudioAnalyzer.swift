@@ -758,16 +758,41 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
             }
         }
 
-        // ── Genre tiebreaker — only when acoustically ambiguous ─────────────────
-        let isAmbiguous = sorted.count >= 2 && sorted[0].score < sorted[1].score * 1.5
-
-        if isAmbiguous, !genreHints.isEmpty, let range = genreRange(for: genreHints) {
-            let winner = sorted.max {
-                genreAffinity($0.bpm, range: range) * $0.score <
-                genreAffinity($1.bpm, range: range) * $1.score
+        // ── Genre tiebreaker ─────────────────────────────────────────────────────
+        // Fires in two modes:
+        //   Ambiguous: top < 1.5× second → weight all candidates by genre affinity.
+        //   Out-of-range: top BPM is outside the genre's expected tempo band →
+        //     apply genre affinity unconditionally (double-tempo correction without
+        //     requiring acoustic ambiguity). This fixes slow Latin/soul songs where
+        //     the 2× harmonic dominates the autocorr but genre clearly says it's wrong.
+        if !genreHints.isEmpty, let range = genreRange(for: genreHints) {
+            let topBPM = sorted.first?.bpm ?? 0
+            let isAmbiguous = sorted.count >= 2 && sorted[0].score < sorted[1].score * 1.5
+            let isOutOfRange = !range.contains(topBPM)
+            if isAmbiguous || isOutOfRange {
+                let winner = sorted.max {
+                    genreAffinity($0.bpm, range: range) * $0.score <
+                    genreAffinity($1.bpm, range: range) * $1.score
+                }
+                if let w = winner, w.score >= globalMax * 0.25 {
+                    return w.bpm
+                }
             }
-            if let w = winner, w.score >= globalMax * 0.25 {
-                return w.bpm
+        }
+
+        // ── Non-electronic double-tempo correction (no genre hints) ───────────────
+        // Acoustic, Latin, and folk tracks often show stronger autocorrelation at the
+        // 8th-note level (2× felt tempo) than the quarter-note pulse, yielding e.g.
+        // 150 BPM instead of 75 BPM. Sub-bass gate prevents misfiring on house/techno
+        // where the kick drum IS at 130+ BPM and sub-bass confirms it.
+        // Threshold: half must score ≥ 35% of global max (conservative without genre prior).
+        if genreHints.isEmpty, !subBassUsable,
+           let top = sorted.first, top.bpm >= 120, top.bpm <= 175 {
+            let halfBPM = top.bpm / 2
+            if halfBPM >= 55, halfBPM <= 100,
+               let halfEntry = sorted.first(where: { abs($0.bpm - halfBPM) < 6 }),
+               halfEntry.score >= globalMax * 0.35 {
+                return halfEntry.bpm
             }
         }
 
