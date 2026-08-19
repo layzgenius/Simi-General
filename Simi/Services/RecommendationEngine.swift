@@ -286,9 +286,17 @@ class RecommendationEngine: ObservableObject {
         "grunge", "new wave", "progressive rock", "prog rock", "nu-metal", "metalcore",
         "pop punk", "folk rock",
         // Acoustic / World
-        "disco", "funk", "reggae", "dancehall", "ska",
-        "afrobeats", "afropop",
-        "reggaeton", "latin", "bossa nova",
+        "disco", "funk", "ska",
+        // Latin / Ibero-Caribbean — exact-match fallback behind the identity-tier all-tags scan
+        "latin", "latin alternative", "latin pop", "latin jazz", "latin rock",
+        "latin trap", "latin indie",
+        "salsa", "cumbia", "bachata", "merengue", "vallenato", "reggaeton",
+        "nueva cancion", "nueva canción", "bolero", "bossa nova",
+        "afro-cuban", "afro-caribbean",
+        // African / Afrodiaspora
+        "afrobeats", "afropop", "afroswing", "amapiano", "afro house",
+        // Caribbean
+        "reggae", "dancehall",
         "americana", "bluegrass",
         // Jazz
         "jazz fusion", "smooth jazz",
@@ -311,17 +319,39 @@ class RecommendationEngine: ObservableObject {
             return [Genre(main: "Pop")]
         }
 
-        // K-pop / J-pop / regional pop override: check ALL tags regardless of position.
-        // Last.fm users frequently apply hip-hop/trap tags to K-pop tracks, but if a Korean
-        // or Japanese pop identifier appears anywhere in the tag list it's authoritative —
-        // these genres are too sonically distinct to let a misclassified "trap" tag slide.
-        let regionalPopTags: Set<String> = [
-            "k-pop", "kpop", "k pop", "korean pop", "korean music", "korean",
-            "j-pop", "jpop", "j pop", "japanese pop", "c-pop", "cpop", "mandopop", "sino-pop"
+        // ── Identity-tier override: scan ALL tags regardless of position ──────────
+        // Cultural/regional genres are routinely outranked by mainstream cross-genre labels
+        // ("alternative", "indie") in Last.fm's vote-ordered tag list. A single identity
+        // tag anywhere in the list is authoritative — these genres are too sonically distinct
+        // to let positional tag ordering win. To add a new cultural genre: extend this set.
+        let identityTags: [String: String] = [
+            // East Asian pop
+            "k-pop": "K-Pop",   "kpop": "K-Pop",  "k pop": "K-Pop",
+            "korean pop": "K-Pop", "korean music": "K-Pop",
+            "j-pop": "J-Pop",   "jpop": "J-Pop",  "j pop": "J-Pop",
+            "japanese pop": "J-Pop",
+            "c-pop": "C-Pop",   "cpop": "C-Pop",  "mandopop": "C-Pop", "sino-pop": "C-Pop",
+            // Latin / Ibero-Caribbean
+            "latin": "Latin",               "latin alternative": "Latin Alternative",
+            "latin pop": "Latin Pop",        "latin jazz": "Latin Jazz",
+            "latin rock": "Latin Rock",      "latin trap": "Latin Trap",
+            "latin indie": "Latin Indie",
+            "salsa": "Salsa",               "cumbia": "Cumbia",
+            "bachata": "Bachata",            "merengue": "Merengue",
+            "vallenato": "Vallenato",        "reggaeton": "Reggaeton",
+            "nueva cancion": "Nueva Cancion","nueva canción": "Nueva Canción",
+            "bolero": "Bolero",
+            "afro-cuban": "Afro-Cuban",     "afro-caribbean": "Afro-Caribbean",
+            "bossa nova": "Bossa Nova",
+            // African / Afrodiaspora
+            "afrobeats": "Afrobeats",  "afropop": "Afropop",
+            "afroswing": "Afroswing",  "amapiano": "Amapiano", "afro house": "Afro House",
+            // Caribbean
+            "dancehall": "Dancehall",  "reggae": "Reggae",
         ]
-        if let found = tags.first(where: { regionalPopTags.contains($0.lowercased()) }) {
-            let normalized = found == "kpop" ? "K-Pop" : found == "jpop" ? "J-Pop" : found == "cpop" ? "C-Pop" : found.capitalized
-            return [Genre(main: normalized)]
+        if let found = tags.first(where: { identityTags[$0.lowercased()] != nil }),
+           let canonical = identityTags[found.lowercased()] {
+            return [Genre(main: canonical)]
         }
 
         // Pop-adjacent tags that should win over any specific subgenre found deeper in the list.
@@ -2442,6 +2472,53 @@ class RecommendationEngine: ObservableObject {
                 let allowed = Set(decisions.compactMap { $0.1 ? $0.0 : nil })
                 let result = candidates.enumerated().compactMap { allowed.contains($0.offset) ? $0.element : nil }
                 simiLog("🎯 GenreGate: \(result.count)/\(candidates.count) passed genre check")
+
+                // ── Floor pass 1: full misclassification ────────────────────────────
+                // If all candidates are excluded, the source genre is almost certainly wrong.
+                // Return the unfiltered pool rather than a blank screen.
+                if result.isEmpty {
+                    simiLog("⚠️ GenreGate: all candidates excluded — source genre likely misclassified, falling back to unfiltered pool")
+                    return candidates
+                }
+
+                // ── Floor pass 2: thin-pool relaxation ──────────────────────────────
+                // Fewer than 5 results after the full gate usually means a niche source
+                // genre where the pool has few cultural matches (e.g. amapiano, bolero).
+                // Re-admit adjacent-family candidates that were blocked only by the quota
+                // cap, without lifting the hard distant-family exclusion.
+                if result.count < 5 {
+                    let relaxedQuota = GenreQuotaTracker(limit: candidates.count) // uncapped
+                    let relaxedDecisions: [(Int, Bool)] = await withTaskGroup(of: (Int, Bool).self) { inner in
+                        for (index, song) in candidates.enumerated() {
+                            guard !allowed.contains(index) else {
+                                // Already passed — keep as-is, don't re-fetch tags.
+                                inner.addTask { (index, true) }
+                                continue
+                            }
+                            inner.addTask {
+                                async let tt = self.lastFMService.fetchRawTags(title: song.title, artist: song.artist)
+                                async let at = self.lastFMService.fetchArtistRawTags(artist: song.artist)
+                                let tTags = await tt; let aTags = await at
+                                let tags = tTags + aTags.filter { !Set(tTags).contains($0) }.prefix(5)
+                                guard let tg = await self.genresFromRawTags(tags).first else { return (index, true) }
+                                let p = self.genrePenalty(sourceGenres: genres, targetGenre: tg)
+                                if p >= 0.18 { return (index, false) }          // still hard-exclude distant
+                                let ok = await relaxedQuota.claim()
+                                return (index, ok)
+                            }
+                        }
+                        var out: [(Int, Bool)] = []
+                        for await d in inner { out.append(d) }
+                        return out
+                    }
+                    let relaxedAllowed = Set(relaxedDecisions.compactMap { $0.1 ? $0.0 : nil })
+                    let relaxed = candidates.enumerated().compactMap { relaxedAllowed.contains($0.offset) ? $0.element : nil }
+                    if relaxed.count > result.count {
+                        simiLog("⚠️ GenreGate thin-pool: relaxed adjacent quota, \(result.count) → \(relaxed.count) candidates")
+                        return relaxed
+                    }
+                }
+
                 return result
             }
             // Fail open: if Last.fm is unreachable, return all candidates rather than block.
@@ -2657,26 +2734,26 @@ class RecommendationEngine: ObservableObject {
     }
 
     private func detectGenreFamily(_ genres: [Genre]) -> GenreFamily {
+        // Single source of truth: delegate to genreFamily() which owns the family mapping
+        // for penalty calculation. detectGenreFamily is only used for the UI badge — using
+        // the same logic prevents the two systems from diverging when new genres are added.
+        // Blues is a special case: genreFamily() maps it to "jazz" (penalty-equivalent), but
+        // the UI badge distinguishes it, so we check blues first before delegating.
         let names = genres.map { $0.main.lowercased() }
-        func any(_ check: (String) -> Bool) -> Bool { names.contains(where: check) }
-        // Blues wins over rock/metal when any tag in the array is blues — Last.fm often returns
-        // "Classic Rock" first even for blues artists, so scan the whole list.
-        if any({ $0.contains("blues") }) { return .blues }
-        if any({ $0.contains("metal") || $0.contains("thrash") || $0.contains("metalcore") || $0.contains("deathcore") || $0.contains("doom") }) { return .metal }
-        // Hip-hop checked before rock: "rap rock", "punk rap", "hardcore rap" are primarily
-        // hip-hop and should not penalize other rap/trap songs as genre-crosses.
-        if any({ $0.contains("hip") || $0.contains("rap") || $0.contains("trap") || $0.contains("drill") || $0.contains("grime") || $0.contains("phonk") }) { return .hiphop }
-        // Latin checked before rock/electronic — "latin alternative" (iLe, Natalia Lafourcade)
-        // and "latin rock" contain "alternative"/"rock" but belong to the Latin family, not rock.
-        if any({ $0.contains("latin") || $0.contains("salsa") || $0.contains("reggaeton") || $0.contains("cumbia") || $0.contains("bachata") || $0.contains("merengue") || $0.contains("bossa nova") || $0.contains("samba") || $0.contains("afro-caribbean") || $0.contains("afro-cuban") }) { return .latin }
-        if any({ $0.contains("hard rock") || $0.contains("punk") || $0.contains("grunge") || $0.contains("rock") || $0.contains("hardcore") || $0.contains("shoegaze") || $0.contains("post-rock") }) { return .rock }
-        if any({ $0.contains("r&b") || $0.contains("rnb") || $0.contains("soul") || $0.contains("funk") || $0.contains("gospel") || $0.contains("slow jam") || $0.contains("neo-soul") }) { return .rnb }
-        if any({ $0.contains("jazz") }) { return .jazz }
-        if any({ $0.contains("classical") || $0.contains("orchestral") }) { return .classical }
-        if any({ $0.contains("electronic") || $0.contains("edm") || $0.contains("house") || $0.contains("techno") || $0.contains("trance") || $0.contains("drum and bass") || $0.contains("dubstep") || $0.contains("synthwave") || $0.contains("synth") }) { return .electronic }
-        if any({ $0.contains("folk") || $0.contains("acoustic") || $0.contains("country") || $0.contains("americana") || $0.contains("bluegrass") || $0.contains("singer-songwriter") }) { return .folk }
-        if any({ $0.contains("pop") }) { return .pop }
-        return .unknown
+        if names.contains(where: { $0.contains("blues") }) { return .blues }
+        switch genreFamily(genres.first?.main ?? "") {
+        case "metal":       return .metal
+        case "rock":        return .rock
+        case "hiphop":      return .hiphop
+        case "rnb":         return .rnb
+        case "pop":         return .pop
+        case "electronic":  return .electronic
+        case "folk":        return .folk
+        case "jazz":        return .jazz
+        case "classical":   return .classical
+        case "latin":       return .latin
+        default:            return .unknown
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -3502,7 +3579,10 @@ class RecommendationEngine: ObservableObject {
             "r&b", "rnb", "soul", "neo-soul", "neo soul", "chill", "chillout", "chill out",
             "ambient", "lo-fi", "lofi", "blues", "gospel", "ballad", "slow jam", "slow",
             "bedroom pop", "dream pop", "folk", "acoustic", "romantic", "melancholic",
-            "sad", "relaxing", "smooth", "laid back", "downtempo", "trip hop"
+            "sad", "relaxing", "smooth", "laid back", "downtempo", "trip hop",
+            // Slow Latin subgenres — "latin" is intentionally excluded (salsa/merengue are genuinely fast).
+            // These specific subgenres are always slow enough that > 155 BPM is a detector error.
+            "bolero", "bossa nova", "nueva cancion", "nueva canción",
         ]
 
         // Same direction fix: only tag.contains($0), not the reverse.
@@ -3517,7 +3597,12 @@ class RecommendationEngine: ObservableObject {
         // detected at double-time; a 140-read of a 70 BPM ballad lands here).
         // We use a narrow tag set to avoid halving legitimately fast R&B/trap
         // (e.g. "All Back" by CB is a real 146 BPM neo-soul — "r&b" alone is too broad).
-        let stronglySlowTags: Set<String> = ["ballad", "slow jam", "slow jams", "gospel", "blues"]
+        // Slow Latin subgenres (bolero, nueva cancion) have the same double-tempo artifact
+        // as ballads and never live in the 130–155 range genuinely.
+        let stronglySlowTags: Set<String> = [
+            "ballad", "slow jam", "slow jams", "gospel", "blues",
+            "bolero", "nueva cancion", "nueva canción",
+        ]
         let hasStronglySlowTag = tags.contains { tag in stronglySlowTags.contains { tag.contains($0) } }
         if hasStronglySlowTag && bpm > 130 && bpm <= 155 {
             let halved = bpm / 2

@@ -131,18 +131,45 @@ class LastFMService {
             "disco", "funk", "bossa nova", "reggae",
         ]
 
-        // Latin / Afro-Caribbean override: scan ALL tags regardless of position.
-        // "latin" and its subgenres get misclassified when Last.fm returns
-        // "alternative" or "electronic" before "latin" in the tag ordering.
-        // Like the K-pop override, this scans the full list so the identity wins.
-        let latinIdentifiers: Set<String> = [
-            "latin", "latin alternative", "latin pop", "latin jazz", "latin rock", "latin trap",
+        // ── Identity-tier override: scan ALL tags regardless of position ──────────
+        // Cultural/regional genres are routinely outranked in Last.fm's vote-ordered
+        // tag list by mainstream cross-genre labels ("alternative", "indie", "pop").
+        // Whenever an identity tag appears ANYWHERE in the list, it wins — these
+        // genres are too sonically distinct for a positional first-match to be reliable.
+        // To add a new cultural genre: add every spelling variant to this set, nothing else.
+        let identityTags: Set<String> = [
+            // East Asian pop — all common spellings
+            "k-pop", "kpop", "k pop", "korean pop", "korean music",
+            "j-pop", "jpop", "j pop", "japanese pop",
+            "c-pop", "cpop", "mandopop", "sino-pop",
+            // Latin / Ibero-Caribbean
+            "latin", "latin alternative", "latin pop", "latin jazz", "latin rock",
+            "latin trap", "latin indie",
             "salsa", "cumbia", "bachata", "merengue", "vallenato", "reggaeton",
-            "nueva cancion", "nueva canción", "afro-cuban", "afro-caribbean",
-            "latin indie", "bossa nova",
+            "nueva cancion", "nueva canción", "bolero",
+            "afro-cuban", "afro-caribbean", "bossa nova",
+            // African / Afrodiaspora
+            "afrobeats", "afropop", "afroswing", "amapiano", "afro house",
+            // Caribbean
+            "dancehall", "reggae",
         ]
-        if let found = cleanTags.first(where: { latinIdentifiers.contains($0) }) {
-            return [Genre(main: found.capitalized, sub: nil)]
+        if let found = cleanTags.first(where: { identityTags.contains($0) }) {
+            // Normalise common non-standard spellings to their canonical form.
+            let normalized: String
+            switch found {
+            case "kpop":        normalized = "K-Pop"
+            case "k pop":       normalized = "K-Pop"
+            case "korean pop":  normalized = "K-Pop"
+            case "korean music":normalized = "K-Pop"
+            case "jpop":        normalized = "J-Pop"
+            case "j pop":       normalized = "J-Pop"
+            case "japanese pop":normalized = "J-Pop"
+            case "cpop":        normalized = "C-Pop"
+            case "mandopop":    normalized = "C-Pop"
+            case "sino-pop":    normalized = "C-Pop"
+            default:            normalized = found.capitalized
+            }
+            return [Genre(main: normalized, sub: nil)]
         }
 
         // Tier 2: broad genre keywords — fallback when no specific subgenre found.
