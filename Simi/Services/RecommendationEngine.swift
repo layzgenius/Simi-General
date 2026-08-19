@@ -2636,7 +2636,7 @@ class RecommendationEngine: ObservableObject {
     // ──────────────────────────────────────────────
 
     private enum GenreFamily: Equatable {
-        case metal, rock, blues, hiphop, rnb, pop, electronic, folk, jazz, classical, unknown
+        case metal, rock, blues, hiphop, rnb, pop, electronic, folk, jazz, classical, latin, unknown
 
         var displayName: String {
             switch self {
@@ -2650,6 +2650,7 @@ class RecommendationEngine: ObservableObject {
             case .folk:       return "Folk"
             case .jazz:       return "Jazz"
             case .classical:  return "Classical"
+            case .latin:      return "Latin"
             case .unknown:    return ""
             }
         }
@@ -2665,6 +2666,9 @@ class RecommendationEngine: ObservableObject {
         // Hip-hop checked before rock: "rap rock", "punk rap", "hardcore rap" are primarily
         // hip-hop and should not penalize other rap/trap songs as genre-crosses.
         if any({ $0.contains("hip") || $0.contains("rap") || $0.contains("trap") || $0.contains("drill") || $0.contains("grime") || $0.contains("phonk") }) { return .hiphop }
+        // Latin checked before rock/electronic — "latin alternative" (iLe, Natalia Lafourcade)
+        // and "latin rock" contain "alternative"/"rock" but belong to the Latin family, not rock.
+        if any({ $0.contains("latin") || $0.contains("salsa") || $0.contains("reggaeton") || $0.contains("cumbia") || $0.contains("bachata") || $0.contains("merengue") || $0.contains("bossa nova") || $0.contains("samba") || $0.contains("afro-caribbean") || $0.contains("afro-cuban") }) { return .latin }
         if any({ $0.contains("hard rock") || $0.contains("punk") || $0.contains("grunge") || $0.contains("rock") || $0.contains("hardcore") || $0.contains("shoegaze") || $0.contains("post-rock") }) { return .rock }
         if any({ $0.contains("r&b") || $0.contains("rnb") || $0.contains("soul") || $0.contains("funk") || $0.contains("gospel") || $0.contains("slow jam") || $0.contains("neo-soul") }) { return .rnb }
         if any({ $0.contains("jazz") }) { return .jazz }
@@ -2788,6 +2792,10 @@ class RecommendationEngine: ObservableObject {
             // Latin crosses many families — Latin pop, Latin R&B, bossa nova (jazz), cumbia (folk).
             // Adjacent (not same) so it's a soft preference, not a free pass.
             ["latin", "pop"], ["latin", "rnb"], ["latin", "folk"], ["latin", "jazz"],
+            // Electro-cumbia, Latin trap, and reggaeton all blend Latin and electronic production.
+            // Adjacent pair prevents Latin candidates from being hard-excluded when the source
+            // genre is misread as "electronic" (e.g. iLe's "Tu Rumba" with synth production).
+            ["latin", "electronic"],
         ]
         for family in sourceFamilies {
             if adjacent.contains([family, targetFamily]) { return 0.12 }
