@@ -2820,7 +2820,7 @@ class RecommendationEngine: ObservableObject {
         // Latin must be checked before "alternative" — "Latin Alternative" (iLe, Natalia Lafourcade) is
         // a Latin subgenre that contains the word "alternative"; catching it after the rock sweep would
         // misclassify the source as "rock" and hard-exclude all Latin candidates via GenreGate.
-        if g.contains("latin") || g.contains("reggaeton") || g.contains("salsa") || g.contains("cumbia") || g.contains("bossa nova") || g.contains("samba") || g.contains("merengue") || g.contains("bachata") { return "latin" }
+        if g.contains("latin") || g.contains("reggaeton") || g.contains("salsa") || g.contains("cumbia") || g.contains("bossa nova") || g.contains("samba") || g.contains("merengue") || g.contains("bachata") || g.contains("bolero") || g.contains("nueva cancion") || g.contains("nueva canción") { return "latin" }
         if g.contains("rock") || g.contains("indie") || g.contains("alternative") || g.contains("punk") || g.contains("grunge") || g.contains("shoegaze") || g.contains("emo") { return "rock" }
         if g.contains("metal") || g.contains("hardcore") || g.contains("screamo") { return "metal" }
         if g.contains("electronic") || g.contains("edm") || g.contains("house") || g.contains("techno") || g.contains("ambient") || g.contains("dubstep") || g.contains("trance") { return "electronic" }
