@@ -3572,6 +3572,53 @@ class RecommendationEngine: ObservableObject {
             simiLog("🎚️ BPM doubling skipped \(Int(bpm)) → would be \(Int(doubled)) (out of valid range for genre)")
         }
 
+        // ── Genre-range correction ─────────────────────────────────────────────────
+        // Catches cached BPMs at 2× or ½× the felt tempo when the genre tag makes the
+        // correct range unambiguous. This is the fix for stale Supabase cache entries:
+        // normalizeBPM is called at every BPM read site (lines ~405, ~705, ~1843), so
+        // any BPM that passes through with earlyTags available gets rewritten here and
+        // the corrected value is stored back to Supabase by the caller.
+        //
+        // Priority order: specific subgenres before broad labels so "salsa" (80–115)
+        // wins over "latin" (70–125) when both appear in the tag list.
+        // Correction only fires when the halved/doubled value falls strictly inside
+        // the range — no tolerance buffer, to avoid over-correcting ambiguous tempos.
+        let genreRanges: [(keys: [String], range: ClosedRange<Double>)] = [
+            (["bolero"],                              45.0...85.0),
+            (["nueva cancion", "nueva canción"],      55.0...100.0),
+            (["rumba"],                               60.0...105.0),
+            (["bossa nova"],                          75.0...130.0),
+            (["salsa"],                               80.0...115.0),
+            (["cumbia"],                              80.0...115.0),
+            (["bachata"],                             104.0...132.0),
+            (["reggaeton"],                           70.0...105.0),
+            (["latin"],                               70.0...125.0),
+        ]
+        if !tags.isEmpty {
+            let lTags = tags.map { $0.lowercased() }
+            for entry in genreRanges {
+                guard lTags.contains(where: { tag in
+                    entry.keys.contains(where: { tag.contains($0) || $0.contains(tag) })
+                }) else { continue }
+                let range = entry.range
+                if range.contains(bpm) { break }     // in range — no correction needed
+                if bpm > range.upperBound {
+                    let halved = bpm / 2
+                    if range.contains(halved) {
+                        simiLog("🎚️ BPM halved \(Int(bpm)) → \(Int(halved)) (genre range '\(entry.keys[0])')")
+                        return halved
+                    }
+                } else if bpm > 0 {
+                    let doubled = bpm * 2
+                    if range.contains(doubled) {
+                        simiLog("🎚️ BPM doubled \(Int(bpm)) → \(Int(doubled)) (genre range '\(entry.keys[0])')")
+                        return doubled
+                    }
+                }
+                break  // matched genre but correction out of range — don't try broader genres
+            }
+        }
+
         guard bpm > 130 else { return bpm }  // Only fast readings need further correction
 
         // Tags that reliably indicate a slow tempo
