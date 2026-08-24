@@ -252,8 +252,8 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
         let chroma:        [Double]
         let magnitudes:    [Float]
         let totalEnergy:   Double
-        let lowMidEnergy:  Double   // 100–2000 Hz — spectral warmth driver
-        let midBandEnergy: Double   // 300–3000 Hz — vocal presence proxy
+        let lowMidEnergy:  Double   // 250–2000 Hz — spectral warmth driver (floor raised to clear 50–200 Hz sub-bass)
+        let midBandEnergy: Double   // 450–3000 Hz — vocal presence proxy (floor raised past 808 harmonic range ~400 Hz)
         let subBassEnergy: Double   // 50–200 Hz — kick drum fundamental band
         let flatness:      Double   // geometric/arithmetic mean ratio
         let hfFlatness:    Double   // same, 2 kHz+; -1 when no HF bins
@@ -397,7 +397,11 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
         let rolloffNorm    = min(1.0, (avgRolloffBin * binHz) / (sampleRate / 2.0))
 
         let safeTotal      = max(totalEnergySum, 1e-9)
+        // 250–2000 Hz / total: warm acoustic instruments (guitar body, piano, cello) vs. cold synths.
+        // Sub-bass exclusion (floor raised from 100→250 Hz) prevents kick/808 energy from inflating warmth.
         let spectralWarmth = min(1.0, lowMidEnergySum / safeTotal)
+        // 450–3000 Hz / total: vocal content proxy. Floor raised from 300→450 Hz to exclude 808 harmonics
+        // (which extend to ~400 Hz and previously pulled instrumental trap toward high vocalPresence).
         let vocalPresence  = min(1.0, midBandEnergySum / safeTotal)
 
         // ── BPM ───────────────────────────────────────────
@@ -596,8 +600,8 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
                 let midi = 12.0 * log2(freq / 440.0) + 69.0
                 chroma[((Int(midi.rounded()) % 12) + 12) % 12] += mag
             }
-            if freq >= 100 && freq <= 2000 { lowMidEnergy  += mag }
-            if freq >= 300 && freq <= 3000 { midBandEnergy += mag }
+            if freq >= 250 && freq <= 2000 { lowMidEnergy  += mag }
+            if freq >= 450 && freq <= 3000 { midBandEnergy += mag }
             if freq >= 50  && freq <= 200  { subBassEnergy += mag }
             if freq >= 2000                { hfMags.append(mags[i]) }
         }

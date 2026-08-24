@@ -3172,18 +3172,22 @@ class RecommendationEngine: ObservableObject {
             totalScore += keyHarmonyScore * 0.06
         }
 
-        // Spectral warmth — disabled pending sub-bass RMS fix. Stored, contributes nothing.
-        totalScore += (1.0 - abs(source.spectralWarmth - target.spectralWarmth)) * 0.00
+        // Spectral warmth — 250–2000 Hz / total energy. Distinguishes warm acoustic instruments
+        // (guitar body, piano, cello resonance) from cold synth pads and electronic brightness.
+        // Sub-bass floor fix (100→250 Hz) prevents kick/808 from inflating warmth for EDM.
+        totalScore += (1.0 - abs(source.spectralWarmth - target.spectralWarmth)) * 0.05
 
         // Tonal clarity — harmonic focus (melody-driven trap vs. beat-driven trap).
         totalScore += (1.0 - abs(source.tonalClarity - target.tonalClarity)) * 0.01
 
-        // Vocal presence — disabled (weight 0.00); stored, contributes nothing.
-        // Calibration: 808 sine waves stay in y_harmonic, inverting expected ordering.
-        totalScore += (1.0 - abs(source.vocalPresence - target.vocalPresence)) * 0.00
+        // Vocal presence — 450–3000 Hz / total energy. Separates vocal-led songs from instrumentals.
+        // 808 floor fix (300→450 Hz) excludes 808 harmonics (~40–400 Hz) that previously pulled
+        // instrumental trap toward high vocalPresence and inverted the vocal/instrumental ordering.
+        totalScore += (1.0 - abs(source.vocalPresence - target.vocalPresence)) * 0.06
 
-        // Reverb space — disabled (weight 0.00); stored, contributes nothing.
-        // Calibration: HF noise floor in trap gives falsely high spectral flatness.
+        // Reverb space — disabled (weight 0.00). HF spectral flatness cannot distinguish hi-hat
+        // broadband noise from reverb diffusion in single-frame analysis. Needs multi-frame HF
+        // energy decay tracking (reverb: slow decay; dry hi-hat: fast transient). Left for later.
         totalScore += (1.0 - abs(source.reverbSpace - target.reverbSpace)) * 0.00
 
         // Normalize by used weight. When arousal, MFCC, and chroma entropy are
