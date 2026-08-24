@@ -468,19 +468,24 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
         // independent of loudness. Shared by both arousal and danceability below.
         let beatRegularity = computeBeatRegularity(onsetFlux: onsetFlux, fps: fps, bpm: bpm)
 
-        // Arousal: physical intensity + pulse clarity.
+        // Arousal: physical intensity + pulse clarity + tonal tension.
         // DEAM Stage 2 overwrites this with the real value for the top 8 candidates;
         // this fills in arousal for the remaining ~90% so circumplex matching works across
         // the full result set. 180 BPM ceiling captures DnB/rave at max arousal.
         // beatRegularity raises arousal for quiet-but-rhythmically-insistent tracks —
         // minimal techno at low volume, tense ambient with a steady pulse — that energy
         // alone would mis-score as calm.
+        // tonalTension (1 − consonance) raises arousal for dissonant-but-quiet music:
+        // cloud rap (tritone/min-2 clusters), dark ambient drones, doom metal — all carry
+        // high tension that RMS energy alone misses.
         let arousalTempoScore = min(1.0, bpm / 180.0)
+        let tonalTension      = 1.0 - consonance
         let arousal = min(1.0, max(0.0,
-            energy            * 0.50 +
+            energy            * 0.44 +
             arousalTempoScore * 0.25 +
-            avgBrightness     * 0.10 +
-            beatRegularity    * 0.15
+            beatRegularity    * 0.15 +
+            avgBrightness     * 0.08 +
+            tonalTension      * 0.08
         ))
 
         // Danceability: beat regularity + genre-aware BPM fit + energy.
@@ -819,14 +824,26 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
         let lag = Int((fps * 60.0 / bpm).rounded())
         guard lag > 0 && lag < n else { return 0.5 }
 
-        var dotBeat: Float = 0
-        var dotSelf:  Float = 0
-        for t in 0..<(n - lag) { dotBeat += onsetFlux[t] * onsetFlux[t + lag] }
-        for t in 0..<n         { dotSelf  += onsetFlux[t] * onsetFlux[t]      }
-
+        var dotSelf: Float = 0
+        for t in 0..<n { dotSelf += onsetFlux[t] * onsetFlux[t] }
         guard dotSelf > 0 else { return 0.5 }
-        // Scale: autocorr at beat lag / autocorr at lag=0; multiply by 2 to expand 0–0.5 range to 0–1
-        return min(1.0, max(0.0, Double(dotBeat / dotSelf) * 2.0))
+
+        // Normalized autocorrelation at a given lag, scaled ×2 so the [0, 0.5] range
+        // of a typical onset signal expands to [0, 1].
+        func autocorr(at l: Int) -> Double {
+            guard l > 0 && l < n else { return 0 }
+            var dot: Float = 0
+            for t in 0..<(n - l) { dot += onsetFlux[t] * onsetFlux[t + l] }
+            return Double(dot / dotSelf) * 2.0
+        }
+
+        // Check at the quarter-note lag (one beat) AND the half-bar lag (two beats).
+        // Afrobeats, amapiano, and syncopated R&B have grooves that repeat every 2 beats
+        // rather than every beat — their autocorrelation peaks at lag×2 while lag alone
+        // looks weak, making them appear rhythmically vague at the single-lag check.
+        let r1 = autocorr(at: lag)      // one beat  — house, techno, 4-on-the-floor
+        let r2 = autocorr(at: lag * 2)  // two beats — afrobeats, clave-based, syncopated
+        return min(1.0, max(0.0, max(r1, r2)))
     }
 
     // How well `bpm` fits the expected tempo for dancing.
