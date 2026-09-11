@@ -16,6 +16,7 @@ struct Song: Identifiable, Codable, Equatable {
     var previewURL: String? // 30-second preview audio (optional — not all songs have one)
     var spotifyURL: String  // Link back to Spotify
     var sourceURL: String   // The URL the user originally pasted (Spotify, YouTube, etc.)
+    var releaseYear: Int?   // Album release year from Spotify — used for era-tag candidate sourcing
 
     // Audio fingerprint — the "DNA" of the song
     var audioFeatures: AudioFeatures?
@@ -71,6 +72,9 @@ struct AudioFeatures: Codable, Sendable, Equatable {
     var valenceEssentia: Double?      // DEAM valence [0,1]
     // DCLAP neural embedding — nil when backend unavailable or track not yet embedded
     var dclapEmbedding: [Double]?     // 512-dim L2-normalised DCLAP vector
+    // MusiCNN timbral embedding — nil until catalog populates via /embed-candidates
+    // 200-dim, Last.fm tag-supervised. Better recommendation ANN than DCLAP (RecSys '24).
+    var musicnnEmbedding: [Double]?   // 200-dim L2-normalised MusiCNN vector
 
     // Memberwise initializer — required because defining init(from:) suppresses
     // Swift's auto-synthesized memberwise init. All new fields default to neutral.
@@ -103,7 +107,8 @@ struct AudioFeatures: Codable, Sendable, Equatable {
         grooveRatio: Double? = nil,
         arousal: Double? = nil,
         valenceEssentia: Double? = nil,
-        dclapEmbedding: [Double]? = nil
+        dclapEmbedding: [Double]? = nil,
+        musicnnEmbedding: [Double]? = nil
     ) {
         self.bpm              = bpm
         self.energy           = energy
@@ -134,6 +139,7 @@ struct AudioFeatures: Codable, Sendable, Equatable {
         self.arousal          = arousal
         self.valenceEssentia  = valenceEssentia
         self.dclapEmbedding   = dclapEmbedding
+        self.musicnnEmbedding = musicnnEmbedding
     }
 
     // Custom decoder — new fields fall back to 0.5 (neutral) when absent from older
@@ -169,6 +175,7 @@ struct AudioFeatures: Codable, Sendable, Equatable {
         arousal          = try c.decodeIfPresent(Double.self,    forKey: .arousal)
         valenceEssentia  = try c.decodeIfPresent(Double.self,    forKey: .valenceEssentia)
         dclapEmbedding   = try c.decodeIfPresent([Double].self,  forKey: .dclapEmbedding)
+        musicnnEmbedding = try c.decodeIfPresent([Double].self,  forKey: .musicnnEmbedding)
     }
 
     // Human-readable helpers
@@ -323,9 +330,14 @@ enum MatchReason: String, Codable, CaseIterable {
     case mellowMatch   = "Mellow Match"     // both low energy (<0.45) — bedroom, calm, soft
     case energy        = "Similar Energy"   // generic fallback when energy is mid-range
     // Mood-specific (replaces generic "Same Mood")
-    case darkMood      = "Dark Mood"        // both dark/heavy (valence <0.40)
-    case upbeatMood    = "Upbeat Mood"      // both bright/joyful (valence >0.65)
+    case darkMood      = "Dark Mood"        // both dark/heavy (valence <0.40) — arousal unavailable
+    case upbeatMood    = "Upbeat Mood"      // both bright/joyful (valence >0.65) — arousal unavailable
     case mood          = "Same Mood"        // generic fallback for mid-valence matches
+    // Russell's circumplex quadrant labels — only when DEAM arousal is present on both songs
+    case tense         = "Tense"            // low valence + high arousal (e.g. dark trap, horror score)
+    case melancholic   = "Melancholic"      // low valence + low arousal (e.g. sad ambient, grief ballad)
+    case euphoric      = "Euphoric"         // high valence + high arousal (e.g. festival anthem, pop banger)
+    case serene        = "Serene"           // high valence + low arousal (e.g. peaceful indie, chill R&B)
     // Other
     case genre         = "Same Genre"
     case subGenre      = "Same Sub-Genre"

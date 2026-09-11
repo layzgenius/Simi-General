@@ -250,25 +250,55 @@ struct SongCard: View {
                     }
                 }
 
+                // Multi-hop: search from this recommendation as the new seed
+                Button {
+                    previewPlayer.stop()
+                    Task { await engine.findSimilarSongs(title: song.title, artist: song.artist) }
+                } label: {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.simiAccent)
+                        .frame(minWidth: 44, minHeight: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Find songs similar to \(song.title)")
+                .accessibilityHint("Searches for songs with a similar feel")
+
                 Spacer()
             }
             .padding(.horizontal, 14)
             .padding(.bottom, 0)
 
-            FeedbackRow(song: song)
-
             // ── Match reason chips — full-width row so they never get squished ──
-            if !song.matchReasons.isEmpty {
+            // When enrichment is still in progress (isEstimated), suppress the tag-estimated
+            // chips and show only the Calculating indicator — mixing uncertain chips with
+            // a "Calculating" badge presents two conflicting confidence signals at once.
+            let isAnalyzing = song.audioFeatures?.isEstimated == true
+            if !song.matchReasons.isEmpty || isAnalyzing {
                 HStack(spacing: 6) {
-                    ForEach(song.matchReasons.prefix(2), id: \.rawValue) { reason in
-                        Text(reason.rawValue)
-                            .font(.simiMicro)
-                            .lineLimit(1)
-                            .foregroundColor(.simiAccent)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.simiAccent.opacity(0.12))
-                            .clipShape(Capsule())
+                    if isAnalyzing {
+                        HStack(spacing: 4) {
+                            PulsingDot()
+                            Text("Calculating…")
+                                .font(.simiMicro)
+                                .foregroundColor(.simiSubtext)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.simiSubtext.opacity(0.08))
+                        .clipShape(Capsule())
+                        .transition(.opacity)
+                    } else {
+                        ForEach(song.matchReasons.prefix(2), id: \.rawValue) { reason in
+                            Text(reason.rawValue)
+                                .font(.simiMicro)
+                                .lineLimit(1)
+                                .foregroundColor(.simiAccent)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Color.simiAccent.opacity(0.12))
+                                .clipShape(Capsule())
+                        }
                     }
                     Spacer()
                 }
@@ -276,21 +306,7 @@ struct SongCard: View {
                 .padding(.bottom, 12)
                 .accessibilityHidden(true)
                 .allowsHitTesting(false)
-            }
-            // ── Match explanation tagline (collapsed-only teaser) ──
-            if !isExpanded,
-               let explanation = song.matchExplanation,
-               !explanation.rows.isEmpty {
-                Text(explanation.rows.prefix(2).map(\.descriptor).joined(separator: " · "))
-                    .font(.simiMicro)
-                    .foregroundColor(.simiSubtext)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 10)
-                    .transition(.opacity)
-                    .accessibilityHidden(true)
+                .animation(.easeInOut(duration: 0.3), value: isAnalyzing)
             }
 
             // ── Genre bridge ──
@@ -317,6 +333,8 @@ struct SongCard: View {
                 Divider()
                     .background(Color.simiBorder)
                     .padding(.horizontal, 14)
+
+                FeedbackRow(song: song)
 
                 Group {
                     if let explanation = song.matchExplanation,
@@ -406,6 +424,25 @@ struct WaveformBars: View {
         .frame(height: barHeight)
         .onAppear { phase = true }
         .onDisappear { phase = false }
+    }
+}
+
+// ──────────────────────────────────────────────
+// MARK: - Pulsing Dot (enrichment in-progress indicator)
+// ──────────────────────────────────────────────
+
+private struct PulsingDot: View {
+    @State private var scale: CGFloat = 0.5
+    var body: some View {
+        Circle()
+            .fill(Color.simiSubtext)
+            .frame(width: 5, height: 5)
+            .scaleEffect(scale)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                    scale = 1.0
+                }
+            }
     }
 }
 

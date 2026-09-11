@@ -179,6 +179,7 @@ struct ResultsView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(spacing: 0) {
+                        Color.clear.frame(height: 0).id("resultsTop")
 
                         // ── Source Song Header ──
                         if engine.blendedSongs.count > 1 {
@@ -188,6 +189,11 @@ struct ResultsView: View {
                                 .padding(.bottom, 20)
                         } else if let song = engine.sourceSong {
                             SourceSongHeader(song: song, genres: engine.detectedGenres)
+                                .padding(.horizontal, 20)
+                                .padding(.top, 16)
+                                .padding(.bottom, 20)
+                        } else if let mood = engine.moodTarget {
+                            MoodSourceHeader(mood: mood)
                                 .padding(.horizontal, 20)
                                 .padding(.top, 16)
                                 .padding(.bottom, 20)
@@ -228,6 +234,11 @@ struct ResultsView: View {
                         attributionFooter
                             .padding(.horizontal, 20)
                             .padding(.bottom, 32)
+                    }
+                }
+                .onChange(of: engine.isLoading) { _, loading in
+                    if loading {
+                        withAnimation { proxy.scrollTo("resultsTop", anchor: .top) }
                     }
                 }
             }
@@ -1156,6 +1167,67 @@ struct FilterChip: View {
         .frame(minHeight: 44)
         .contentShape(Rectangle())
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: isActive)
+    }
+}
+
+// ──────────────────────────────────────────────
+// MARK: - Mood Source Header
+// Shown instead of SourceSongHeader when searching by mood coordinates.
+// ──────────────────────────────────────────────
+
+struct MoodSourceHeader: View {
+    let mood: MoodTarget
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("finding songs that feel")
+                .font(.simiMicro.weight(.semibold))
+                .foregroundColor(.simiSubtext)
+                .textCase(.uppercase)
+                .tracking(1.2)
+
+            Text(mood.label)
+                .font(.simiDisplay)
+                .foregroundStyle(LinearGradient.simiBrand)
+
+            HStack(spacing: 16) {
+                moodBar(label: "Mood", value: mood.valence,
+                        lowLabel: "Darker", highLabel: "Brighter")
+                moodBar(label: "Energy", value: mood.arousal,
+                        lowLabel: "Calmer", highLabel: "More Energetic")
+            }
+            .padding(.top, 2)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Mood search: \(mood.label). Mood \(Int(mood.valence * 100))%, Energy \(Int(mood.arousal * 100))%")
+    }
+
+    private func moodBar(label: String, value: Double, lowLabel: String, highLabel: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label)
+                    .font(.simiMicro)
+                    .foregroundColor(.simiSubtext)
+                Spacer()
+                Text(value > 0.5 ? highLabel : lowLabel)
+                    .font(.simiMicro.weight(.semibold))
+                    .foregroundColor(.simiAccent)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.simiSubtext.opacity(0.2))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(LinearGradient(
+                            colors: [.simiPrimary, .simiAccent],
+                            startPoint: .leading, endPoint: .trailing
+                        ))
+                        .frame(width: geo.size.width * value)
+                }
+            }
+            .frame(height: 4)
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 

@@ -15,6 +15,7 @@ import Combine
 enum SearchMode: String, CaseIterable {
     case url  = "Paste Link"
     case text = "Search by Name"
+    case mood = "By Mood"
 }
 
 // ──────────────────────────────────────────────
@@ -41,6 +42,8 @@ struct HomeView: View {
     @State private var seeds: [SongSeed] = [SongSeed()]
     @State private var navigateToResults = false
     @State private var showClearConfirm  = false
+    @State private var moodValence: Double = 0.5
+    @State private var moodArousal: Double = 0.5
 
     // Focus + cycling placeholder state
     private enum Field { case urlInput, titleInput, artistInput }
@@ -75,14 +78,18 @@ struct HomeView: View {
 
                         modePicker
 
-                        chipsRow
-                            .padding(.horizontal, 24)
+                        if searchMode != .mood {
+                            chipsRow
+                                .padding(.horizontal, 24)
+                        }
 
                         Group {
                             if searchMode == .url {
                                 urlInputSection
-                            } else {
+                            } else if searchMode == .text {
                                 textSearchSection
+                            } else {
+                                moodSearchSection
                             }
                         }
                         .padding(.horizontal, 24)
@@ -115,6 +122,11 @@ struct HomeView: View {
                     navigateToResults = true
                 }
             }
+            .onChange(of: engine.moodTarget) { _, target in
+                if target != nil {
+                    navigateToResults = true
+                }
+            }
             // Auto-focus URL field after onboarding dismissal
             .onChange(of: shouldFocusURL.wrappedValue) { _, newValue in
                 if newValue {
@@ -130,6 +142,13 @@ struct HomeView: View {
             // Reset placeholder index when URL field is cleared
             .onChange(of: pastedURLs[0]) { _, newValue in
                 if newValue.isEmpty { placeholderIndex = 0 }
+            }
+            // Warm HF Spaces the moment the user focuses a search field — gives the
+            // container the typing window (~5-30s) to finish starting up before Stage 2 fires.
+            .onChange(of: focusedField) { _, newField in
+                if newField != nil {
+                    Task { _ = await SimiAudioService.shared.warmUp() }
+                }
             }
             .navigationDestination(isPresented: $navigateToResults) {
                 ResultsView()
@@ -412,6 +431,31 @@ struct HomeView: View {
     }
 
     // ──────────────────────────────────────────────
+    // MARK: - Mood Coordinate Search
+    // ──────────────────────────────────────────────
+
+    var moodSearchSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("drag to set the vibe")
+                    .font(.simiMicro.weight(.semibold))
+                    .foregroundColor(.simiSubtext)
+                    .textCase(.uppercase)
+                    .tracking(1.2)
+                    .accessibilityHidden(true)
+                Spacer()
+                Text(moodLabelText)
+                    .font(.simiMicro.weight(.semibold))
+                    .foregroundColor(.simiAccent)
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: moodLabelText)
+            }
+
+            MoodPadView(valence: $moodValence, arousal: $moodArousal)
+                .frame(height: 220)
+        }
+    }
+
+    // ──────────────────────────────────────────────
     // MARK: - Text Search Input (multi-seed)
     // ──────────────────────────────────────────────
 
@@ -618,11 +662,13 @@ struct HomeView: View {
                 } else {
                     Image(systemName: "waveform.badge.magnifyingglass")
                         .accessibilityHidden(true)
-                    Text(searchMode == .text && seeds.count > 1
-                         ? "Blend \(seeds.count) Songs"
-                         : searchMode == .url && pastedURLs.filter({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }).count > 1
-                             ? "Blend \(pastedURLs.filter({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }).count) Songs"
-                             : "Find Similar Songs")
+                    Text(searchMode == .mood
+                         ? "Find \(moodLabelText) Songs"
+                         : searchMode == .text && seeds.count > 1
+                             ? "Blend \(seeds.count) Songs"
+                             : searchMode == .url && pastedURLs.filter({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }).count > 1
+                                 ? "Blend \(pastedURLs.filter({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }).count) Songs"
+                                 : "Find Similar Songs")
                 }
             }
             .font(.simiHeadline.weight(.semibold))
@@ -784,7 +830,14 @@ struct HomeView: View {
         switch searchMode {
         case .url:  return pastedURLs.contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         case .text: return seeds.contains { !$0.title.trimmingCharacters(in: .whitespaces).isEmpty }
+        case .mood: return true
         }
+    }
+
+    private var moodLabelText: String {
+        let v = moodValence > 0.5 ? "Bright" : "Dark"
+        let a = moodArousal > 0.5 ? "Energetic" : "Calm"
+        return "\(v) & \(a)"
     }
 
     func startSearch() {
@@ -801,6 +854,8 @@ struct HomeView: View {
                     .map { (title: $0.title.trimmingCharacters(in: .whitespaces),
                             artist: $0.artist.trimmingCharacters(in: .whitespaces)) }
                 await engine.findSimilarSongs(seeds: validSeeds)
+            case .mood:
+                await engine.findSimilarSongs(valence: moodValence, arousal: moodArousal)
             }
         }
     }
