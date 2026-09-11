@@ -38,8 +38,8 @@ struct SimiApp: App {
                     .environmentObject(engine)
                     .preferredColorScheme(.dark)
                     .onChange(of: scenePhase) { _, phase in
-                        // Warm Railway on foreground — cold starts take up to ~20s, so use
-                        // warmUp() (22s timeout) not isReachable() (3s) so the container is
+                        // Warm HF Spaces on foreground — cold starts take 60-90s, so use
+                        // warmUp() (90s timeout) not isReachable() (3s) so the container is
                         // actually alive by the time the user's first search hits Stage 2.
                         if phase == .active {
                             Task { _ = await SimiAudioService.shared.warmUp() }
