@@ -21,7 +21,16 @@ import Accelerate
 final class LocalAudioAnalyzer: @unchecked Sendable {
 
     static let shared = LocalAudioAnalyzer()
-    private init() {}
+    private let _log2n: vDSP_Length
+    private let _cachedFFTSetup: FFTSetup?
+    private init() {
+        _log2n = vDSP_Length(log2(Double(fftSize)))
+        _cachedFFTSetup = vDSP_create_fftsetup(_log2n, FFTRadix(kFFTRadix2))
+    }
+
+    deinit {
+        if let s = _cachedFFTSetup { vDSP_destroy_fftsetup(s) }
+    }
 
     private let fftSize = 2048
     private let hopSize = 512
@@ -261,17 +270,31 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
     }
 
     private func buildFeatures(samples: [Float], sampleRate: Double, title: String, genreHints: [String] = []) -> AudioFeatures {
-        let log2n = vDSP_Length(log2(Double(fftSize)))
+        guard let fftSetup = _cachedFFTSetup else { return fallbackFeatures() }
+        let log2n = _log2n
         let window = makeHannWindow()
-        guard let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
-            return fallbackFeatures()
-        }
-        defer { vDSP_destroy_fftsetup(fftSetup) }
 
         let binHz = sampleRate / Double(fftSize)
 
         // Mel filterbank built once per call (depends on sampleRate)
         let filterbank = buildMelFilterbank(sampleRate: sampleRate)
+
+        // Precompute chroma bin per FFT bin — eliminates log2 per bin per frame.
+        let chromaBinMap: [Int?] = (0..<fftSize / 2).map { i in
+            let freq = Double(i) * binHz
+            guard freq >= 60 && freq <= 5000 else { return nil }
+            let midi = 12.0 * log2(freq / 440.0) + 69.0
+            return ((Int(midi.rounded()) % 12) + 12) % 12
+        }
+
+        // Pre-allocated frame buffers — reused across all frames to avoid per-frame heap churn.
+        var frameBuffer    = [Float](repeating: 0, count: fftSize)
+        var realBuffer     = [Float](repeating: 0, count: fftSize / 2)
+        var imagBuffer     = [Float](repeating: 0, count: fftSize / 2)
+        var bandMagsBuffer = [Float](repeating: 0, count: fftSize / 2)
+        var bandMagsCount  = 0
+        var hfMagsBuffer   = [Float](repeating: 0, count: fftSize / 2)
+        var hfMagsCount    = 0
 
         // Frame-by-frame accumulators
         var chromaAccum      = [Double](repeating: 0, count: 12)
@@ -303,7 +326,12 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
         var offset = introSkip
         while offset + fftSize <= samples.count {
             let r = analyzeFrame(at: offset, samples: samples, window: window,
-                                 fftSetup: fftSetup, log2n: log2n, binHz: binHz)
+                                 fftSetup: fftSetup, log2n: log2n, binHz: binHz,
+                                 chromaBinMap: chromaBinMap,
+                                 frameBuffer: &frameBuffer, realBuffer: &realBuffer,
+                                 imagBuffer: &imagBuffer,
+                                 bandMagsBuffer: &bandMagsBuffer, bandMagsCount: &bandMagsCount,
+                                 hfMagsBuffer: &hfMagsBuffer, hfMagsCount: &hfMagsCount)
             centroids.append(r.centroid)
             for i in 0..<12 { chromaAccum[i] += r.chroma[i] }
             if let prev = prevChromaFrame {
@@ -558,20 +586,35 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
     // MARK: - Per-Frame Analysis
 
     private func analyzeFrame(
-        at offset: Int, samples: [Float], window: [Float],
-        fftSetup: FFTSetup, log2n: vDSP_Length, binHz: Double
+        at offset: Int,
+        samples: [Float],
+        window: [Float],
+        fftSetup: FFTSetup,
+        log2n: vDSP_Length,
+        binHz: Double,
+        chromaBinMap: [Int?],
+        frameBuffer: inout [Float],
+        realBuffer: inout [Float],
+        imagBuffer: inout [Float],
+        bandMagsBuffer: inout [Float],
+        bandMagsCount: inout Int,
+        hfMagsBuffer: inout [Float],
+        hfMagsCount: inout Int
     ) -> FrameResult {
-        var frame = Array(samples[offset..<(offset + fftSize)])
-        vDSP_vmul(frame, 1, window, 1, &frame, 1, vDSP_Length(fftSize))
+        // Copy sample slice into pre-allocated buffer and apply Hann window in-place.
+        frameBuffer.withUnsafeMutableBufferPointer { dst in
+            samples.withUnsafeBufferPointer { src in
+                dst.baseAddress!.update(from: src.baseAddress!.advanced(by: offset), count: fftSize)
+            }
+        }
+        vDSP_vmul(frameBuffer, 1, window, 1, &frameBuffer, 1, vDSP_Length(fftSize))
 
-        var real = [Float](repeating: 0, count: fftSize / 2)
-        var imag = [Float](repeating: 0, count: fftSize / 2)
         var mags = [Float](repeating: 0, count: fftSize / 2)
 
-        real.withUnsafeMutableBufferPointer { rPtr in
-            imag.withUnsafeMutableBufferPointer { iPtr in
+        realBuffer.withUnsafeMutableBufferPointer { rPtr in
+            imagBuffer.withUnsafeMutableBufferPointer { iPtr in
                 var split = DSPSplitComplex(realp: rPtr.baseAddress!, imagp: iPtr.baseAddress!)
-                frame.withUnsafeBytes { raw in
+                frameBuffer.withUnsafeBytes { raw in
                     vDSP_ctoz(raw.baseAddress!.assumingMemoryBound(to: DSPComplex.self),
                               2, &split, 1, vDSP_Length(fftSize / 2))
                 }
@@ -588,27 +631,26 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
         var lowMidEnergy  = 0.0
         var midBandEnergy = 0.0
         var subBassEnergy = 0.0
-        var bandMags      = [Float]()   // 1 Hz+ for overall flatness
-        var hfMags        = [Float]()   // 2 kHz+ for reverb proxy
-
-        bandMags.reserveCapacity(numBins)
+        bandMagsCount = 0
+        hfMagsCount   = 0
 
         for i in 1..<numBins {
             let freq = Double(i) * binHz
             let mag  = Double(mags[i])
-            bandMags.append(mags[i])
+            bandMagsBuffer[bandMagsCount] = mags[i]
+            bandMagsCount += 1
             totalEnergy += mag
 
             if freq >= 200 && freq <= 6000 { weightedSum += freq * mag; magSum += mag }
 
-            if freq >= 60 && freq <= 5000 && mag > 0 {
-                let midi = 12.0 * log2(freq / 440.0) + 69.0
-                chroma[((Int(midi.rounded()) % 12) + 12) % 12] += mag
-            }
+            if let cb = chromaBinMap[i], mags[i] > 0 { chroma[cb] += mag }
             if freq >= 250 && freq <= 2000 { lowMidEnergy  += mag }
             if freq >= 450 && freq <= 3000 { midBandEnergy += mag }
             if freq >= 50  && freq <= 200  { subBassEnergy += mag }
-            if freq >= 2000                { hfMags.append(mags[i]) }
+            if freq >= 2000 {
+                hfMagsBuffer[hfMagsCount] = mags[i]
+                hfMagsCount += 1
+            }
         }
 
         let centroid = magSum > 0 ? max(0, min(1, (weightedSum / magSum - 200) / 5800)) : 0.5
@@ -617,8 +659,8 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
         let normChroma  = chromaTotal > 0 ? chroma.map { $0 / chromaTotal } :
                           [Double](repeating: 1.0 / 12, count: 12)
 
-        let flatness   = spectralFlatness(bandMags)
-        let hfFlatness = hfMags.isEmpty ? -1.0 : spectralFlatness(hfMags)
+        let flatness   = spectralFlatness(bandMagsBuffer, count: bandMagsCount)
+        let hfFlatness = hfMagsCount == 0 ? -1.0 : spectralFlatness(hfMagsBuffer, count: hfMagsCount)
 
         // 85th-percentile rolloff bin
         var cumEnergy = 0.0
@@ -1012,13 +1054,21 @@ final class LocalAudioAnalyzer: @unchecked Sendable {
 
     // MARK: - Spectral Flatness (acousticness base)
 
-    private func spectralFlatness(_ mags: [Float]) -> Double {
-        let positive = mags.filter { $0 > 1e-10 }
-        guard !positive.isEmpty else { return 0.5 }
-        let logSum       = positive.reduce(0.0) { $0 + Double(log(max($1, 1e-10))) }
-        let geometricMean = exp(logSum / Double(positive.count))
-        let arithmeticMean = positive.reduce(0.0) { $0 + Double($1) } / Double(positive.count)
-        guard arithmeticMean > 0 else { return 0.5 }
+    private func spectralFlatness(_ buffer: [Float], count: Int) -> Double {
+        guard count > 0 else { return 0.5 }
+        var logSum = 0.0
+        var linSum = 0.0
+        var n = 0
+        for i in 0..<count {
+            let v = buffer[i]
+            guard v > 1e-10 else { continue }
+            logSum += Double(log(v))
+            linSum += Double(v)
+            n += 1
+        }
+        guard n > 0, linSum > 0 else { return 0.5 }
+        let geometricMean  = exp(logSum / Double(n))
+        let arithmeticMean = linSum / Double(n)
         return min(1.0, max(0.0, geometricMean / arithmeticMean))
     }
 
