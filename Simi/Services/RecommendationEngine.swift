@@ -414,8 +414,6 @@ class RecommendationEngine: ObservableObject {
             async let genresTask                = fetchGenresWithFallback(title: song.title, artist: song.artist)
             async let similarTracksTask         = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
             async let lbTask                    = fetchListenBrainzTracks(title: song.title, artist: song.artist)
-            async let artistCandidatesTask      = fetchArtistSimilarCandidates(song: song)
-            async let sourceArtistTask          = fetchSourceArtistCandidates(song: song)
             async let deezerTask                = deezerService.fetchSimilarTracks(title: song.title, artist: song.artist)
             async let soundCloudTask            = soundCloudService.fetchRelatedTracks(title: song.title, artist: song.artist)
             // Spotify artist genres run concurrently — they don't need audio features or rawTags.
@@ -523,17 +521,15 @@ class RecommendationEngine: ObservableObject {
             self.detectedGenres  = genres
             self.lastGenres      = genres
 
-            let artistCandidates       = await artistCandidatesTask
-            let sourceArtistCandidates = await sourceArtistTask
             let deezerCandidates       = await deezerTask
             let soundCloudCandidates   = await soundCloudTask
             let emotionalTagCandidates = await emotionalTagTask
             let undergroundMoodCandidates = await undergroundMoodTask
             let expandedTracks = Self.mergeTracks(
                 primary: Self.mergeTracks(
-                    primary:   Array(dclapCandidates.prefix(25)),
+                    primary:   Array(dclapCandidates.prefix(40)),
                     secondary: Self.mergeTracks(
-                        primary:   Array(musicnnCandidates.prefix(20)),
+                        primary:   Array(musicnnCandidates.prefix(30)),
                         secondary: Array(vectorCandidates.prefix(20))
                     )
                 ),
@@ -547,13 +543,7 @@ class RecommendationEngine: ObservableObject {
                                 primary:   Array(emotionalTagCandidates.prefix(20)),
                                 secondary: Self.mergeTracks(
                                     primary:   Array(undergroundMoodCandidates.prefix(20)),
-                                    secondary: Self.mergeTracks(
-                                        primary:   Array(deezerCandidates.prefix(15)),
-                                        secondary: Self.mergeTracks(
-                                            primary:   Array(sourceArtistCandidates.prefix(4)),
-                                            secondary: Array(artistCandidates.prefix(8))
-                                        )
-                                    )
+                                    secondary: Array(deezerCandidates.prefix(15))
                                 )
                             )
                         )
@@ -561,7 +551,7 @@ class RecommendationEngine: ObservableObject {
                 )
             )
             simiLog("🧬 Source embeddings: dclap=\(sourceFeatures.dclapEmbedding.map { "\($0.count)d" } ?? "nil") musicnn=\(sourceFeatures.musicnnEmbedding.map { "\($0.count)d" } ?? "nil")")
-            simiLog("📦 Pool: dclap=\(min(dclapCandidates.count, 25)) musicnn=\(min(musicnnCandidates.count, 20)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(lastFMTracks.count, 25)) lb=\(min(lbTracks.count, 25)) sc=\(min(soundCloudCandidates.count, 25)) tag=\(min(emotionalTagCandidates.count, 20)) mood=\(min(undergroundMoodCandidates.count, 20)) deezer=\(min(deezerCandidates.count, 15)) src=\(min(sourceArtistCandidates.count, 4)) artist=\(min(artistCandidates.count, 8)) → \(expandedTracks.count) unique")
+            simiLog("📦 Pool: dclap=\(min(dclapCandidates.count, 40)) musicnn=\(min(musicnnCandidates.count, 30)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(lastFMTracks.count, 25)) lb=\(min(lbTracks.count, 25)) sc=\(min(soundCloudCandidates.count, 25)) tag=\(min(emotionalTagCandidates.count, 20)) mood=\(min(undergroundMoodCandidates.count, 20)) deezer=\(min(deezerCandidates.count, 15)) → \(expandedTracks.count) unique")
 
             let merged = try await mergeAndScore(
                 spotifyRecs: spotifyRecs,
@@ -720,8 +710,6 @@ class RecommendationEngine: ObservableObject {
             async let genresTask             = fetchGenresWithFallback(title: song.title, artist: song.artist)
             async let similarTracksTask      = fetchSimilarTracksWithCache(title: song.title, artist: song.artist)
             async let lbTask                 = fetchListenBrainzTracks(title: song.title, artist: song.artist)
-            async let artistCandidatesTask   = fetchArtistSimilarCandidates(song: song)
-            async let sourceArtistTask2      = fetchSourceArtistCandidates(song: song)
             async let deezerTask             = deezerService.fetchSimilarTracks(title: song.title, artist: song.artist)
             async let soundCloudTask2        = soundCloudService.fetchRelatedTracks(title: song.title, artist: song.artist)
             async let spotifyGenresTask      = spotifyService.fetchArtistGenres(forTrackId: song.id)
@@ -818,17 +806,15 @@ class RecommendationEngine: ObservableObject {
             self.detectedGenres  = genres
             self.lastGenres      = genres
 
-            let artistCandidates          = await artistCandidatesTask
-            let sourceArtistCandidates2   = await sourceArtistTask2
             let deezerCandidates          = await deezerTask
             let soundCloudCandidates2     = await soundCloudTask2
             let emotionalTagCandidates2   = await emotionalTagTask2
             let undergroundMoodCandidates2 = await undergroundMoodTask2
             let expandedTracks = Self.mergeTracks(
                 primary: Self.mergeTracks(
-                    primary:   Array(dclapCandidates2.prefix(25)),
+                    primary:   Array(dclapCandidates2.prefix(40)),
                     secondary: Self.mergeTracks(
-                        primary:   Array(musicnnCandidates2.prefix(20)),
+                        primary:   Array(musicnnCandidates2.prefix(30)),
                         secondary: Array(vectorCandidates.prefix(20))
                     )
                 ),
@@ -842,13 +828,7 @@ class RecommendationEngine: ObservableObject {
                                 primary:   Array(emotionalTagCandidates2.prefix(20)),
                                 secondary: Self.mergeTracks(
                                     primary:   Array(undergroundMoodCandidates2.prefix(20)),
-                                    secondary: Self.mergeTracks(
-                                        primary:   Array(deezerCandidates.prefix(15)),
-                                        secondary: Self.mergeTracks(
-                                            primary:   Array(sourceArtistCandidates2.prefix(4)),
-                                            secondary: Array(artistCandidates.prefix(8))
-                                        )
-                                    )
+                                    secondary: Array(deezerCandidates.prefix(15))
                                 )
                             )
                         )
@@ -856,7 +836,7 @@ class RecommendationEngine: ObservableObject {
                 )
             )
             simiLog("🧬 Source embeddings: dclap=\(sourceFeatures.dclapEmbedding.map { "\($0.count)d" } ?? "nil") musicnn=\(sourceFeatures.musicnnEmbedding.map { "\($0.count)d" } ?? "nil")")
-            simiLog("📦 Pool: dclap=\(min(dclapCandidates2.count, 25)) musicnn=\(min(musicnnCandidates2.count, 20)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(lastFMTracks.count, 25)) lb=\(min(lbTracks.count, 25)) sc=\(min(soundCloudCandidates2.count, 25)) tag=\(min(emotionalTagCandidates2.count, 20)) mood=\(min(undergroundMoodCandidates2.count, 20)) deezer=\(min(deezerCandidates.count, 15)) src=\(min(sourceArtistCandidates2.count, 4)) artist=\(min(artistCandidates.count, 8)) → \(expandedTracks.count) unique")
+            simiLog("📦 Pool: dclap=\(min(dclapCandidates2.count, 40)) musicnn=\(min(musicnnCandidates2.count, 30)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(lastFMTracks.count, 25)) lb=\(min(lbTracks.count, 25)) sc=\(min(soundCloudCandidates2.count, 25)) tag=\(min(emotionalTagCandidates2.count, 20)) mood=\(min(undergroundMoodCandidates2.count, 20)) deezer=\(min(deezerCandidates.count, 15)) → \(expandedTracks.count) unique")
 
             let merged = try await mergeAndScore(
                 spotifyRecs: spotifyRecs,
@@ -1011,9 +991,9 @@ class RecommendationEngine: ObservableObject {
             // Multi-seed: allLastFMTracks is the union across all seeds, so it's bigger than single-seed.
             let expandedTracks = Self.mergeTracks(
                 primary: Self.mergeTracks(
-                    primary:   Array(dclapCandidates3.prefix(25)),
+                    primary:   Array(dclapCandidates3.prefix(40)),
                     secondary: Self.mergeTracks(
-                        primary:   Array(musicnnCandidates3.prefix(20)),
+                        primary:   Array(musicnnCandidates3.prefix(30)),
                         secondary: Array(vectorCandidates.prefix(20))
                     )
                 ),
@@ -1025,7 +1005,7 @@ class RecommendationEngine: ObservableObject {
                     )
                 )
             )
-            simiLog("📦 Pool (blend): dclap=\(min(dclapCandidates3.count, 25)) musicnn=\(min(musicnnCandidates3.count, 20)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(allLastFMTracks.count, 25)) deezer=\(min(deezerCandidates3.count, 15)) sc=\(min(soundCloudCandidates3.count, 15)) → \(expandedTracks.count) unique")
+            simiLog("📦 Pool (blend): dclap=\(min(dclapCandidates3.count, 40)) musicnn=\(min(musicnnCandidates3.count, 30)) vec=\(min(vectorCandidates.count, 20)) lfm=\(min(allLastFMTracks.count, 25)) deezer=\(min(deezerCandidates3.count, 15)) sc=\(min(soundCloudCandidates3.count, 15)) → \(expandedTracks.count) unique")
 
             // Exclude all seed songs from results
             let seedIDSet = Set(seedIDs)
