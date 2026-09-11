@@ -103,7 +103,7 @@ class SupabaseCacheService {
               let featuresJSON = try? JSONSerialization.jsonObject(with: featuresData) else { return }
         let key = cacheKey(title: title, artist: artist)
         // TTL is proportional to data quality — better sources stay cached longer.
-        // librosa (Railway full-analysis) is our highest-quality on-device source,
+        // librosa (HF Spaces full-analysis) is our highest-quality on-device source,
         // on par with Spotify features. Estimated data self-corrects sooner.
         let ttlDays: Int
         switch source {
@@ -125,6 +125,54 @@ class SupabaseCacheService {
             "expires_at": expiresAt,
             "schema_version": 1
         ]
+        await upsert(url: url, body: body, conflictColumn: "cache_key")
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Spotify Track Cache
+    // ──────────────────────────────────────────────
+    // Caches title+artist → Spotify Song lookup results permanently.
+    // Spotify track IDs never change, so no TTL needed.
+    // Requires table: spotify_track_cache (see SUPABASE_MIGRATION.sql)
+
+    func lookupSpotifyTrack(title: String, artist: String) async -> Song? {
+        guard cacheEnabled else { return nil }
+        let key = cacheKey(title: title, artist: artist)
+        guard let url = URL(string: "\(baseURL)/rest/v1/spotify_track_cache?cache_key=eq.\(key.urlEncoded)&select=spotify_id,artist_name,album_art,preview_url,spotify_url,release_year,title,artist&limit=1") else { return nil }
+
+        guard let data = try? await get(url: url),
+              let rows = try? JSONDecoder().decode([SpotifyTrackCacheRow].self, from: data),
+              let row = rows.first else { return nil }
+
+        simiLog("✅ Supabase Spotify cache hit: \"\(title)\" by \"\(artist)\"")
+        return Song(
+            id: row.spotifyId,
+            title: row.title,
+            artist: row.artistName,
+            albumArt: row.albumArt ?? "",
+            previewURL: row.previewUrl,
+            spotifyURL: row.spotifyUrl,
+            sourceURL: row.spotifyUrl,
+            releaseYear: row.releaseYear
+        )
+    }
+
+    func storeSpotifyTrack(_ song: Song) async {
+        guard cacheEnabled else { return }
+        guard !song.id.hasPrefix("stub:"), !song.id.hasPrefix("itunes:") else { return }
+        guard let url = URL(string: "\(baseURL)/rest/v1/spotify_track_cache") else { return }
+        let key = cacheKey(title: song.title, artist: song.artist)
+        var body: [String: Any] = [
+            "cache_key":   key,
+            "title":       song.title,
+            "artist":      song.artist,
+            "spotify_id":  song.id,
+            "artist_name": song.artist,
+            "spotify_url": song.spotifyURL
+        ]
+        if !song.albumArt.isEmpty  { body["album_art"]    = song.albumArt }
+        if let p = song.previewURL { body["preview_url"]  = p }
+        if let y = song.releaseYear { body["release_year"] = y }
         await upsert(url: url, body: body, conflictColumn: "cache_key")
     }
 
@@ -364,6 +412,26 @@ private struct TracksValue: Codable {
         }
     }
     func encode(to encoder: Encoder) throws {}
+}
+
+private struct SpotifyTrackCacheRow: Codable {
+    let spotifyId:   String
+    let title:       String
+    let artist:      String
+    let artistName:  String
+    let albumArt:    String?
+    let previewUrl:  String?
+    let spotifyUrl:  String
+    let releaseYear: Int?
+    enum CodingKeys: String, CodingKey {
+        case spotifyId   = "spotify_id"
+        case title, artist
+        case artistName  = "artist_name"
+        case albumArt    = "album_art"
+        case previewUrl  = "preview_url"
+        case spotifyUrl  = "spotify_url"
+        case releaseYear = "release_year"
+    }
 }
 
 private struct VectorCandidateRow: Codable {

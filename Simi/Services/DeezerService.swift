@@ -54,6 +54,26 @@ class DeezerService {
         return preview
     }
 
+    /// Returns tracks similar to the given song using Deezer's /radio endpoint.
+    /// No authentication required — Deezer's public API.
+    func fetchSimilarTracks(title: String, artist: String) async -> [(title: String, artist: String)] {
+        guard let track = try? await searchTrack(title: title, artist: artist) else { return [] }
+        guard let url = URL(string: "\(baseURL)/track/\(track.id)/radio?limit=25") else { return [] }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 6
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return [] }
+        struct RadioResponse: Decodable {
+            struct Track: Decodable {
+                let title: String
+                let artist: DeezerArtist
+            }
+            let data: [Track]
+        }
+        guard let result = try? JSONDecoder().decode(RadioResponse.self, from: data) else { return [] }
+        return result.data.map { (title: $0.title, artist: $0.artist.name) }
+    }
+
     // ──────────────────────────────────────────────
     // MARK: - Helpers
     // ──────────────────────────────────────────────

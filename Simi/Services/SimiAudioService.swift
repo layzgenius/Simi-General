@@ -20,7 +20,7 @@ class SimiAudioService {
 
     private init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 45.0   // download + upload + librosa can reach ~30s
+        config.timeoutIntervalForRequest = 90.0   // HF cold start (60-90s) + librosa processing
         session = URLSession(configuration: config)
     }
 
@@ -29,30 +29,31 @@ class SimiAudioService {
     // ──────────────────────────────────────────────
 
     /// Downloads the preview URL on-device then POSTs the raw bytes to /analyze-bytes.
-    /// iOS has faster CDN routing to Apple/iTunes servers than Railway does, so
+    /// iOS has faster CDN routing to Apple/iTunes servers than HF Spaces does, so
     /// downloading here eliminates the main source of /analyze latency (server-side
     /// CDN fetch taking 5-30s). Returns nil on any failure — caller falls through
     /// to local PreviewAudioAnalyzer + tag estimation.
-    func analyzePreview(url: String, artist: String = "", title: String = "") async -> AudioFeatures? {
-        // 1. Download audio on-device (~1-3s from iTunes CDN)
+    func analyzePreview(url: String, artist: String = "", title: String = "", spotifyId: String = "") async -> AudioFeatures? {
         guard let audioURL = URL(string: url),
               let (audioData, audioResponse) = try? await URLSession.shared.data(from: audioURL),
               (audioResponse as? HTTPURLResponse)?.statusCode == 200 else {
             return nil
         }
+        return await analyzeDownloadedAudio(data: audioData, sourceURL: url, artist: artist, title: title, spotifyId: spotifyId)
+    }
 
-        // 2. POST bytes to Railway as multipart/form-data (~1-3s upload + librosa)
-        // Pass artist/title so server fires cascade prefetch for the artist's catalog.
+    /// POSTs pre-downloaded audio bytes to /analyze-bytes. Use this when audio is already
+    /// in memory (e.g. Stage 2 pre-download pipeline) to avoid re-downloading.
+    func analyzeDownloadedAudio(data audioData: Data, sourceURL: String, artist: String = "", title: String = "", spotifyId: String = "") async -> AudioFeatures? {
         var components = URLComponents(string: "\(baseURL)/analyze-bytes")!
-        if !artist.isEmpty {
-            components.queryItems = [
-                URLQueryItem(name: "artist", value: artist),
-                URLQueryItem(name: "title", value: title),
-            ]
-        }
+        var queryItems: [URLQueryItem] = []
+        if !artist.isEmpty    { queryItems.append(URLQueryItem(name: "artist",     value: artist))     }
+        if !title.isEmpty     { queryItems.append(URLQueryItem(name: "title",      value: title))      }
+        if !spotifyId.isEmpty { queryItems.append(URLQueryItem(name: "spotify_id", value: spotifyId))  }
+        if !queryItems.isEmpty { components.queryItems = queryItems }
         guard let endpoint = components.url else { return nil }
 
-        let suffix = url.lowercased().contains(".m4a") ? "m4a" : "mp3"
+        let suffix = sourceURL.lowercased().contains(".m4a") ? "m4a" : "mp3"
         let mimeType = suffix == "m4a" ? "audio/mp4" : "audio/mpeg"
         let boundary = "simi-\(UUID().uuidString)"
 
@@ -93,7 +94,7 @@ class SimiAudioService {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 90.0   // Railway downloading + librosa on 5-20 tracks
+        request.timeoutInterval = 90.0   // HF Spaces downloading + librosa on 5-20 tracks
         request.httpBody = bodyData
 
         guard let (data, response) = try? await session.data(for: request),
@@ -167,14 +168,14 @@ class SimiAudioService {
         return (response as? HTTPURLResponse)?.statusCode == 200
     }
 
-    /// Warms up the Railway container and returns whether it responded in time.
+    /// Warms up the HF Spaces container and returns whether it responded in time.
     /// Call this at enrichment start (concurrent with tag estimation) so cold-start
-    /// time overlaps with Stage 1. Returns false if Railway doesn't respond within
+    /// time overlaps with Stage 1. Returns false if HF doesn't respond within
     /// the deadline — caller should skip batch-analyze rather than immediately timeout.
     func warmUp() async -> Bool {
         guard let url = URL(string: "\(baseURL)/health") else { return false }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 22.0   // Railway cold starts can take up to ~20s
+        request.timeoutInterval = 90.0   // HF Spaces free tier cold starts take 60-90s
         guard let (_, response) = try? await session.data(for: request) else { return false }
         return (response as? HTTPURLResponse)?.statusCode == 200
     }

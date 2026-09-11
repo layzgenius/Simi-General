@@ -75,10 +75,15 @@ class iTunesService {
     // ──────────────────────────────────────────────
 
     /// Returns the 30-second preview URL for a track, if available.
+    func fetchPreviewURL(title: String, artist: String) async -> String? {
+        await fetchPreviewAndArtwork(title: title, artist: artist).preview
+    }
+
+    /// Returns both the preview URL and 600px album art URL for a track.
     /// Validates that the iTunes result actually matches the requested song —
     /// without this, iTunes fuzzy-matches wrong tracks entirely (e.g. searching
     /// "PUT IT ONG Yeat" returns Usher's "You Got It Bad").
-    func fetchPreviewURL(title: String, artist: String) async -> String? {
+    func fetchPreviewAndArtwork(title: String, artist: String) async -> (preview: String?, artwork: String?) {
         var components = URLComponents(string: baseURL)
         components?.queryItems = [
             URLQueryItem(name: "term",   value: "\(title) \(artist)"),
@@ -91,11 +96,9 @@ class iTunesService {
               let (data, response) = try? await URLSession.shared.data(from: url),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let result = try? JSONDecoder().decode(iTunesSearchResult.self, from: data) else {
-            return nil
+            return (nil, nil)
         }
 
-        // Find the first result that actually matches both title and artist.
-        // Uses normalised string comparison to handle punctuation / casing differences.
         let normTitle  = normalize(title)
         let normArtist = normalize(artist)
 
@@ -107,12 +110,29 @@ class iTunesService {
             let artistMatch = tArtist.contains(normArtist) || normArtist.contains(tArtist)
 
             if titleMatch && artistMatch {
-                return track.previewUrl
+                // Upgrade to 600px — replace the size suffix iTunes embeds in the URL
+                let art600 = track.artworkUrl100?.replacingOccurrences(of: "100x100bb", with: "600x600bb")
+                return (track.previewUrl, art600)
             }
         }
 
-        // No confident match — return nil rather than a wrong preview
-        return nil
+        return (nil, nil)
+    }
+
+    /// Resolves a preview URL directly from an Apple Music track ID (from LB crosswalk).
+    /// Uses itunes.apple.com/lookup?id= which is exact — no fuzzy matching needed.
+    func fetchPreviewByAppleMusicID(_ trackID: String) async -> String? {
+        guard var components = URLComponents(string: "https://itunes.apple.com/lookup") else { return nil }
+        components.queryItems = [
+            URLQueryItem(name: "id",    value: trackID),
+            URLQueryItem(name: "media", value: "music"),
+        ]
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let result = try? JSONDecoder().decode(iTunesSearchResult.self, from: data),
+              let track = result.results.first else { return nil }
+        return track.previewUrl
     }
 
     /// Strips punctuation, lowercases, and collapses whitespace for loose comparison.

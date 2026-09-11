@@ -113,6 +113,58 @@ class ListenBrainzService {
     }
 
     // ──────────────────────────────────────────────
+    // MARK: - ID Crosswalk
+    // ──────────────────────────────────────────────
+
+    /// Resolves an MBID to an Apple Music / iTunes track ID via the ListenBrainz Labs
+    /// crosswalk endpoint. Returns nil when no mapping exists (track not in their index).
+    /// Use the iTunes ID in: https://itunes.apple.com/lookup?id=<ID>&media=music
+    /// to get a direct preview URL — more precise than text search fallback.
+    func resolveAppleMusicID(mbid: String) async -> String? {
+        guard var components = URLComponents(string: "\(labsURL)/apple-music-id-from-mbid/json") else {
+            return nil
+        }
+        components.queryItems = [URLQueryItem(name: "recording_mbids", value: mbid)]
+        guard let url = components.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 6
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let results = try? JSONDecoder().decode([LBCrosswalkResult].self, from: data),
+              let first = results.first(where: { !($0.apple_music_id ?? "").isEmpty }),
+              let id = first.apple_music_id else { return nil }
+
+        simiLog("🔗 LB crosswalk Apple Music ID for \(mbid): \(id)")
+        return id
+    }
+
+    /// Resolves an MBID to a SoundCloud track ID via the ListenBrainz Labs crosswalk.
+    /// Returns nil when no mapping exists.
+    func resolveSoundCloudID(mbid: String) async -> String? {
+        guard var components = URLComponents(string: "\(labsURL)/soundcloud-id-from-mbid/json") else {
+            return nil
+        }
+        components.queryItems = [URLQueryItem(name: "recording_mbids", value: mbid)]
+        guard let url = components.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 6
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let results = try? JSONDecoder().decode([LBCrosswalkResult].self, from: data),
+              let first = results.first(where: { !($0.soundcloud_id ?? "").isEmpty }),
+              let id = first.soundcloud_id else { return nil }
+
+        simiLog("🔗 LB crosswalk SoundCloud ID for \(mbid): \(id)")
+        return id
+    }
+
+    // ──────────────────────────────────────────────
     // MARK: - Path B: lb-radio Fallback
     // ──────────────────────────────────────────────
 
@@ -127,11 +179,19 @@ class ListenBrainzService {
 
         var request = URLRequest(url: url)
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 8
+        request.timeoutInterval = 10
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let result = try? JSONDecoder().decode(LBPlaylistResponse.self, from: data) else {
+        guard let (data, response) = try? await URLSession.shared.data(for: request) else {
+            simiLog("⚠️ LB lb-radio: network error for MBID \(mbid)")
+            return []
+        }
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard statusCode == 200 else {
+            simiLog("⚠️ LB lb-radio: HTTP \(statusCode) for MBID \(mbid)")
+            return []
+        }
+        guard let result = try? JSONDecoder().decode(LBPlaylistResponse.self, from: data) else {
+            simiLog("⚠️ LB lb-radio: decode failed for MBID \(mbid) — \(String(data: data.prefix(200), encoding: .utf8) ?? "?")")
             return []
         }
 
@@ -194,4 +254,11 @@ private struct LBPlaylist: Codable {
 private struct LBTrack: Codable {
     let title: String
     let creator: String
+}
+
+// ID crosswalk response (apple-music-id-from-mbid / soundcloud-id-from-mbid)
+private struct LBCrosswalkResult: Codable {
+    let recording_mbid: String?
+    let apple_music_id: String?
+    let soundcloud_id:  String?
 }
