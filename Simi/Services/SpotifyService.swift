@@ -11,10 +11,41 @@
 
 import Foundation
 
+// ──────────────────────────────────────────────
+// MARK: - Search Circuit Breaker
+// ──────────────────────────────────────────────
+
+/// Shared across all SpotifyService instances. When Spotify returns 429,
+/// all search calls stop immediately for 60 seconds — no piling on.
+private actor SearchCircuitBreaker {
+    static let shared = SearchCircuitBreaker()
+    private var blockedUntil: Date?
+
+    var isOpen: Bool {
+        guard let until = blockedUntil else { return false }
+        if Date() > until { blockedUntil = nil; return false }
+        return true
+    }
+
+    func trip(retryAfter: TimeInterval? = nil) {
+        // Don't extend an existing block — first 429 sets the window
+        guard blockedUntil == nil || Date() > blockedUntil! else { return }
+        // Use Spotify's Retry-After header when available; clamp 30–300s
+        let wait = min(max(retryAfter ?? 60, 30), 300)
+        blockedUntil = Date().addingTimeInterval(wait)
+        simiLog("🚧 Spotify search circuit breaker tripped — pausing all searches for \(Int(wait))s")
+    }
+
+    func reset() {
+        blockedUntil = nil
+    }
+}
+
 class SpotifyService {
 
     // Thread-safe token cache — prevents concurrent token refreshes racing each other
     private let tokenCache = TokenCache()
+    private let circuitBreaker = SearchCircuitBreaker.shared
 
     // Shared URLSession with a 10-second request timeout
     private let session: URLSession = {
@@ -96,7 +127,8 @@ class SpotifyService {
             albumArt: track.album.images.first?.url ?? "",
             previewURL: track.previewURL,
             spotifyURL: track.externalURLs.spotify,
-            sourceURL: track.externalURLs.spotify
+            sourceURL: track.externalURLs.spotify,
+            releaseYear: track.album.releaseYear
         )
     }
 
@@ -157,6 +189,11 @@ class SpotifyService {
 
     /// Low-level Spotify search — fires a single query and returns the first track.
     private func _searchSpotify(query: String, token: String) async throws -> Song? {
+        // Don't fire if circuit breaker is open — fail fast, save quota
+        guard await !circuitBreaker.isOpen else {
+            throw SimiError.rateLimited
+        }
+
         guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "\(baseURL)/search?q=\(encoded)&type=track&limit=1") else {
             return nil
@@ -164,7 +201,12 @@ class SpotifyService {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 429 {
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap { Double($0) }
+            await circuitBreaker.trip(retryAfter: retryAfter)
+            throw SimiError.rateLimited
+        }
         let result = try JSONDecoder().decode(SpotifySearchResult.self, from: data)
 
         guard let track = result.tracks.items.first else { return nil }
@@ -176,8 +218,189 @@ class SpotifyService {
             albumArt: track.album.images.first?.url ?? "",
             previewURL: track.previewURL,
             spotifyURL: track.externalURLs.spotify,
-            sourceURL: "\(baseURL)/tracks/\(track.id)"
+            sourceURL: "\(baseURL)/tracks/\(track.id)",
+            releaseYear: track.album.releaseYear
         )
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Artist Genre Lookup
+    // ──────────────────────────────────────────────
+
+    /// Returns Spotify's artist genre list using a track-ID two-hop lookup.
+    ///
+    /// Spotify uses the "Every Noise at Once" taxonomy — thousands of micro-genre
+    /// labels like "new orleans rap", "vapor trap", "chamber pop", "dark clubbing".
+    /// These are far more specific than Last.fm track tags and are maintained at
+    /// scale, making them the best available signal for subgenre disambiguation.
+    ///
+    /// The search endpoint returns simplified artist objects (no genres field).
+    /// The full artist object — reachable via /artists/{id} — carries the genre list.
+    /// We get the artist ID from the track object, avoiding artist-name ambiguity.
+    ///
+    /// Used by RecommendationEngine to anchor audio-derived tag queries to the
+    /// correct subgenre rather than guessing from audio features alone.
+    func fetchArtistGenres(forTrackId trackId: String) async -> [String] {
+        guard !trackId.isEmpty else {
+            simiLog("🎸 fetchArtistGenres: empty trackId — skipping")
+            return []
+        }
+        guard !trackId.hasPrefix("itunes:") else { return [] }
+        guard let token = try? await getAccessToken() else {
+            simiLog("🎸 fetchArtistGenres: token fetch failed")
+            return []
+        }
+
+        // Hop 1: track → artist ID
+        var trackRequest = URLRequest(url: URL(string: "\(baseURL)/tracks/\(trackId)")!)
+        trackRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        trackRequest.timeoutInterval = 5
+
+        struct TrackArtistStub: Decodable {
+            struct ArtistIdItem: Decodable { let id: String }
+            let artists: [ArtistIdItem]
+        }
+
+        guard let (trackData, trackResp) = try? await session.data(for: trackRequest) else {
+            simiLog("🎸 fetchArtistGenres: hop1 network error for trackId \(trackId)")
+            return []
+        }
+        guard (trackResp as? HTTPURLResponse)?.statusCode == 200 else {
+            simiLog("🎸 fetchArtistGenres: hop1 HTTP \((trackResp as? HTTPURLResponse)?.statusCode ?? -1) for trackId \(trackId)")
+            return []
+        }
+        guard let trackObj = try? JSONDecoder().decode(TrackArtistStub.self, from: trackData),
+              let artistId = trackObj.artists.first?.id else {
+            simiLog("🎸 fetchArtistGenres: hop1 decode failed for trackId \(trackId)")
+            return []
+        }
+
+        // Hop 2: artist ID → full artist object → genres
+        var artistRequest = URLRequest(url: URL(string: "\(baseURL)/artists/\(artistId)")!)
+        artistRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        artistRequest.timeoutInterval = 5
+
+        struct ArtistFull: Decodable { let name: String; let genres: [String]? }
+
+        guard let (artistData, artistResp) = try? await session.data(for: artistRequest) else {
+            simiLog("🎸 fetchArtistGenres: hop2 network error for artistId \(artistId)")
+            return []
+        }
+        guard (artistResp as? HTTPURLResponse)?.statusCode == 200 else {
+            simiLog("🎸 fetchArtistGenres: hop2 HTTP \((artistResp as? HTTPURLResponse)?.statusCode ?? -1) for artistId \(artistId)")
+            return []
+        }
+        guard let artist = try? JSONDecoder().decode(ArtistFull.self, from: artistData) else {
+            simiLog("🎸 fetchArtistGenres: hop2 decode failed for artistId \(artistId)")
+            return []
+        }
+
+        let genres = artist.genres ?? []
+        simiLog("🎸 Spotify genres for \(artist.name): \(genres.isEmpty ? "(none on Spotify)" : genres.prefix(5).joined(separator: ", "))")
+        return genres
+    }
+
+    // ──────────────────────────────────────────────
+    // MARK: - Related Artists
+    // ──────────────────────────────────────────────
+
+    /// Returns artist names from Spotify's related-artists graph for the given track's primary artist.
+    /// Uses Spotify's 600M-user co-listening data — covers niche artists that Last.fm lacks.
+    /// Two-hop: track ID → artist ID → /related-artists.
+    func fetchRelatedArtists(forTrackId trackId: String) async -> [String] {
+        guard !trackId.isEmpty, !trackId.hasPrefix("itunes:"), !trackId.hasPrefix("stub:") else { return [] }
+        guard let token = try? await getAccessToken() else { return [] }
+
+        var trackRequest = URLRequest(url: URL(string: "\(baseURL)/tracks/\(trackId)")!)
+        trackRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        trackRequest.timeoutInterval = 5
+
+        struct TrackArtistStub: Decodable {
+            struct ArtistIdItem: Decodable { let id: String }
+            let artists: [ArtistIdItem]
+        }
+
+        guard let (trackData, trackResp) = try? await session.data(for: trackRequest),
+              (trackResp as? HTTPURLResponse)?.statusCode == 200,
+              let trackObj = try? JSONDecoder().decode(TrackArtistStub.self, from: trackData),
+              let artistId = trackObj.artists.first?.id else { return [] }
+
+        var relatedRequest = URLRequest(url: URL(string: "\(baseURL)/artists/\(artistId)/related-artists")!)
+        relatedRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        relatedRequest.timeoutInterval = 5
+
+        struct RelatedArtistsResponse: Decodable {
+            struct Artist: Decodable { let name: String }
+            let artists: [Artist]
+        }
+
+        guard let (relData, relResp) = try? await session.data(for: relatedRequest),
+              (relResp as? HTTPURLResponse)?.statusCode == 200,
+              let related = try? JSONDecoder().decode(RelatedArtistsResponse.self, from: relData) else { return [] }
+
+        let names = related.artists.map { $0.name }
+        simiLog("🎸 Spotify related artists (\(names.count)): \(names.prefix(5).joined(separator: ", "))")
+        return names
+    }
+
+    /// Two-hop expansion of Spotify's related-artists graph.
+    /// Hop-1: artists directly related to the source artist.
+    /// Hop-2: for the 5 closest hop-1 artists, fetch their related artists too.
+    /// Returns a deduplicated list (hop-1 first, then new hop-2 discoveries).
+    func fetchRelatedArtistsDeep(forTrackId trackId: String) async -> [String] {
+        guard !trackId.isEmpty, !trackId.hasPrefix("itunes:"), !trackId.hasPrefix("stub:") else { return [] }
+        guard let token = try? await getAccessToken() else { return [] }
+
+        // Hop 0: resolve track → primary artist ID
+        struct TrackArtistStub: Decodable {
+            struct Item: Decodable { let id: String }
+            let artists: [Item]
+        }
+        var trackReq = URLRequest(url: URL(string: "\(baseURL)/tracks/\(trackId)")!)
+        trackReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        trackReq.timeoutInterval = 5
+        guard let (trackData, trackResp) = try? await session.data(for: trackReq),
+              (trackResp as? HTTPURLResponse)?.statusCode == 200,
+              let trackObj = try? JSONDecoder().decode(TrackArtistStub.self, from: trackData),
+              let artistId = trackObj.artists.first?.id else { return [] }
+
+        // Hop 1: primary artist → related artists (names + IDs needed for hop-2)
+        var hop1Req = URLRequest(url: URL(string: "\(baseURL)/artists/\(artistId)/related-artists")!)
+        hop1Req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        hop1Req.timeoutInterval = 5
+        guard let (hop1Data, hop1Resp) = try? await session.data(for: hop1Req),
+              (hop1Resp as? HTTPURLResponse)?.statusCode == 200,
+              let hop1 = try? JSONDecoder().decode(SpotifyRelatedArtistsResponse.self, from: hop1Data) else { return [] }
+
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for a in hop1.artists {
+            if seen.insert(a.name.lowercased()).inserted { ordered.append(a.name) }
+        }
+        simiLog("🎸 Spotify hop-1 (\(hop1.artists.count) artists): \(hop1.artists.prefix(5).map { $0.name }.joined(separator: ", "))")
+
+        // Hop 2: for the 5 closest hop-1 artists, fetch their related artists concurrently
+        await withTaskGroup(of: [SpotifyRelatedArtistsResponse.Artist].self) { group in
+            for hopArtist in hop1.artists.prefix(5) {
+                let aid = hopArtist.id
+                group.addTask {
+                    var req = URLRequest(url: URL(string: "\(self.baseURL)/artists/\(aid)/related-artists")!)
+                    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    req.timeoutInterval = 4
+                    guard let (data, resp) = try? await self.session.data(for: req),
+                          (resp as? HTTPURLResponse)?.statusCode == 200,
+                          let res = try? JSONDecoder().decode(SpotifyRelatedArtistsResponse.self, from: data) else { return [] }
+                    return res.artists
+                }
+            }
+            for await artists in group {
+                for a in artists {
+                    if seen.insert(a.name.lowercased()).inserted { ordered.append(a.name) }
+                }
+            }
+        }
+        simiLog("🎸 Spotify deep graph: \(ordered.count) unique artists after 2-hop expansion")
+        return ordered
     }
 
     // ──────────────────────────────────────────────
@@ -250,11 +473,64 @@ class SpotifyService {
                     albumArt: track.album.images.first?.url ?? "",
                     previewURL: track.previewURL,
                     spotifyURL: track.externalURLs.spotify,
-                    sourceURL: track.externalURLs.spotify
+                    sourceURL: track.externalURLs.spotify,
+                    releaseYear: track.album.releaseYear
                 )
             }
         } catch {
             simiLog("⚠️ Spotify recommendations failed: \(error)")
+            return []
+        }
+    }
+
+    /// Fetches songs targeted to a specific mood point (valence × energy) using genre seeds.
+    /// Used by the mood coordinate search — no reference track required.
+    func getRecommendationsByMood(valence: Double, arousal: Double, limit: Int = 20) async throws -> [Song] {
+        do {
+            let token = try await getAccessToken()
+
+            let energyMin  = max(0.0, arousal  - 0.25)
+            let energyMax  = min(1.0, arousal  + 0.25)
+            let valenceMin = max(0.0, valence  - 0.25)
+            let valenceMax = min(1.0, valence  + 0.25)
+
+            let paramParts = [
+                "seed_genres=pop,rock,hip-hop,electronic,indie",
+                "limit=\(limit)",
+                "target_valence=\(String(format: "%.2f", valence))",
+                "target_energy=\(String(format: "%.2f", arousal))",
+                "min_energy=\(String(format: "%.2f", energyMin))",
+                "max_energy=\(String(format: "%.2f", energyMax))",
+                "min_valence=\(String(format: "%.2f", valenceMin))",
+                "max_valence=\(String(format: "%.2f", valenceMax))",
+            ]
+            let params = paramParts.joined(separator: "&")
+
+            var request = URLRequest(url: URL(string: "\(baseURL)/recommendations?\(params)")!)
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+            let (data, response) = try await session.data(for: request)
+
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                simiLog("⚠️ Spotify mood recommendations unavailable")
+                return []
+            }
+
+            let result = try JSONDecoder().decode(SpotifyRecommendationResult.self, from: data)
+            return result.tracks.map { track in
+                Song(
+                    id: track.id,
+                    title: track.name,
+                    artist: track.artists.first?.name ?? "Unknown Artist",
+                    albumArt: track.album.images.first?.url ?? "",
+                    previewURL: track.previewURL,
+                    spotifyURL: track.externalURLs.spotify,
+                    sourceURL: track.externalURLs.spotify,
+                    releaseYear: track.album.releaseYear
+                )
+            }
+        } catch {
+            simiLog("⚠️ Spotify mood recommendations failed: \(error)")
             return []
         }
     }
@@ -281,6 +557,14 @@ private actor TokenCache {
         self.token = token
         self.expiry = expiry
     }
+}
+
+// Shared response type for /artists/{id}/related-artists — used in both hop-1 and
+// hop-2 calls in fetchRelatedArtistsDeep. Defined at file scope so it is nonisolated
+// and can be decoded inside a non-main-actor TaskGroup.
+private struct SpotifyRelatedArtistsResponse: Decodable, Sendable {
+    struct Artist: Decodable, Sendable { let name: String; let id: String }
+    let artists: [Artist]
 }
 
 // ──────────────────────────────────────────────
@@ -316,6 +600,15 @@ private struct SpotifyArtist: Codable { let name: String }
 private struct SpotifyAlbum: Codable {
     let name: String
     let images: [SpotifyImage]
+    let releaseDate: String?
+    enum CodingKeys: String, CodingKey {
+        case name, images
+        case releaseDate = "release_date"
+    }
+    var releaseYear: Int? {
+        guard let d = releaseDate else { return nil }
+        return Int(d.prefix(4))
+    }
 }
 private struct SpotifyImage: Codable { let url: String }
 private struct SpotifyExternalURLs: Codable { let spotify: String }
