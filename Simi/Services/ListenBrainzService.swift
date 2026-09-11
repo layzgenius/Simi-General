@@ -101,15 +101,58 @@ class ListenBrainzService {
 
         // Sort descending by score (API usually returns sorted, but be safe)
         let sorted = results.sorted { $0.score > $1.score }
-        let tracks = sorted.compactMap { rec -> (title: String, artist: String)? in
+        let firstHopTracks = sorted.compactMap { rec -> (title: String, artist: String)? in
             let t = rec.recording_name.trimmingCharacters(in: .whitespaces)
             let a = rec.artist_credit_name.trimmingCharacters(in: .whitespaces)
             guard !t.isEmpty, !a.isEmpty else { return nil }
             return (title: t, artist: a)
         }
 
-        simiLog("🎵 Labs similar-recordings: \(tracks.count) results for MBID \(mbid)")
-        return tracks
+        simiLog("🎵 Labs similar-recordings hop-1: \(firstHopTracks.count) results for MBID \(mbid)")
+
+        // 2-hop: take the top 5 MBIDs from hop-1 and find what THEY'RE similar to.
+        // Discovers tracks 2 degrees away in the listening-session graph — often the
+        // niche songs that deep fans of the genre actually seek out, invisible to hop-1.
+        // 5 parallel queries, each capped at top 10, deduped against hop-1.
+        let hop2MBIDs = sorted.prefix(5).map { $0.recording_mbid }
+        var seen = Set(firstHopTracks.map { "\($0.title.lowercased())|\($0.artist.lowercased())" })
+        var hop2Tracks: [(title: String, artist: String)] = []
+
+        await withTaskGroup(of: [(title: String, artist: String)].self) { group in
+            for hop2MBID in hop2MBIDs {
+                group.addTask {
+                    guard var comp = URLComponents(string: "\(self.labsURL)/similar-recordings/json") else { return [] }
+                    comp.queryItems = [
+                        URLQueryItem(name: "recording_mbids", value: hop2MBID),
+                        URLQueryItem(name: "algorithm",       value: algorithm),
+                    ]
+                    guard let url2 = comp.url else { return [] }
+                    var req = URLRequest(url: url2)
+                    req.setValue(self.userAgent, forHTTPHeaderField: "User-Agent")
+                    req.timeoutInterval = 8
+                    guard let (d, r) = try? await URLSession.shared.data(for: req),
+                          (r as? HTTPURLResponse)?.statusCode == 200,
+                          let recs = try? JSONDecoder().decode([LabsSimilarRecording].self, from: d) else { return [] }
+                    return recs.sorted { $0.score > $1.score }.prefix(10).compactMap { rec -> (title: String, artist: String)? in
+                        let t = rec.recording_name.trimmingCharacters(in: .whitespaces)
+                        let a = rec.artist_credit_name.trimmingCharacters(in: .whitespaces)
+                        guard !t.isEmpty, !a.isEmpty else { return nil }
+                        return (title: t, artist: a)
+                    }
+                }
+            }
+            for await tracks in group {
+                for t in tracks {
+                    let key = "\(t.title.lowercased())|\(t.artist.lowercased())"
+                    if seen.insert(key).inserted { hop2Tracks.append(t) }
+                }
+            }
+        }
+
+        if !hop2Tracks.isEmpty {
+            simiLog("🎵 Labs 2-hop: \(hop2Tracks.count) additional from \(hop2MBIDs.count) hop-1 seeds")
+        }
+        return firstHopTracks + hop2Tracks
     }
 
     // ──────────────────────────────────────────────
