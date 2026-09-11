@@ -226,7 +226,8 @@ class RecommendationEngine: ObservableObject {
                     let all = await self.lastFMService.fetchArtistTopTracks(artist: similarArtist, limit: 15)
                     // Skip rank-1 hit; take the next 3 (well-known but not chart-toppers).
                     // Hop-2 artists are already further from source so deeper cuts make sense.
-                    return Array(all.dropFirst(min(1, all.count)).prefix(3))
+                    // Skip the top 3 most-played tracks (the known hits); take the next 4 album cuts.
+                    return Array(all.dropFirst(min(3, all.count)).prefix(4))
                 }
             }
             for await artistTracks in group { tracks += artistTracks }
@@ -539,7 +540,7 @@ class RecommendationEngine: ObservableObject {
                 secondary: Self.mergeTracks(
                     primary:   Array(lastFMTracks.prefix(25)),
                     secondary: Self.mergeTracks(
-                        primary:   Array(lbTracks.prefix(10)),
+                        primary:   Array(lbTracks.prefix(25)),
                         secondary: Self.mergeTracks(
                             primary:   Array(soundCloudCandidates.prefix(25)),
                             secondary: Self.mergeTracks(
@@ -834,7 +835,7 @@ class RecommendationEngine: ObservableObject {
                 secondary: Self.mergeTracks(
                     primary:   Array(lastFMTracks.prefix(25)),
                     secondary: Self.mergeTracks(
-                        primary:   Array(lbTracks.prefix(10)),
+                        primary:   Array(lbTracks.prefix(25)),
                         secondary: Self.mergeTracks(
                             primary:   Array(soundCloudCandidates2.prefix(25)),
                             secondary: Self.mergeTracks(

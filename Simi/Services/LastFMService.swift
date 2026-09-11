@@ -402,8 +402,10 @@ class LastFMService {
 
         await withTaskGroup(of: [(title: String, artist: String)].self) { group in
             for tag in queries {
-                group.addTask { await self.fetchTopTracks(forTag: tag, limit: 15, page: 1) }
-                group.addTask { await self.fetchTopTracks(forTag: tag, limit: 15, page: 2) }
+                // Pages 4+5 skip the top 45 most-played songs per tag (mainstream hits)
+                // and land in the 46–75 range — niche but correctly tagged for the emotion.
+                group.addTask { await self.fetchTopTracks(forTag: tag, limit: 15, page: 4) }
+                group.addTask { await self.fetchTopTracks(forTag: tag, limit: 15, page: 5) }
             }
             for await tracks in group {
                 for t in tracks {
@@ -632,11 +634,16 @@ class LastFMService {
         await withTaskGroup(of: [(title: String, artist: String)].self) { group in
             for tag in selected {
                 group.addTask {
-                    let artists = await self.fetchTopArtistsByTag(tag: tag, page: 2, limit: 8)
+                    // Page 3 = past the top mainstream artists for this mood tag.
+                    let artists = await self.fetchTopArtistsByTag(tag: tag, page: 3, limit: 8)
                     var tracks: [(title: String, artist: String)] = []
                     await withTaskGroup(of: [(title: String, artist: String)].self) { inner in
                         for artist in artists.prefix(5) {
-                            inner.addTask { await self.fetchArtistTopTracks(artist: artist, limit: 4) }
+                            // Skip each artist's top 2 hits — take tracks 3–6 (album cuts, not chart singles).
+                            inner.addTask {
+                                let all = await self.fetchArtistTopTracks(artist: artist, limit: 8)
+                                return Array(all.dropFirst(min(2, all.count)).prefix(4))
+                            }
                         }
                         for await t in inner { tracks.append(contentsOf: t) }
                     }
